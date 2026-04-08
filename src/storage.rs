@@ -53,7 +53,8 @@ impl SqliteStorage {
                 epoch INTEGER NOT NULL,
                 sequence_number INTEGER NOT NULL,
                 is_own INTEGER NOT NULL DEFAULT 0,
-                delivery_status_json TEXT
+                delivery_status_json TEXT,
+                payload_json TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_messages_convo
@@ -73,6 +74,18 @@ impl SqliteStorage {
             );
             ",
         )?;
+
+        // Migration: add payload_json column to existing databases
+        let has_payload_json: bool = conn
+            .prepare("SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name='payload_json'")
+            .and_then(|mut stmt| stmt.query_row([], |row| row.get::<_, i64>(0)))
+            .map(|count| count > 0)
+            .unwrap_or(false);
+        if !has_payload_json {
+            conn.execute_batch("ALTER TABLE messages ADD COLUMN payload_json TEXT;")?;
+            tracing::info!("Migrated messages table: added payload_json column");
+        }
+
         Ok(())
     }
 
@@ -293,8 +306,8 @@ impl MLSStorageBackend for SqliteStorage {
             .and_then(|ds| serde_json::to_string(ds).ok());
         conn.execute(
             "INSERT OR REPLACE INTO messages
-             (id, conversation_id, sender_did, text, timestamp, epoch, sequence_number, is_own, delivery_status_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             (id, conversation_id, sender_did, text, timestamp, epoch, sequence_number, is_own, delivery_status_json, payload_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             rusqlite::params![
                 message.id,
                 message.conversation_id,
@@ -305,6 +318,7 @@ impl MLSStorageBackend for SqliteStorage {
                 message.sequence_number,
                 message.is_own as i32,
                 delivery_json,
+                message.payload_json,
             ],
         )
         .map_err(Self::map_err)?;
@@ -322,7 +336,7 @@ impl MLSStorageBackend for SqliteStorage {
             let mut stmt = conn
                 .prepare(
                     "SELECT id, conversation_id, sender_did, text, timestamp, epoch,
-                            sequence_number, is_own, delivery_status_json
+                            sequence_number, is_own, delivery_status_json, payload_json
                      FROM messages
                      WHERE conversation_id = ?1 AND sequence_number < ?2
                      ORDER BY sequence_number DESC LIMIT ?3",
@@ -339,7 +353,7 @@ impl MLSStorageBackend for SqliteStorage {
             let mut stmt = conn
                 .prepare(
                     "SELECT id, conversation_id, sender_did, text, timestamp, epoch,
-                            sequence_number, is_own, delivery_status_json
+                            sequence_number, is_own, delivery_status_json, payload_json
                      FROM messages
                      WHERE conversation_id = ?1
                      ORDER BY sequence_number DESC LIMIT ?2",

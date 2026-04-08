@@ -909,6 +909,17 @@ impl MLSAPIClient for BirdApiClient {
             .map_err(|e| OrchestratorError::Api(e.to_string()))
     }
 
+    async fn report_recovery_failure(&self, convo_id: &str, failure_type: &str) -> Result<()> {
+        self.post_void(
+            "blue.catbird.mlsChat.reportRecoveryFailure",
+            &json!({
+                "convoId": convo_id,
+                "failureType": failure_type,
+            }),
+        )
+        .await
+    }
+
     async fn process_external_commit(
         &self,
         convo_id: &str,
