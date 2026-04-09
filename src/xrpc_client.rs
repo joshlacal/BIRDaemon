@@ -654,18 +654,29 @@ impl MLSAPIClient for BirdApiClient {
         cipher_suite: &str,
         expires_at: &str,
     ) -> Result<()> {
-        self.post_void(
-            "blue.catbird.mlsChat.publishKeyPackages",
-            &json!({
-                "action": "publish",
-                "keyPackages": [{
-                    "keyPackage": B64.encode(key_package),
-                    "cipherSuite": cipher_suite,
-                    "expires": expires_at,
-                }],
-            }),
-        )
-        .await
+        use catbird_atproto::catbird::mls_chat::publish_key_packages;
+
+        let kp_item: publish_key_packages::KeyPackageItem =
+            publish_key_packages::KeyPackageItemData {
+                cipher_suite: cipher_suite.to_string(),
+                expires: expires_at.parse().unwrap(),
+                key_package: key_package.to_vec(),
+            }
+            .into();
+
+        let input: publish_key_packages::Input = publish_key_packages::InputData {
+            action: "publish".to_string(),
+            device_id: None,
+            key_packages: Some(vec![kp_item]),
+            local_hashes: None,
+        }
+        .into();
+
+        let body = serde_json::to_value(&input)
+            .map_err(|e| OrchestratorError::Api(format!("Serialize error: {e}")))?;
+
+        self.post_void("blue.catbird.mlsChat.publishKeyPackages", &body)
+            .await
     }
 
     async fn get_key_packages(&self, dids: &[String]) -> Result<Vec<KeyPackageRef>> {
@@ -767,7 +778,7 @@ impl MLSAPIClient for BirdApiClient {
                 register_device::KeyPackageItemData {
                     cipher_suite: "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519".to_string(),
                     expires: expires_str.parse().unwrap(),
-                    key_package: B64.encode(kp),
+                    key_package: kp.clone(),
                 }
                 .into()
             })
