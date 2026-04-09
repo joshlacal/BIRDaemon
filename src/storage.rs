@@ -97,6 +97,7 @@ impl SqliteStorage {
         match s {
             "Active" => ConversationState::Active,
             "NeedsRejoin" => ConversationState::NeedsRejoin,
+            "ForkDetected" => ConversationState::ForkDetected,
             "Failed" => ConversationState::Failed,
             _ => ConversationState::Initializing,
         }
@@ -106,6 +107,7 @@ impl SqliteStorage {
         match s {
             ConversationState::Initializing => "Initializing",
             ConversationState::Active => "Active",
+            ConversationState::ForkDetected => "ForkDetected",
             ConversationState::NeedsRejoin => "NeedsRejoin",
             ConversationState::Failed => "Failed",
         }
