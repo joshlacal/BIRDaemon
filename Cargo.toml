@@ -1,0 +1,62 @@
+[package]
+name = "bird-daemon"
+version = "0.1.0"
+edition = "2021"
+description = "BIRD - Bluesky DM chatbot daemon using MLS encryption"
+
+[dependencies]
+# MLS protocol (from catbird-mls)
+catbird_mls = { path = "../catbird-mls", default-features = false }
+
+# Generated AT Protocol types (proper $bytes serialization)
+catbird-atproto = { path = "../catbird-atproto" }
+
+# ATProto client (jacquard) — auth, identity resolution
+jacquard = { version = "0.9", default-features = false, features = ["api_full", "dns", "cache"] }
+jacquard-common = { version = "0.9", features = ["reqwest-client"] }
+jacquard-identity = { version = "0.9", features = ["dns", "cache"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP client (for LLM + MLS XRPC calls)
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+
+# Storage
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Async traits
+async-trait = "0.1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# WebSocket (for MLS event subscription)
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
+
+# DAG-CBOR (for WebSocket frame parsing)
+ciborium = "0.2"
+
+# Crypto / encoding
+base64 = "0.22"
+sha2 = "0.10"
+hex = "0.4"
+
+# Utilities
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "1.0"
+anyhow = "1.0"
+futures-util = "0.3"
+dotenvy = "0.15"
+url = "2.5"
+dirs = "5"
+
+[patch.crates-io]
+# Use Catbird's patched jacquard-oauth (adds transition:chat.bsky scope)
+jacquard-oauth = { path = "../nest/patches/jacquard-oauth" }
