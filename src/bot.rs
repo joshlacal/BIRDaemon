@@ -129,19 +129,44 @@ impl BirdBot {
                                 .await;
                             });
                         }
-                        MlsEvent::GroupReset { conversation_id } => {
+                        MlsEvent::GroupReset {
+                            conversation_id,
+                            new_group_id,
+                            reset_generation,
+                        } => {
                             tracing::info!(
                                 convo = %conversation_id,
-                                "Group reset event received — clearing recovery state and flagging NEEDS_REJOIN"
+                                new_group_id = %new_group_id,
+                                reset_generation,
+                                "Group reset event received — adopting RESET_PENDING"
                             );
-                            // Reset recovery attempt counter
                             self.recent_rejoins.lock().await.remove(&conversation_id);
-                            // Flag for deferred rejoin with the new group
-                            if let Err(e) = self.orchestrator.storage().mark_needs_rejoin(&conversation_id).await {
-                                tracing::error!(
-                                    convo = %conversation_id,
-                                    "Failed to mark NEEDS_REJOIN after group reset: {}", e
-                                );
+                            match hex::decode(&new_group_id) {
+                                Ok(new_group_id_bytes) => {
+                                    if let Err(e) = self
+                                        .orchestrator
+                                        .handle_group_reset(
+                                            &conversation_id,
+                                            new_group_id_bytes,
+                                            reset_generation,
+                                        )
+                                        .await
+                                    {
+                                        tracing::error!(
+                                            convo = %conversation_id,
+                                            error = %e,
+                                            "Failed to adopt group reset"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        convo = %conversation_id,
+                                        new_group_id = %new_group_id,
+                                        error = %e,
+                                        "Ignoring malformed group reset newGroupId"
+                                    );
+                                }
                             }
                         }
                         MlsEvent::Connected => {

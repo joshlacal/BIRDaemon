@@ -35,6 +35,10 @@ impl SqliteStorage {
                 group_id TEXT NOT NULL,
                 state TEXT NOT NULL DEFAULT 'Initializing',
                 needs_rejoin INTEGER NOT NULL DEFAULT 0,
+                reset_pending INTEGER NOT NULL DEFAULT 0,
+                reset_new_group_id TEXT,
+                reset_generation INTEGER,
+                reset_notified_at_ms INTEGER,
                 join_method TEXT,
                 join_epoch INTEGER,
                 epoch INTEGER NOT NULL DEFAULT 0,
@@ -86,6 +90,36 @@ impl SqliteStorage {
             tracing::info!("Migrated messages table: added payload_json column");
         }
 
+        let conversation_columns = [
+            (
+                "reset_pending",
+                "ALTER TABLE conversations ADD COLUMN reset_pending INTEGER NOT NULL DEFAULT 0;",
+            ),
+            (
+                "reset_new_group_id",
+                "ALTER TABLE conversations ADD COLUMN reset_new_group_id TEXT;",
+            ),
+            (
+                "reset_generation",
+                "ALTER TABLE conversations ADD COLUMN reset_generation INTEGER;",
+            ),
+            (
+                "reset_notified_at_ms",
+                "ALTER TABLE conversations ADD COLUMN reset_notified_at_ms INTEGER;",
+            ),
+        ];
+        for (name, ddl) in conversation_columns {
+            let exists: bool = conn
+                .prepare("SELECT COUNT(*) FROM pragma_table_info('conversations') WHERE name=?1")
+                .and_then(|mut stmt| stmt.query_row([name], |row| row.get::<_, i64>(0)))
+                .map(|count| count > 0)
+                .unwrap_or(false);
+            if !exists {
+                conn.execute_batch(ddl)?;
+                tracing::info!("Migrated conversations table: added {} column", name);
+            }
+        }
+
         Ok(())
     }
 
@@ -98,6 +132,11 @@ impl SqliteStorage {
             "Active" => ConversationState::Active,
             "NeedsRejoin" => ConversationState::NeedsRejoin,
             "ForkDetected" => ConversationState::ForkDetected,
+            "ResetPending" => ConversationState::ResetPending {
+                new_group_id: String::new(),
+                reset_generation: 0,
+                notified_at_ms: 0,
+            },
             "Failed" => ConversationState::Failed,
             _ => ConversationState::Initializing,
         }
@@ -109,6 +148,7 @@ impl SqliteStorage {
             ConversationState::Active => "Active",
             ConversationState::ForkDetected => "ForkDetected",
             ConversationState::NeedsRejoin => "NeedsRejoin",
+            ConversationState::ResetPending { .. } => "ResetPending",
             ConversationState::Failed => "Failed",
         }
     }
@@ -293,6 +333,56 @@ impl MLSStorageBackend for SqliteStorage {
         conn.execute(
             "UPDATE conversations SET needs_rejoin = 0 WHERE conversation_id = ?1",
             rusqlite::params![conversation_id],
+        )
+        .map_err(Self::map_err)?;
+        Ok(())
+    }
+
+    async fn mark_reset_pending(
+        &self,
+        conversation_id: &str,
+        new_group_id_hex: &str,
+        reset_generation: i32,
+        notified_at_ms: i64,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE conversations
+             SET state = 'ResetPending',
+                 needs_rejoin = 0,
+                 reset_pending = 1,
+                 reset_new_group_id = ?1,
+                 reset_generation = ?2,
+                 reset_notified_at_ms = ?3,
+                 group_id = ?1,
+                 epoch = 0,
+                 updated_at = ?4
+             WHERE conversation_id = ?5",
+            rusqlite::params![
+                new_group_id_hex,
+                reset_generation,
+                notified_at_ms,
+                Utc::now().to_rfc3339(),
+                conversation_id,
+            ],
+        )
+        .map_err(Self::map_err)?;
+        Ok(())
+    }
+
+    async fn clear_reset_pending(&self, conversation_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE conversations
+             SET state = 'Active',
+                 reset_pending = 0,
+                 reset_new_group_id = NULL,
+                 reset_generation = NULL,
+                 reset_notified_at_ms = NULL,
+                 needs_rejoin = 0,
+                 updated_at = ?1
+             WHERE conversation_id = ?2",
+            rusqlite::params![Utc::now().to_rfc3339(), conversation_id],
         )
         .map_err(Self::map_err)?;
         Ok(())

@@ -606,12 +606,14 @@ impl MLSAPIClient for BirdApiClient {
         cursor: Option<&str>,
         limit: u32,
         message_type: Option<&str>,
+        from_epoch: Option<u32>,
+        to_epoch: Option<u32>,
     ) -> Result<(Vec<IncomingEnvelope>, Option<String>)> {
         let limit_str = limit.to_string();
         let mut params: Vec<(&str, &str)> = vec![("convoId", convo_id), ("limit", &limit_str)];
         if let Some(c) = cursor {
             // For commit fetches, use fromEpoch; for app messages, use sinceSeq
-            if message_type == Some("commit") {
+            if message_type == Some("commit") && from_epoch.is_none() {
                 params.push(("fromEpoch", c));
             } else {
                 params.push(("sinceSeq", c));
@@ -619,6 +621,14 @@ impl MLSAPIClient for BirdApiClient {
         }
         if let Some(mt) = message_type {
             params.push(("type", mt));
+        }
+        let from_epoch_str = from_epoch.map(|epoch| epoch.to_string());
+        if let Some(ref from) = from_epoch_str {
+            params.push(("fromEpoch", from));
+        }
+        let to_epoch_str = to_epoch.map(|epoch| epoch.to_string());
+        if let Some(ref to) = to_epoch_str {
+            params.push(("toEpoch", to));
         }
 
         use catbird_atproto::jacquard_common::IntoStatic;
@@ -920,13 +930,29 @@ impl MLSAPIClient for BirdApiClient {
             .map_err(|e| OrchestratorError::Api(e.to_string()))
     }
 
-    async fn report_recovery_failure(&self, convo_id: &str, failure_type: &str) -> Result<()> {
+    async fn report_recovery_failure(
+        &self,
+        convo_id: &str,
+        failure_type: &str,
+        epoch_authenticator: Option<&str>,
+        failure_mode: Option<&str>,
+    ) -> Result<()> {
+        let mut body = json!({
+            "convoId": convo_id,
+            "failureType": failure_type,
+        });
+        if let Some(auth) = epoch_authenticator {
+            body["epochAuthenticator"] = serde_json::Value::String(auth.to_string());
+        }
+        // ADR-008 D1 (spec §8.6.1): forward failureMode when orchestrator
+        // classified it. Servers without D1 enforcement ignore the field.
+        if let Some(mode) = failure_mode {
+            body["failureMode"] = serde_json::Value::String(mode.to_string());
+        }
+
         self.post_void(
             "blue.catbird.mlsChat.reportRecoveryFailure",
-            &json!({
-                "convoId": convo_id,
-                "failureType": failure_type,
-            }),
+            &body,
         )
         .await
     }

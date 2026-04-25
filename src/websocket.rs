@@ -122,6 +122,8 @@ pub enum MlsEvent {
     /// Group has been reset — conversation needs rejoin with new group.
     GroupReset {
         conversation_id: String,
+        new_group_id: String,
+        reset_generation: i32,
     },
     /// Connection established.
     Connected,
@@ -386,14 +388,26 @@ fn handle_frame(data: &[u8]) -> Result<Option<(MlsEvent, Option<String>)>, Strin
             let conversation_id = cbor_str(top, "convoId")
                 .or_else(|| cbor_str(top, "conversationId"))
                 .ok_or("Missing convoId in groupResetEvent")?;
+            let new_group_id = cbor_str(top, "newGroupId")
+                .or_else(|| cbor_str(top, "new_group_id"))
+                .ok_or("Missing newGroupId in groupResetEvent")?;
+            let reset_generation = cbor_int(top, "resetGeneration")
+                .or_else(|| cbor_int(top, "reset_generation"))
+                .unwrap_or(0) as i32;
 
             tracing::info!(
                 conversation_id = %conversation_id,
+                new_group_id = %new_group_id,
+                reset_generation,
                 "Parsed groupResetEvent"
             );
 
             Ok(Some((
-                MlsEvent::GroupReset { conversation_id },
+                MlsEvent::GroupReset {
+                    conversation_id,
+                    new_group_id,
+                    reset_generation,
+                },
                 cursor,
             )))
         }
