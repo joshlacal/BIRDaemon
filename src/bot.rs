@@ -143,9 +143,14 @@ impl BirdBot {
                             self.recent_rejoins.lock().await.remove(&conversation_id);
                             match hex::decode(&new_group_id) {
                                 Ok(new_group_id_bytes) => {
+                                    // Spec §8.5 Phase 1: persist-only path. The
+                                    // 30s sync loop drives `join_or_rejoin` (now
+                                    // including first-responder bootstrap) — never
+                                    // run External Commits inline from event
+                                    // handlers (April 2026 epoch-inflation class).
                                     if let Err(e) = self
                                         .orchestrator
-                                        .handle_group_reset(
+                                        .record_group_reset(
                                             &conversation_id,
                                             new_group_id_bytes,
                                             reset_generation,
