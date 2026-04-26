@@ -937,18 +937,12 @@ impl MLSAPIClient for BirdApiClient {
         epoch_authenticator: Option<&str>,
         failure_mode: Option<&str>,
     ) -> Result<()> {
-        let mut body = json!({
-            "convoId": convo_id,
-            "failureType": failure_type,
-        });
-        if let Some(auth) = epoch_authenticator {
-            body["epochAuthenticator"] = serde_json::Value::String(auth.to_string());
-        }
-        // ADR-008 D1 (spec §8.6.1): forward failureMode when orchestrator
-        // classified it. Servers without D1 enforcement ignore the field.
-        if let Some(mode) = failure_mode {
-            body["failureMode"] = serde_json::Value::String(mode.to_string());
-        }
+        let body = build_report_recovery_failure_body(
+            convo_id,
+            failure_type,
+            epoch_authenticator,
+            failure_mode,
+        );
 
         self.post_void(
             "blue.catbird.mlsChat.reportRecoveryFailure",
@@ -1199,5 +1193,74 @@ impl BirdApiClient {
             }),
         )
         .await
+    }
+}
+
+/// Build the JSON body posted to `blue.catbird.mlsChat.reportRecoveryFailure`.
+///
+/// `epochAuthenticator` (ADR-002 / spec §8.6) and `failureMode` (ADR-008 D1 /
+/// spec §8.6.1) are only included when present so pre-A7 / pre-D1 servers
+/// continue to accept the call.
+fn build_report_recovery_failure_body(
+    convo_id: &str,
+    failure_type: &str,
+    epoch_authenticator: Option<&str>,
+    failure_mode: Option<&str>,
+) -> serde_json::Value {
+    let mut body = json!({
+        "convoId": convo_id,
+        "failureType": failure_type,
+    });
+    if let Some(auth) = epoch_authenticator {
+        body["epochAuthenticator"] = serde_json::Value::String(auth.to_string());
+    }
+    if let Some(mode) = failure_mode {
+        body["failureMode"] = serde_json::Value::String(mode.to_string());
+    }
+    body
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_report_recovery_failure_body;
+
+    #[test]
+    fn body_contains_required_fields() {
+        let body = build_report_recovery_failure_body(
+            "convo-x",
+            "external_commit_exhausted",
+            None,
+            None,
+        );
+        assert_eq!(body["convoId"], "convo-x");
+        assert_eq!(body["failureType"], "external_commit_exhausted");
+        assert!(body.get("epochAuthenticator").is_none());
+        assert!(body.get("failureMode").is_none());
+    }
+
+    #[test]
+    fn body_includes_optional_fields_when_present() {
+        let body = build_report_recovery_failure_body(
+            "convo-y",
+            "remote_data_error",
+            Some("deadbeef"),
+            Some("group_state_unrecoverable"),
+        );
+        assert_eq!(body["convoId"], "convo-y");
+        assert_eq!(body["failureType"], "remote_data_error");
+        assert_eq!(body["epochAuthenticator"], "deadbeef");
+        assert_eq!(body["failureMode"], "group_state_unrecoverable");
+    }
+
+    #[test]
+    fn body_omits_only_missing_optional_fields() {
+        let body = build_report_recovery_failure_body(
+            "convo-z",
+            "external_commit_exhausted",
+            Some("cafebabe"),
+            None,
+        );
+        assert_eq!(body["epochAuthenticator"], "cafebabe");
+        assert!(body.get("failureMode").is_none());
     }
 }
