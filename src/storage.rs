@@ -137,6 +137,12 @@ impl SqliteStorage {
                 reset_generation: 0,
                 notified_at_ms: 0,
             },
+            // Quarantine survives restart (suppresses auto-rejoin). reason/since_ms
+            // are diagnostic and not persisted, so restore a sensible default.
+            "Quarantined" => ConversationState::Quarantined {
+                reason: QuarantineReason::PeerBadCommit,
+                since_ms: 0,
+            },
             "Failed" => ConversationState::Failed,
             _ => ConversationState::Initializing,
         }
@@ -149,6 +155,7 @@ impl SqliteStorage {
             ConversationState::ForkDetected => "ForkDetected",
             ConversationState::NeedsRejoin => "NeedsRejoin",
             ConversationState::ResetPending { .. } => "ResetPending",
+            ConversationState::Quarantined { .. } => "Quarantined",
             ConversationState::Failed => "Failed",
         }
     }

@@ -676,9 +676,12 @@ impl MLSAPIClient for BirdApiClient {
 
         let input: publish_key_packages::Input = publish_key_packages::InputData {
             action: "publish".to_string(),
+            convo_id: None,
             device_id: None,
             key_packages: Some(vec![kp_item]),
             local_hashes: None,
+            reason: None,
+            target_dids: None,
         }
         .into();
 
