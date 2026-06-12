@@ -416,6 +416,11 @@ fn parse_conversation(v: &serde_json::Value) -> ConversationView {
             .get("updatedAt")
             .and_then(|v| v.as_str())
             .and_then(parse_dt),
+        // WS-4 rung 2 (ADR-010 D4): optional on the wire; older servers omit it.
+        sequencer_did: v
+            .get("sequencerDid")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
     }
 }
 

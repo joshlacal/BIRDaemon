@@ -195,6 +195,9 @@ impl SqliteStorage {
             metadata,
             created_at: created_at.and_then(|s| Self::parse_dt(&s)),
             updated_at: updated_at.and_then(|s| Self::parse_dt(&s)),
+            // WS-4 rung 2: not persisted in BIRDaemon storage yet
+            // (2026-06-11 WS-4 plan §3.4); absence = sequencer unknown.
+            sequencer_did: None,
         })
     }
 }
