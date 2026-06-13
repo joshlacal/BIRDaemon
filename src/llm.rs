@@ -177,8 +177,7 @@ impl LlmClient {
         let content = choice
             .and_then(|c| c.message.content.clone())
             .unwrap_or_default();
-        let has_reasoning =
-            choice.map_or(false, |c| c.message.reasoning_content.is_some());
+        let has_reasoning = choice.map_or(false, |c| c.message.reasoning_content.is_some());
 
         let cleaned = if has_reasoning {
             content

@@ -92,7 +92,9 @@ impl BirdApiClient {
                         None,
                     )
                     .await
-                    .map_err(|e| OrchestratorError::Api(format!("Re-authentication failed: {e}")))?;
+                    .map_err(|e| {
+                        OrchestratorError::Api(format!("Re-authentication failed: {e}"))
+                    })?;
                 tracing::info!("Re-authenticated successfully");
                 self.session
                     .access_token()
@@ -216,12 +218,7 @@ impl BirdApiClient {
             .map_err(|e| OrchestratorError::Api(format!("JSON decode: {e}")))
     }
 
-    async fn raw_post_void(
-        &self,
-        nsid: &str,
-        body: &serde_json::Value,
-        jwt: &str,
-    ) -> Result<()> {
+    async fn raw_post_void(&self, nsid: &str, body: &serde_json::Value, jwt: &str) -> Result<()> {
         let resp = self
             .http
             .post(self.xrpc_url(nsid))
@@ -273,12 +270,7 @@ impl BirdApiClient {
             .map_err(|e| OrchestratorError::Api(format!("JSON decode: {e}")))
     }
 
-    async fn raw_get_text(
-        &self,
-        nsid: &str,
-        params: &[(&str, &str)],
-        jwt: &str,
-    ) -> Result<String> {
+    async fn raw_get_text(&self, nsid: &str, params: &[(&str, &str)], jwt: &str) -> Result<String> {
         let resp = self
             .http
             .get(self.xrpc_url(nsid))
@@ -330,18 +322,19 @@ impl BirdApiClient {
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 fn parse_dt(s: &str) -> Option<DateTime<Utc>> {
-    s.parse::<DateTime<Utc>>()
-        .ok()
-        .or_else(|| {
-            DateTime::parse_from_rfc3339(s)
-                .ok()
-                .map(|dt| dt.with_timezone(&Utc))
-        })
+    s.parse::<DateTime<Utc>>().ok().or_else(|| {
+        DateTime::parse_from_rfc3339(s)
+            .ok()
+            .map(|dt| dt.with_timezone(&Utc))
+    })
 }
 
 fn parse_u64(v: &serde_json::Value, key: &str) -> u64 {
     v.get(key)
-        .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+        .and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        })
         .unwrap_or(0)
 }
 
@@ -447,9 +440,7 @@ impl MLSAPIClient for BirdApiClient {
             params.push(("cursor", c));
         }
 
-        let output = self
-            .get("blue.catbird.mlsChat.getConvos", &params)
-            .await?;
+        let output = self.get("blue.catbird.mlsChat.getConvos", &params).await?;
 
         let convos = output
             .get("conversations")
@@ -753,7 +744,10 @@ impl MLSAPIClient for BirdApiClient {
         let parse_u32 = |key: &str| -> u32 {
             stats
                 .get(key)
-                .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                .and_then(|v| {
+                    v.as_u64()
+                        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                })
                 .unwrap_or(0) as u32
         };
 
@@ -834,9 +828,7 @@ impl MLSAPIClient for BirdApiClient {
     }
 
     async fn list_devices(&self) -> Result<Vec<DeviceInfo>> {
-        let output = self
-            .get("blue.catbird.mlsChat.listDevices", &[])
-            .await?;
+        let output = self.get("blue.catbird.mlsChat.listDevices", &[]).await?;
 
         let devices = output
             .get("devices")
@@ -952,11 +944,8 @@ impl MLSAPIClient for BirdApiClient {
             failure_mode,
         );
 
-        self.post_void(
-            "blue.catbird.mlsChat.reportRecoveryFailure",
-            &body,
-        )
-        .await
+        self.post_void("blue.catbird.mlsChat.reportRecoveryFailure", &body)
+            .await
     }
 
     async fn process_external_commit(
@@ -1056,17 +1045,16 @@ impl BirdApiClient {
     /// Mirrors `MLSDeviceRecordService.ensureDeviceRecordPublished` in CatbirdMLSCore.
     pub async fn ensure_device_record_published(&self, signature_public_key: &[u8]) -> Result<()> {
         // Check if a device record with this key already exists
-        let existing = self.list_repo_records("blue.catbird.mlsChat.device").await?;
+        let existing = self
+            .list_repo_records("blue.catbird.mlsChat.device")
+            .await?;
         let our_key_b64 = B64.encode(signature_public_key);
 
         for record in &existing {
             if let Some(value) = record.get("value") {
                 // Check if mlsSignaturePublicKey.$bytes matches our key
                 if let Some(key_obj) = value.get("mlsSignaturePublicKey") {
-                    let key_b64 = key_obj
-                        .get("$bytes")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                    let key_b64 = key_obj.get("$bytes").and_then(|v| v.as_str()).unwrap_or("");
                     if key_b64 == our_key_b64 {
                         tracing::info!("Device record already published");
                         return Ok(());
@@ -1097,7 +1085,11 @@ impl BirdApiClient {
         let output = self
             .raw_get_no_proxy(
                 "com.atproto.repo.listRecords",
-                &[("repo", &self.did), ("collection", collection), ("limit", "50")],
+                &[
+                    ("repo", &self.did),
+                    ("collection", collection),
+                    ("limit", "50"),
+                ],
                 &self.get_jwt().await?,
             )
             .await?;
@@ -1121,8 +1113,12 @@ impl BirdApiClient {
             "validate": false,
             "record": record,
         });
-        self.raw_post_no_proxy("com.atproto.repo.createRecord", &body, &self.get_jwt().await?)
-            .await
+        self.raw_post_no_proxy(
+            "com.atproto.repo.createRecord",
+            &body,
+            &self.get_jwt().await?,
+        )
+        .await
     }
 
     /// GET without atproto-proxy header (direct PDS call).
@@ -1234,12 +1230,8 @@ mod tests {
 
     #[test]
     fn body_contains_required_fields() {
-        let body = build_report_recovery_failure_body(
-            "convo-x",
-            "external_commit_exhausted",
-            None,
-            None,
-        );
+        let body =
+            build_report_recovery_failure_body("convo-x", "external_commit_exhausted", None, None);
         assert_eq!(body["convoId"], "convo-x");
         assert_eq!(body["failureType"], "external_commit_exhausted");
         assert!(body.get("epochAuthenticator").is_none());

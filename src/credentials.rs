@@ -8,8 +8,8 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
 
 use catbird_mls::orchestrator::credentials::CredentialStore;
 use catbird_mls::orchestrator::error::{OrchestratorError, Result};

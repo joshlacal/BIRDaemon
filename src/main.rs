@@ -12,16 +12,16 @@ use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
 use crate::bot::BirdBot;
+use crate::bridge_client::BridgeClient;
 use crate::config::{data_dir, load_config, load_secrets};
 use crate::credentials::FileCredentialStore;
 use crate::keychain::FileKeychain;
-use crate::bridge_client::BridgeClient;
 use crate::storage::SqliteStorage;
 use crate::xrpc_client::BirdApiClient;
 
-use catbird_mls::MLSContext;
-use catbird_mls::orchestrator::{MLSOrchestrator, OrchestratorConfig};
 use catbird_mls::orchestrator::credentials::CredentialStore;
+use catbird_mls::orchestrator::{MLSOrchestrator, OrchestratorConfig};
+use catbird_mls::MLSContext;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -126,7 +126,10 @@ async fn main() -> anyhow::Result<()> {
             tracing::warn!("Device registration failed: {}, attempting cleanup...", e);
             // If device limit reached, remove oldest devices and retry
             if let Ok(devices) = orchestrator.list_devices().await {
-                tracing::info!("Found {} registered devices, removing old ones", devices.len());
+                tracing::info!(
+                    "Found {} registered devices, removing old ones",
+                    devices.len()
+                );
                 // Remove all devices to make room (they're from previous runs)
                 for dev in &devices {
                     if let Err(e) = orchestrator.remove_device(&dev.device_id).await {
@@ -137,8 +140,12 @@ async fn main() -> anyhow::Result<()> {
                 }
                 // Retry registration
                 match orchestrator.ensure_device_registered().await {
-                    Ok(mls_did) => tracing::info!(mls_did = %mls_did, "Device registered after cleanup"),
-                    Err(e2) => tracing::error!("Device registration still failed after cleanup: {}", e2),
+                    Ok(mls_did) => {
+                        tracing::info!(mls_did = %mls_did, "Device registered after cleanup")
+                    }
+                    Err(e2) => {
+                        tracing::error!("Device registration still failed after cleanup: {}", e2)
+                    }
                 }
             }
         }

@@ -1,19 +1,19 @@
 //! Bot logic: ties together MLS orchestrator, WebSocket, LLM client, and event loop.
 
-use std::collections::HashMap;
-use std::sync::Arc;
 use base64::Engine;
 use chrono::Utc;
+use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 
-use catbird_mls::MLSContext;
 use catbird_mls::blob_crypto::decrypt_blob;
-use catbird_mls::orchestrator::{MLSOrchestrator, MLSStorageBackend, IncomingEnvelope};
+use catbird_mls::orchestrator::{IncomingEnvelope, MLSOrchestrator, MLSStorageBackend};
+use catbird_mls::MLSContext;
 
+use crate::bridge_client::BridgeClient;
 use crate::config::BirdConfig;
 use crate::credentials::FileCredentialStore;
-use crate::bridge_client::BridgeClient;
 use crate::storage::SqliteStorage;
 use crate::websocket::{MlsEvent, MlsWebSocket};
 use crate::xrpc_client::BirdApiClient;
@@ -207,7 +207,10 @@ impl BirdBot {
 
     // handle_message is now the free function handle_message_bg() below
 
-    async fn begin_typing_signal(&self, conversation_id: &str) -> Option<tokio::task::JoinHandle<()>> {
+    async fn begin_typing_signal(
+        &self,
+        conversation_id: &str,
+    ) -> Option<tokio::task::JoinHandle<()>> {
         if let Err(e) = self
             .api_client
             .send_typing_indicator(conversation_id, true)
@@ -297,10 +300,7 @@ impl BirdBot {
         let mut behind = 0u32;
         let mut ahead = 0u32;
         for (convo_id, convo) in &conversations {
-            let local_epoch = group_states
-                .get(convo_id)
-                .map(|gs| gs.epoch)
-                .unwrap_or(0);
+            let local_epoch = group_states.get(convo_id).map(|gs| gs.epoch).unwrap_or(0);
 
             if convo.epoch > local_epoch {
                 behind += 1;
@@ -412,7 +412,11 @@ async fn handle_message_bg(
                     local_epoch,
                     "Decrypt failed (we may be behind), flagging NEEDS_REJOIN for deferred recovery: {}", e
                 );
-                if let Err(mark_err) = orchestrator.storage().mark_needs_rejoin(conversation_id).await {
+                if let Err(mark_err) = orchestrator
+                    .storage()
+                    .mark_needs_rejoin(conversation_id)
+                    .await
+                {
                     tracing::error!(
                         convo = %conversation_id,
                         "Failed to mark NEEDS_REJOIN: {}", mark_err
@@ -452,7 +456,10 @@ async fn handle_message_bg(
     );
 
     // Start typing indicator
-    if let Err(e) = api_client.send_typing_indicator(conversation_id, true).await {
+    if let Err(e) = api_client
+        .send_typing_indicator(conversation_id, true)
+        .await
+    {
         tracing::debug!("Failed to send typing start: {}", e);
     }
     let typing_api = Arc::clone(api_client);
@@ -475,9 +482,15 @@ async fn handle_message_bg(
                     tracing::info!(blob_id = %image.blob_id, size = plaintext.len(), "Image blob decrypted");
                     Some((plaintext, image.content_type.clone()))
                 }
-                Err(e) => { tracing::warn!("Failed to decrypt image blob: {}", e); None }
+                Err(e) => {
+                    tracing::warn!("Failed to decrypt image blob: {}", e);
+                    None
+                }
             },
-            Err(e) => { tracing::warn!("Failed to fetch image blob: {}", e); None }
+            Err(e) => {
+                tracing::warn!("Failed to fetch image blob: {}", e);
+                None
+            }
         }
     } else {
         None
@@ -498,7 +511,10 @@ async fn handle_message_bg(
             if embed.kind == "image" {
                 None
             } else {
-                Some(format!("[attachment type={}, data={}]", embed.kind, embed.data))
+                Some(format!(
+                    "[attachment type={}, data={}]",
+                    embed.kind, embed.data
+                ))
             }
         })
     });
@@ -519,7 +535,9 @@ async fn handle_message_bg(
         Err(e) => {
             tracing::error!("LLM call failed: {}", e);
             typing_handle.abort();
-            let _ = api_client.send_typing_indicator(conversation_id, false).await;
+            let _ = api_client
+                .send_typing_indicator(conversation_id, false)
+                .await;
             return;
         }
     };
@@ -527,7 +545,9 @@ async fn handle_message_bg(
     if response.is_empty() {
         tracing::warn!("LLM returned empty response, not sending");
         typing_handle.abort();
-        let _ = api_client.send_typing_indicator(conversation_id, false).await;
+        let _ = api_client
+            .send_typing_indicator(conversation_id, false)
+            .await;
         return;
     }
 
@@ -539,7 +559,9 @@ async fn handle_message_bg(
 
     // Stop typing before sending
     typing_handle.abort();
-    let _ = api_client.send_typing_indicator(conversation_id, false).await;
+    let _ = api_client
+        .send_typing_indicator(conversation_id, false)
+        .await;
 
     match orchestrator.send_message(conversation_id, &response).await {
         Ok(_msg) => {

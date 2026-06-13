@@ -177,7 +177,15 @@ impl MlsWebSocket {
                 attempt += 1;
                 tracing::info!("WebSocket connecting (attempt {})", attempt);
 
-                match do_subscribe(&api_client, last_cursor.as_deref(), &tx, &shutdown, &reconnect).await {
+                match do_subscribe(
+                    &api_client,
+                    last_cursor.as_deref(),
+                    &tx,
+                    &shutdown,
+                    &reconnect,
+                )
+                .await
+                {
                     Ok(cursor) => {
                         last_cursor = cursor;
                         attempt = 0; // Reset on successful connection
@@ -325,15 +333,15 @@ fn handle_frame(data: &[u8]) -> Result<Option<(MlsEvent, Option<String>)>, Strin
             };
 
             let cursor = cbor_str(top, "cursor");
-            let msg_map = cbor_map(top, "message")
-                .ok_or("Missing 'message' field in messageEvent")?;
+            let msg_map =
+                cbor_map(top, "message").ok_or("Missing 'message' field in messageEvent")?;
 
             let id = cbor_str(msg_map, "id").ok_or("Missing message.id")?;
             let convo_id = cbor_str(msg_map, "convoId").ok_or("Missing message.convoId")?;
             let created_at = cbor_str(msg_map, "createdAt").ok_or("Missing message.createdAt")?;
             let epoch = cbor_int(msg_map, "epoch").unwrap_or(0) as u64;
-            let ciphertext = cbor_bytes(msg_map, "ciphertext")
-                .ok_or("Missing or invalid message.ciphertext")?;
+            let ciphertext =
+                cbor_bytes(msg_map, "ciphertext").ok_or("Missing or invalid message.ciphertext")?;
 
             tracing::debug!(
                 id = %id,
