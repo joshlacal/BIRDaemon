@@ -43,7 +43,7 @@ pub fn load_secrets() -> anyhow::Result<BirdSecrets> {
     let env_path = data_dir().join(".env");
     tracing::info!("Loading secrets from {}", env_path.display());
     dotenvy::from_path(&env_path)?;
-    let app_password =
-        std::env::var("BIRD_APP_PASSWORD").map_err(|_| anyhow::anyhow!("BIRD_APP_PASSWORD not set in .env"))?;
+    let app_password = std::env::var("BIRD_APP_PASSWORD")
+        .map_err(|_| anyhow::anyhow!("BIRD_APP_PASSWORD not set in .env"))?;
     Ok(BirdSecrets { app_password })
 }

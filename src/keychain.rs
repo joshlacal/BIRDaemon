@@ -8,11 +8,11 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
 
-use catbird_mls::MLSError;
 use catbird_mls::KeychainAccess;
+use catbird_mls::MLSError;
 
 /// File-based keychain that persists data as JSON.
 pub struct FileKeychain {

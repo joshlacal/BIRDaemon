@@ -45,7 +45,8 @@ impl SqliteStorage {
                 members_json TEXT NOT NULL DEFAULT '[]',
                 metadata_json TEXT,
                 created_at TEXT,
-                updated_at TEXT
+                updated_at TEXT,
+                sequencer_did TEXT
             );
 
             CREATE TABLE IF NOT EXISTS messages (
@@ -106,6 +107,10 @@ impl SqliteStorage {
             (
                 "reset_notified_at_ms",
                 "ALTER TABLE conversations ADD COLUMN reset_notified_at_ms INTEGER;",
+            ),
+            (
+                "sequencer_did",
+                "ALTER TABLE conversations ADD COLUMN sequencer_did TEXT;",
             ),
         ];
         for (name, ddl) in conversation_columns {
@@ -182,6 +187,7 @@ impl SqliteStorage {
         let metadata_json: Option<String> = row.get("metadata_json")?;
         let created_at: Option<String> = row.get("created_at")?;
         let updated_at: Option<String> = row.get("updated_at")?;
+        let sequencer_did: Option<String> = row.get("sequencer_did")?;
 
         let members: Vec<MemberView> = serde_json::from_str(&members_json).unwrap_or_default();
         let metadata: Option<ConversationMetadata> =
@@ -195,9 +201,7 @@ impl SqliteStorage {
             metadata,
             created_at: created_at.and_then(|s| Self::parse_dt(&s)),
             updated_at: updated_at.and_then(|s| Self::parse_dt(&s)),
-            // WS-4 rung 2: not persisted in BIRDaemon storage yet
-            // (2026-06-11 WS-4 plan §3.4); absence = sequencer unknown.
-            sequencer_did: None,
+            sequencer_did,
         })
     }
 }
@@ -254,13 +258,16 @@ impl MLSStorageBackend for SqliteStorage {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT conversation_id, group_id, epoch, members_json, metadata_json, created_at, updated_at
+                "SELECT conversation_id, group_id, epoch, members_json, metadata_json, created_at, updated_at, sequencer_did
                  FROM conversations WHERE conversation_id = ?1",
             )
             .map_err(Self::map_err)?;
 
         let result = stmt
-            .query_row(rusqlite::params![conversation_id], Self::row_to_conversation_view)
+            .query_row(
+                rusqlite::params![conversation_id],
+                Self::row_to_conversation_view,
+            )
             .optional()
             .map_err(Self::map_err)?;
 
@@ -271,7 +278,7 @@ impl MLSStorageBackend for SqliteStorage {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT conversation_id, group_id, epoch, members_json, metadata_json, created_at, updated_at
+                "SELECT conversation_id, group_id, epoch, members_json, metadata_json, created_at, updated_at, sequencer_did
                  FROM conversations WHERE user_did = ?1",
             )
             .map_err(Self::map_err)?;
@@ -393,6 +400,20 @@ impl MLSStorageBackend for SqliteStorage {
                  updated_at = ?1
              WHERE conversation_id = ?2",
             rusqlite::params![Utc::now().to_rfc3339(), conversation_id],
+        )
+        .map_err(Self::map_err)?;
+        Ok(())
+    }
+
+    async fn set_conversation_sequencer(
+        &self,
+        conversation_id: &str,
+        sequencer_did: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE conversations SET sequencer_did = ?1 WHERE conversation_id = ?2",
+            rusqlite::params![sequencer_did, conversation_id],
         )
         .map_err(Self::map_err)?;
         Ok(())
@@ -534,7 +555,12 @@ impl MLSStorageBackend for SqliteStorage {
         conn.execute(
             "INSERT OR REPLACE INTO group_states (group_id, conversation_id, epoch, members_json)
              VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![state.group_id, state.conversation_id, state.epoch, members_json],
+            rusqlite::params![
+                state.group_id,
+                state.conversation_id,
+                state.epoch,
+                members_json
+            ],
         )
         .map_err(Self::map_err)?;
         Ok(())
@@ -551,8 +577,7 @@ impl MLSStorageBackend for SqliteStorage {
                 let conversation_id: String = row.get(1)?;
                 let epoch: u64 = row.get(2)?;
                 let members_json: String = row.get(3)?;
-                let members: Vec<String> =
-                    serde_json::from_str(&members_json).unwrap_or_default();
+                let members: Vec<String> = serde_json::from_str(&members_json).unwrap_or_default();
                 Ok(GroupState {
                     group_id,
                     conversation_id,
@@ -578,6 +603,14 @@ impl MLSStorageBackend for SqliteStorage {
         .map_err(Self::map_err)?;
         Ok(())
     }
+
+    fn implemented_optional_methods(&self) -> &'static [&'static str] {
+        &[
+            "mark_reset_pending",
+            "clear_reset_pending",
+            "set_conversation_sequencer",
+        ]
+    }
 }
 
 impl SqliteStorage {
@@ -596,8 +629,7 @@ impl SqliteStorage {
             .map(|dt| dt.with_timezone(&Utc))
             .unwrap_or_else(|_| Utc::now());
 
-        let delivery_status =
-            delivery_json.and_then(|j| serde_json::from_str(&j).ok());
+        let delivery_status = delivery_json.and_then(|j| serde_json::from_str(&j).ok());
 
         Ok(Message {
             id,
@@ -609,7 +641,64 @@ impl SqliteStorage {
             sequence_number,
             is_own: is_own != 0,
             delivery_status,
-            payload_json: row.get("payload_json")?
+            payload_json: row.get("payload_json")?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn new_temp_storage() -> (PathBuf, SqliteStorage) {
+        let path =
+            std::env::temp_dir().join(format!("birdaemon-storage-{}.db", uuid::Uuid::new_v4()));
+        let storage = SqliteStorage::new(path.clone()).expect("open SqliteStorage");
+        (path, storage)
+    }
+
+    #[tokio::test]
+    async fn conversation_sequencer_did_round_trips() {
+        let (path, storage) = new_temp_storage();
+        let user_did = "did:plc:alice";
+        let conversation_id = "conv-sequencer";
+        let group_id = "group-sequencer";
+        let sequencer_did = "did:web:ds-b.example";
+
+        storage
+            .ensure_conversation_exists(user_did, conversation_id, group_id)
+            .await
+            .expect("create conversation");
+        storage
+            .set_conversation_sequencer(conversation_id, sequencer_did)
+            .await
+            .expect("persist sequencer");
+        assert!(
+            storage
+                .implemented_optional_methods()
+                .contains(&"set_conversation_sequencer"),
+            "storage capabilities should report sequencer persistence"
+        );
+
+        let got = storage
+            .get_conversation(user_did, conversation_id)
+            .await
+            .expect("load conversation")
+            .expect("conversation exists");
+        assert_eq!(got.sequencer_did.as_deref(), Some(sequencer_did));
+
+        let listed = storage
+            .list_conversations(user_did)
+            .await
+            .expect("list conversations");
+        let listed = listed
+            .into_iter()
+            .find(|c| c.conversation_id == conversation_id)
+            .expect("listed conversation");
+        assert_eq!(listed.sequencer_did.as_deref(), Some(sequencer_did));
+
+        drop(storage);
+        let _ = fs::remove_file(path);
     }
 }
