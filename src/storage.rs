@@ -39,6 +39,8 @@ impl SqliteStorage {
                 reset_new_group_id TEXT,
                 reset_generation INTEGER,
                 reset_notified_at_ms INTEGER,
+                applied_reset_generation INTEGER NOT NULL DEFAULT -1,
+                reset_generation_fence_initialized INTEGER NOT NULL DEFAULT 1,
                 join_method TEXT,
                 join_epoch INTEGER,
                 epoch INTEGER NOT NULL DEFAULT 0,
@@ -109,6 +111,14 @@ impl SqliteStorage {
                 "ALTER TABLE conversations ADD COLUMN reset_notified_at_ms INTEGER;",
             ),
             (
+                "applied_reset_generation",
+                "ALTER TABLE conversations ADD COLUMN applied_reset_generation INTEGER NOT NULL DEFAULT -1;",
+            ),
+            (
+                "reset_generation_fence_initialized",
+                "ALTER TABLE conversations ADD COLUMN reset_generation_fence_initialized INTEGER NOT NULL DEFAULT 0;",
+            ),
+            (
                 "sequencer_did",
                 "ALTER TABLE conversations ADD COLUMN sequencer_did TEXT;",
             ),
@@ -125,11 +135,59 @@ impl SqliteStorage {
             }
         }
 
+        // Idempotently preserve the known generation of every fenced complete
+        // tuple. Running this after every startup closes a crash window where
+        // ALTER TABLE could have committed but this forensic seed had not.
+        // The row stays fenced because the legacy writer projected group_id to
+        // the target before predecessor deletion, so its mapping is untrusted.
+        conn.execute(
+            "UPDATE conversations
+             SET applied_reset_generation = MAX(applied_reset_generation, reset_generation),
+                 needs_rejoin = 1
+             WHERE reset_generation_fence_initialized = 0
+               AND state = 'ResetPending'
+               AND reset_pending = 1
+               AND reset_new_group_id IS NOT NULL
+               AND reset_generation IS NOT NULL
+               AND reset_notified_at_ms IS NOT NULL",
+            [],
+        )?;
+        let fenced_rows: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM conversations
+             WHERE reset_generation_fence_initialized = 0",
+            [],
+            |row| row.get(0),
+        )?;
+        if fenced_rows > 0 {
+            tracing::warn!(
+                fenced_rows,
+                "Legacy MLS reset rows require authoritative reset-generation reconciliation"
+            );
+        }
+
         Ok(())
     }
 
     fn map_err(e: rusqlite::Error) -> OrchestratorError {
         OrchestratorError::Storage(e.to_string())
+    }
+
+    fn require_reconciled_reset_authority(conn: &Connection, conversation_id: &str) -> Result<()> {
+        let reconciled = conn
+            .query_row(
+                "SELECT reset_generation_fence_initialized
+                 FROM conversations WHERE conversation_id = ?1",
+                [conversation_id],
+                |row| row.get::<_, i32>(0),
+            )
+            .optional()
+            .map_err(Self::map_err)?;
+        if reconciled == Some(0) {
+            return Err(OrchestratorError::Storage(format!(
+                "conversation {conversation_id} has legacy reset authority and requires authoritative reconciliation"
+            )));
+        }
+        Ok(())
     }
 
     fn parse_state(s: &str) -> ConversationState {
@@ -153,7 +211,7 @@ impl SqliteStorage {
         }
     }
 
-    fn state_str(s: ConversationState) -> &'static str {
+    fn state_str(s: &ConversationState) -> &'static str {
         match s {
             ConversationState::Initializing => "Initializing",
             ConversationState::Active => "Active",
@@ -314,17 +372,99 @@ impl MLSStorageBackend for SqliteStorage {
         conversation_id: &str,
         state: ConversationState,
     ) -> Result<()> {
+        if matches!(&state, ConversationState::ResetPending { .. }) {
+            return Err(OrchestratorError::Storage(
+                "ResetPending must be published atomically with mark_reset_pending".into(),
+            ));
+        }
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE conversations SET state = ?1 WHERE conversation_id = ?2",
-            rusqlite::params![Self::state_str(state), conversation_id],
-        )
-        .map_err(Self::map_err)?;
+        Self::require_reconciled_reset_authority(&conn, conversation_id)?;
+        if matches!(&state, ConversationState::Active) {
+            // `complete_reset_pending` is the only causal commit point for
+            // publishing Active while reset authority exists. An unbound
+            // state write must never mask a newer reset generation.
+            conn.execute(
+                "UPDATE conversations
+                 SET state = 'Active'
+                 WHERE conversation_id = ?1
+                   AND reset_pending = 0
+                   AND reset_new_group_id IS NULL
+                   AND reset_generation IS NULL
+                   AND reset_notified_at_ms IS NULL",
+                [conversation_id],
+            )
+            .map_err(Self::map_err)?;
+        } else {
+            conn.execute(
+                "UPDATE conversations SET state = ?1
+                 WHERE conversation_id = ?2
+                   AND reset_pending = 0
+                   AND reset_new_group_id IS NULL
+                   AND reset_generation IS NULL
+                   AND reset_notified_at_ms IS NULL",
+                rusqlite::params![Self::state_str(&state), conversation_id],
+            )
+            .map_err(Self::map_err)?;
+        }
         Ok(())
+    }
+
+    async fn get_conversation_state(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<ConversationState>> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT state, reset_pending, reset_new_group_id, reset_generation,
+                        reset_notified_at_ms, reset_generation_fence_initialized
+                 FROM conversations WHERE conversation_id = ?1",
+                [conversation_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i32>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<i32>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, i32>(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(Self::map_err)?;
+
+        let Some((state, reset_pending, target, generation, notified_at_ms, reconciled)) = row
+        else {
+            return Ok(None);
+        };
+        if reconciled == 0 {
+            return Err(OrchestratorError::Storage(format!(
+                "conversation {conversation_id} has legacy reset authority and requires authoritative reconciliation"
+            )));
+        }
+        let has_any_reset_payload =
+            target.is_some() || generation.is_some() || notified_at_ms.is_some();
+        if state == "ResetPending" || reset_pending != 0 || has_any_reset_payload {
+            return match (state.as_str(), reset_pending, target, generation, notified_at_ms) {
+                ("ResetPending", 1, Some(new_group_id), Some(reset_generation), Some(notified_at_ms)) => {
+                    Ok(Some(ConversationState::ResetPending {
+                        new_group_id,
+                        reset_generation,
+                        notified_at_ms,
+                    }))
+                }
+                _ => Err(OrchestratorError::Storage(format!(
+                    "conversation {conversation_id} contains incomplete or inconsistent reset authority"
+                ))),
+            };
+        }
+        Ok(Some(Self::parse_state(&state)))
     }
 
     async fn mark_needs_rejoin(&self, conversation_id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
+        Self::require_reconciled_reset_authority(&conn, conversation_id)?;
         conn.execute(
             "UPDATE conversations SET needs_rejoin = 1 WHERE conversation_id = ?1",
             rusqlite::params![conversation_id],
@@ -335,20 +475,24 @@ impl MLSStorageBackend for SqliteStorage {
 
     async fn needs_rejoin(&self, conversation_id: &str) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
-        let val: i32 = conn
+        Self::require_reconciled_reset_authority(&conn, conversation_id)?;
+        let val = conn
             .query_row(
                 "SELECT needs_rejoin FROM conversations WHERE conversation_id = ?1",
                 rusqlite::params![conversation_id],
-                |row| row.get(0),
+                |row| row.get::<_, i32>(0),
             )
-            .unwrap_or(0);
-        Ok(val != 0)
+            .optional()
+            .map_err(Self::map_err)?;
+        Ok(val.unwrap_or(0) != 0)
     }
 
     async fn clear_rejoin_flag(&self, conversation_id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
+        Self::require_reconciled_reset_authority(&conn, conversation_id)?;
         conn.execute(
-            "UPDATE conversations SET needs_rejoin = 0 WHERE conversation_id = ?1",
+            "UPDATE conversations SET needs_rejoin = 0
+             WHERE conversation_id = ?1 AND reset_pending = 0",
             rusqlite::params![conversation_id],
         )
         .map_err(Self::map_err)?;
@@ -363,46 +507,129 @@ impl MLSStorageBackend for SqliteStorage {
         notified_at_ms: i64,
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE conversations
+        Self::require_reconciled_reset_authority(&conn, conversation_id)?;
+        let changed = conn
+            .execute(
+                "UPDATE conversations
              SET state = 'ResetPending',
-                 needs_rejoin = 0,
+                 needs_rejoin = 1,
                  reset_pending = 1,
                  reset_new_group_id = ?1,
                  reset_generation = ?2,
                  reset_notified_at_ms = ?3,
-                 group_id = ?1,
-                 epoch = 0,
                  updated_at = ?4
-             WHERE conversation_id = ?5",
-            rusqlite::params![
-                new_group_id_hex,
-                reset_generation,
-                notified_at_ms,
-                Utc::now().to_rfc3339(),
-                conversation_id,
-            ],
-        )
-        .map_err(Self::map_err)?;
+             WHERE conversation_id = ?5
+               AND reset_generation_fence_initialized = 1
+               AND ?2 > applied_reset_generation
+               AND (
+                    (reset_pending = 0
+                        AND state <> 'ResetPending'
+                        AND reset_new_group_id IS NULL
+                        AND reset_generation IS NULL
+                        AND reset_notified_at_ms IS NULL)
+                    OR (state = 'ResetPending'
+                        AND reset_pending = 1
+                        AND reset_new_group_id IS NOT NULL
+                        AND reset_generation IS NOT NULL
+                        AND reset_notified_at_ms IS NOT NULL
+                        AND reset_generation < ?2)
+                    OR (state = 'ResetPending'
+                        AND reset_pending = 1
+                        AND reset_new_group_id IS NOT NULL
+                        AND reset_generation IS NOT NULL
+                        AND reset_notified_at_ms IS NOT NULL
+                        AND reset_generation = ?2
+                        AND reset_new_group_id = ?1
+                        AND reset_notified_at_ms = ?3)
+               )",
+                rusqlite::params![
+                    new_group_id_hex,
+                    reset_generation,
+                    notified_at_ms,
+                    Utc::now().to_rfc3339(),
+                    conversation_id,
+                ],
+            )
+            .map_err(Self::map_err)?;
+        if changed != 1 {
+            return Err(OrchestratorError::Storage(format!(
+                "reset generation {reset_generation} was stale, conflicted, or conversation {conversation_id} was missing"
+            )));
+        }
         Ok(())
     }
 
-    async fn clear_reset_pending(&self, conversation_id: &str) -> Result<()> {
+    async fn complete_reset_pending(
+        &self,
+        conversation_id: &str,
+        expected_generation: i32,
+        expected_new_group_id_hex: &str,
+    ) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE conversations
-             SET state = 'Active',
-                 reset_pending = 0,
-                 reset_new_group_id = NULL,
-                 reset_generation = NULL,
-                 reset_notified_at_ms = NULL,
-                 needs_rejoin = 0,
-                 updated_at = ?1
-             WHERE conversation_id = ?2",
-            rusqlite::params![Utc::now().to_rfc3339(), conversation_id],
-        )
-        .map_err(Self::map_err)?;
-        Ok(())
+        Self::require_reconciled_reset_authority(&conn, conversation_id)?;
+        let changed = conn
+            .execute(
+                "UPDATE conversations
+                 SET state = 'Active',
+                     group_id = ?1,
+                     epoch = 0,
+                     reset_pending = 0,
+                     reset_new_group_id = NULL,
+                     reset_generation = NULL,
+                     reset_notified_at_ms = NULL,
+                     applied_reset_generation = ?4,
+                     needs_rejoin = 0,
+                     updated_at = ?2
+                 WHERE conversation_id = ?3
+                   AND state = 'ResetPending'
+                   AND reset_generation_fence_initialized = 1
+                   AND reset_pending = 1
+                   AND reset_generation = ?4
+                   AND reset_new_group_id = ?1
+                   AND reset_notified_at_ms IS NOT NULL",
+                rusqlite::params![
+                    expected_new_group_id_hex,
+                    Utc::now().to_rfc3339(),
+                    conversation_id,
+                    expected_generation,
+                ],
+            )
+            .map_err(Self::map_err)?;
+        Ok(changed == 1)
+    }
+
+    async fn clear_reset_pending_for_delete(
+        &self,
+        conversation_id: &str,
+        expected_generation: i32,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Self::require_reconciled_reset_authority(&conn, conversation_id)?;
+        let changed = conn
+            .execute(
+                "UPDATE conversations
+                 SET reset_pending = 0,
+                     reset_new_group_id = NULL,
+                     reset_generation = NULL,
+                     reset_notified_at_ms = NULL,
+                     applied_reset_generation = ?3,
+                     needs_rejoin = 0,
+                     updated_at = ?1
+                 WHERE conversation_id = ?2
+                   AND state = 'ResetPending'
+                   AND reset_generation_fence_initialized = 1
+                   AND reset_pending = 1
+                   AND reset_generation = ?3
+                   AND reset_new_group_id IS NOT NULL
+                   AND reset_notified_at_ms IS NOT NULL",
+                rusqlite::params![
+                    Utc::now().to_rfc3339(),
+                    conversation_id,
+                    expected_generation
+                ],
+            )
+            .map_err(Self::map_err)?;
+        Ok(changed == 1)
     }
 
     async fn set_conversation_sequencer(
@@ -606,8 +833,10 @@ impl MLSStorageBackend for SqliteStorage {
 
     fn implemented_optional_methods(&self) -> &'static [&'static str] {
         &[
+            "get_conversation_state",
             "mark_reset_pending",
-            "clear_reset_pending",
+            "complete_reset_pending",
+            "clear_reset_pending_for_delete",
             "set_conversation_sequencer",
         ]
     }
@@ -697,6 +926,604 @@ mod tests {
             .find(|c| c.conversation_id == conversation_id)
             .expect("listed conversation");
         assert_eq!(listed.sequencer_did.as_deref(), Some(sequencer_did));
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    fn reset_snapshot(
+        storage: &SqliteStorage,
+        conversation_id: &str,
+    ) -> (
+        String,
+        String,
+        i32,
+        Option<String>,
+        Option<i32>,
+        Option<i64>,
+        i32,
+        i32,
+        u64,
+    ) {
+        let conn = storage.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT state, group_id, reset_pending, reset_new_group_id, reset_generation,
+                    reset_notified_at_ms, applied_reset_generation, needs_rejoin, epoch
+             FROM conversations WHERE conversation_id = ?1",
+            [conversation_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ))
+            },
+        )
+        .expect("read reset snapshot")
+    }
+
+    fn generation_fence(storage: &SqliteStorage, conversation_id: &str) -> (i32, i32) {
+        let conn = storage.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT applied_reset_generation, reset_generation_fence_initialized
+             FROM conversations WHERE conversation_id = ?1",
+            [conversation_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read generation fence")
+    }
+
+    #[tokio::test]
+    async fn mark_reset_pending_atomically_publishes_authority_and_preserves_predecessor() {
+        let (path, storage) = new_temp_storage();
+        let conversation_id = "conv-reset-atomic-mark";
+        storage
+            .ensure_conversation_exists("did:plc:alice", conversation_id, "old-group")
+            .await
+            .expect("create conversation");
+        storage
+            .mark_reset_pending(conversation_id, "new-group", 7, 1_717_000_000_007)
+            .await
+            .expect("publish reset authority");
+        assert_eq!(
+            reset_snapshot(&storage, conversation_id),
+            (
+                "ResetPending".into(),
+                "old-group".into(),
+                1,
+                Some("new-group".into()),
+                Some(7),
+                Some(1_717_000_000_007),
+                -1,
+                1,
+                0,
+            ),
+            "mark must atomically publish the complete tuple and rejoin route without moving the current-group mapping"
+        );
+        assert_eq!(
+            storage
+                .get_conversation_state(conversation_id)
+                .await
+                .expect("read authority"),
+            Some(ConversationState::ResetPending {
+                new_group_id: "new-group".into(),
+                reset_generation: 7,
+                notified_at_ms: 1_717_000_000_007,
+            })
+        );
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn reset_authority_survives_storage_restart() {
+        let (path, storage) = new_temp_storage();
+        let conversation_id = "conv-reset-restart";
+        storage
+            .ensure_conversation_exists("did:plc:alice", conversation_id, "old-group")
+            .await
+            .expect("create conversation");
+        storage
+            .mark_reset_pending(conversation_id, "new-group", 8, 1_717_000_000_008)
+            .await
+            .expect("publish reset authority");
+        drop(storage);
+
+        assert_eq!(
+            SqliteStorage::new(path.clone())
+                .expect("reopen storage")
+                .get_conversation_state(conversation_id)
+                .await
+                .expect("rehydrate authority"),
+            Some(ConversationState::ResetPending {
+                new_group_id: "new-group".into(),
+                reset_generation: 8,
+                notified_at_ms: 1_717_000_000_008,
+            })
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn stale_and_conflicting_marks_cannot_replace_newer_authority() {
+        let (path, storage) = new_temp_storage();
+        let conversation_id = "conv-reset-mark-fence";
+        storage
+            .ensure_conversation_exists("did:plc:alice", conversation_id, "old-group")
+            .await
+            .expect("create conversation");
+        storage
+            .mark_reset_pending(conversation_id, "group-gen-2", 2, 1_717_000_000_002)
+            .await
+            .expect("commit generation 2");
+        storage
+            .mark_reset_pending(conversation_id, "group-gen-2", 2, 1_717_000_000_002)
+            .await
+            .expect("exact replay is idempotent");
+        assert!(storage
+            .mark_reset_pending(conversation_id, "group-gen-1", 1, 1_717_000_000_001)
+            .await
+            .is_err());
+        assert!(storage
+            .mark_reset_pending(conversation_id, "conflicting-target", 2, 1_717_000_000_002)
+            .await
+            .is_err());
+        assert_eq!(
+            reset_snapshot(&storage, conversation_id),
+            (
+                "ResetPending".into(),
+                "old-group".into(),
+                1,
+                Some("group-gen-2".into()),
+                Some(2),
+                Some(1_717_000_000_002),
+                -1,
+                1,
+                0,
+            )
+        );
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn malformed_partial_authority_cannot_be_overwritten_by_newer_mark() {
+        let (path, storage) = new_temp_storage();
+        let conversation_id = "conv-reset-malformed";
+        storage
+            .ensure_conversation_exists("did:plc:alice", conversation_id, "old-group")
+            .await
+            .expect("create conversation");
+        {
+            let conn = storage.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE conversations
+                 SET state = 'ResetPending', reset_pending = 1,
+                     reset_new_group_id = NULL, reset_generation = 1,
+                     reset_notified_at_ms = 1717000000001, needs_rejoin = 1
+                 WHERE conversation_id = ?1",
+                [conversation_id],
+            )
+            .expect("inject malformed authority");
+        }
+        assert!(storage
+            .mark_reset_pending(conversation_id, "new-group", 2, 1_717_000_000_002)
+            .await
+            .is_err());
+        assert!(storage
+            .get_conversation_state(conversation_id)
+            .await
+            .is_err());
+        assert_eq!(
+            reset_snapshot(&storage, conversation_id),
+            (
+                "ResetPending".into(),
+                "old-group".into(),
+                1,
+                None,
+                Some(1),
+                Some(1_717_000_000_001),
+                -1,
+                1,
+                0,
+            )
+        );
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn needs_rejoin_propagates_sqlite_decode_errors() {
+        let (path, storage) = new_temp_storage();
+        let conversation_id = "conv-corrupt-rejoin";
+        storage
+            .ensure_conversation_exists("did:plc:alice", conversation_id, "old-group")
+            .await
+            .expect("create conversation");
+        {
+            let conn = storage.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE conversations SET needs_rejoin = 'corrupt' WHERE conversation_id = ?1",
+                [conversation_id],
+            )
+            .expect("inject invalid typed value");
+        }
+        assert!(storage.needs_rejoin(conversation_id).await.is_err());
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn unbound_active_write_and_rejoin_clear_cannot_mask_pending_reset() {
+        let (path, storage) = new_temp_storage();
+        let conversation_id = "conv-reset-stale-active";
+        storage
+            .ensure_conversation_exists("did:plc:alice", conversation_id, "old-group")
+            .await
+            .expect("create conversation");
+        storage
+            .mark_reset_pending(conversation_id, "group-gen-2", 2, 1_717_000_000_002)
+            .await
+            .expect("commit generation 2");
+        storage
+            .set_conversation_state(conversation_id, ConversationState::Active)
+            .await
+            .expect("unbound active write is a no-op");
+        storage
+            .clear_rejoin_flag(conversation_id)
+            .await
+            .expect("unbound rejoin clear is a no-op");
+        assert_eq!(
+            reset_snapshot(&storage, conversation_id),
+            (
+                "ResetPending".into(),
+                "old-group".into(),
+                1,
+                Some("group-gen-2".into()),
+                Some(2),
+                Some(1_717_000_000_002),
+                -1,
+                1,
+                0,
+            ),
+            "unbound writes must preserve reset authority and restart routing"
+        );
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn complete_reset_pending_requires_exact_generation_and_target() {
+        let (path, storage) = new_temp_storage();
+        let conversation_id = "conv-reset-complete-cas";
+        storage
+            .ensure_conversation_exists("did:plc:alice", conversation_id, "old-group")
+            .await
+            .expect("create conversation");
+        storage
+            .mark_reset_pending(conversation_id, "new-group", 7, 1_717_000_000_007)
+            .await
+            .expect("commit reset");
+        assert!(!storage
+            .complete_reset_pending(conversation_id, 6, "new-group")
+            .await
+            .expect("stale generation is a no-op"));
+        assert!(!storage
+            .complete_reset_pending(conversation_id, 7, "wrong-target")
+            .await
+            .expect("target mismatch is a no-op"));
+        assert_eq!(
+            storage
+                .get_conversation("did:plc:alice", conversation_id)
+                .await
+                .expect("read conversation")
+                .expect("conversation exists")
+                .group_id,
+            "old-group"
+        );
+        assert!(storage
+            .complete_reset_pending(conversation_id, 7, "new-group")
+            .await
+            .expect("exact completion commits"));
+        assert_eq!(
+            reset_snapshot(&storage, conversation_id),
+            (
+                "Active".into(),
+                "new-group".into(),
+                0,
+                None,
+                None,
+                None,
+                7,
+                0,
+                0,
+            )
+        );
+        assert!(!storage
+            .complete_reset_pending(conversation_id, 7, "new-group")
+            .await
+            .expect("completion affects exactly one pending row"));
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn delete_clear_is_exact_and_never_projects_active() {
+        let (path, storage) = new_temp_storage();
+        let conversation_id = "conv-reset-delete-cas";
+        storage
+            .ensure_conversation_exists("did:plc:alice", conversation_id, "old-group")
+            .await
+            .expect("create conversation");
+        storage
+            .mark_reset_pending(conversation_id, "new-group", 8, 1_717_000_000_008)
+            .await
+            .expect("commit reset");
+        assert!(!storage
+            .clear_reset_pending_for_delete(conversation_id, 7)
+            .await
+            .expect("mismatch is a no-op"));
+        assert!(storage
+            .clear_reset_pending_for_delete(conversation_id, 8)
+            .await
+            .expect("matching delete clear commits"));
+        assert_eq!(
+            reset_snapshot(&storage, conversation_id),
+            (
+                "ResetPending".into(),
+                "old-group".into(),
+                0,
+                None,
+                None,
+                None,
+                8,
+                0,
+                0,
+            ),
+            "delete clearing must preserve the predecessor mapping and must not publish Active"
+        );
+        assert!(storage
+            .get_conversation_state(conversation_id)
+            .await
+            .is_err());
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn completed_generation_high_water_rejects_replay_after_restart() {
+        let (path, storage) = new_temp_storage();
+        let conversation_id = "conv-reset-high-water";
+        storage
+            .ensure_conversation_exists("did:plc:alice", conversation_id, "group-a")
+            .await
+            .expect("create conversation");
+        storage
+            .mark_reset_pending(conversation_id, "group-b", 1, 1_717_000_000_001)
+            .await
+            .expect("publish generation 1");
+        assert!(storage
+            .complete_reset_pending(conversation_id, 1, "group-b")
+            .await
+            .expect("complete generation 1"));
+        storage
+            .mark_reset_pending(conversation_id, "group-c", 2, 1_717_000_000_002)
+            .await
+            .expect("publish generation 2");
+        assert!(storage
+            .complete_reset_pending(conversation_id, 2, "group-c")
+            .await
+            .expect("complete generation 2"));
+        drop(storage);
+
+        let reopened = SqliteStorage::new(path.clone()).expect("reopen storage");
+        assert!(reopened
+            .mark_reset_pending(conversation_id, "group-b", 1, 1_717_000_000_001)
+            .await
+            .is_err());
+        assert_eq!(
+            reset_snapshot(&reopened, conversation_id),
+            (
+                "Active".into(),
+                "group-c".into(),
+                0,
+                None,
+                None,
+                None,
+                2,
+                0,
+                0,
+            ),
+            "completion must retain a durable monotonic fence across restart"
+        );
+
+        drop(reopened);
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn delete_clear_preserves_generation_high_water_after_restart() {
+        let (path, storage) = new_temp_storage();
+        let conversation_id = "conv-reset-delete-high-water";
+        storage
+            .ensure_conversation_exists("did:plc:alice", conversation_id, "group-a")
+            .await
+            .expect("create conversation");
+        storage
+            .mark_reset_pending(conversation_id, "group-b", 3, 1_717_000_000_003)
+            .await
+            .expect("publish generation 3");
+        assert!(storage
+            .clear_reset_pending_for_delete(conversation_id, 3)
+            .await
+            .expect("clear exact pending generation"));
+        drop(storage);
+
+        let reopened = SqliteStorage::new(path.clone()).expect("reopen storage");
+        assert_eq!(generation_fence(&reopened, conversation_id), (3, 1));
+        assert!(reopened
+            .mark_reset_pending(conversation_id, "group-b", 3, 1_717_000_000_003)
+            .await
+            .is_err());
+        assert_eq!(
+            reopened
+                .get_conversation("did:plc:alice", conversation_id)
+                .await
+                .expect("read conversation")
+                .expect("conversation remains after simulated delete failure")
+                .group_id,
+            "group-a"
+        );
+
+        drop(reopened);
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn legacy_migration_fences_unknown_rows_and_seeds_complete_pending_rows() {
+        let path =
+            std::env::temp_dir().join(format!("birdaemon-legacy-{}.db", uuid::Uuid::new_v4()));
+        {
+            let conn = Connection::open(&path).expect("open legacy database");
+            conn.execute_batch(
+                "CREATE TABLE conversations (
+                    conversation_id TEXT PRIMARY KEY,
+                    user_did TEXT NOT NULL,
+                    group_id TEXT NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'Initializing',
+                    needs_rejoin INTEGER NOT NULL DEFAULT 0,
+                    reset_pending INTEGER NOT NULL DEFAULT 0,
+                    reset_new_group_id TEXT,
+                    reset_generation INTEGER,
+                    reset_notified_at_ms INTEGER,
+                    join_method TEXT,
+                    join_epoch INTEGER,
+                    epoch INTEGER NOT NULL DEFAULT 0,
+                    members_json TEXT NOT NULL DEFAULT '[]',
+                    metadata_json TEXT,
+                    created_at TEXT,
+                    updated_at TEXT,
+                    sequencer_did TEXT
+                );
+                INSERT INTO conversations
+                    (conversation_id, user_did, group_id, state)
+                    VALUES ('legacy-active', 'did:plc:alice', 'group-c', 'Active');
+                INSERT INTO conversations
+                    (conversation_id, user_did, group_id, state, needs_rejoin,
+                     reset_pending, reset_new_group_id, reset_generation,
+                     reset_notified_at_ms)
+                    VALUES ('legacy-pending', 'did:plc:alice', 'group-a',
+                            'ResetPending', 0, 1, 'group-b', 5, 1717000000005);",
+            )
+            .expect("create legacy rows");
+        }
+
+        let storage = SqliteStorage::new(path.clone()).expect("migrate legacy database");
+        assert_eq!(generation_fence(&storage, "legacy-active"), (-1, 0));
+        assert!(storage
+            .mark_reset_pending("legacy-active", "group-d", 6, 1_717_000_000_006)
+            .await
+            .is_err());
+        assert_eq!(
+            storage
+                .get_conversation("did:plc:alice", "legacy-active")
+                .await
+                .expect("read legacy active row")
+                .expect("row exists")
+                .group_id,
+            "group-c"
+        );
+
+        assert!(storage
+            .get_conversation_state("legacy-active")
+            .await
+            .is_err());
+        assert!(storage.needs_rejoin("legacy-active").await.is_err());
+
+        assert_eq!(generation_fence(&storage, "legacy-pending"), (5, 0));
+        assert!(storage
+            .get_conversation_state("legacy-pending")
+            .await
+            .is_err());
+        assert!(storage.needs_rejoin("legacy-pending").await.is_err());
+        assert!(storage
+            .mark_reset_pending("legacy-pending", "group-b", 5, 1_717_000_000_005)
+            .await
+            .is_err());
+        assert!(storage
+            .complete_reset_pending("legacy-pending", 5, "group-b")
+            .await
+            .is_err());
+        assert!(storage
+            .clear_reset_pending_for_delete("legacy-pending", 5)
+            .await
+            .is_err());
+        assert_eq!(
+            reset_snapshot(&storage, "legacy-pending"),
+            (
+                "ResetPending".into(),
+                "group-a".into(),
+                1,
+                Some("group-b".into()),
+                Some(5),
+                Some(1_717_000_000_005),
+                5,
+                1,
+                0,
+            ),
+            "migration must preserve forensic authority without treating the legacy predecessor mapping as trusted"
+        );
+
+        {
+            let conn = storage.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE conversations
+                 SET applied_reset_generation = -1, needs_rejoin = 0
+                 WHERE conversation_id = 'legacy-pending'",
+                [],
+            )
+            .expect("simulate crash after schema migration but before forensic seed");
+        }
+        drop(storage);
+        let reopened = SqliteStorage::new(path.clone()).expect("resume interrupted migration");
+        assert_eq!(generation_fence(&reopened, "legacy-pending"), (5, 0));
+        assert_eq!(reset_snapshot(&reopened, "legacy-pending").7, 1);
+        assert!(reopened
+            .get_conversation_state("legacy-pending")
+            .await
+            .is_err());
+        drop(reopened);
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn reset_mutations_report_zero_affected_rows() {
+        let (path, storage) = new_temp_storage();
+        assert!(storage
+            .mark_reset_pending("missing", "new-group", 1, 1)
+            .await
+            .is_err());
+        assert!(!storage
+            .complete_reset_pending("missing", 1, "new-group")
+            .await
+            .expect("missing completion is false"));
+        assert!(!storage
+            .clear_reset_pending_for_delete("missing", 1)
+            .await
+            .expect("missing delete clear is false"));
 
         drop(storage);
         let _ = fs::remove_file(path);
