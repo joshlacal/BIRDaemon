@@ -15,6 +15,156 @@ use catbird_mls::orchestrator::error::{OrchestratorError, Result};
 use catbird_mls::orchestrator::types::*;
 use catbird_mls::orchestrator::MLSAPIClient;
 
+fn server_epoch_from_wire(epoch: i64) -> Result<Option<u64>> {
+    u64::try_from(epoch).map(Some).map_err(|_| {
+        OrchestratorError::Api(format!(
+            "getMessages returned invalid negative epoch: {epoch}"
+        ))
+    })
+}
+
+fn receipt_bytes(field: &str, value: &serde_json::Value) -> Result<Vec<u8>> {
+    if let Some(items) = value.as_array() {
+        return items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                item.as_u64()
+                    .and_then(|value| u8::try_from(value).ok())
+                    .ok_or_else(|| {
+                        OrchestratorError::Api(format!(
+                            "invalid sequencer receipt: {field}[{index}] is not a byte"
+                        ))
+                    })
+            })
+            .collect();
+    }
+    let encoded = value.as_str().ok_or_else(|| {
+        OrchestratorError::Api(format!(
+            "invalid sequencer receipt: {field} must be encoded bytes"
+        ))
+    })?;
+    B64.decode(encoded)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(encoded))
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded))
+        .or_else(|_| hex::decode(encoded.trim_start_matches("0x")))
+        .map_err(|_| {
+            OrchestratorError::Api(format!(
+                "invalid sequencer receipt: {field} is not base64, base64url, or hex"
+            ))
+        })
+}
+
+fn receipt_field<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    snake: &str,
+    camel: &str,
+) -> Option<&'a serde_json::Value> {
+    object.get(snake).or_else(|| object.get(camel))
+}
+
+fn parse_optional_sequencer_receipt(
+    output: &serde_json::Value,
+) -> Result<Option<SequencerReceipt>> {
+    let Some(root) = output.as_object() else {
+        return Ok(None);
+    };
+    let receipt = root.get("receipt").or_else(|| {
+        root.values()
+            .find_map(|value| value.as_object().and_then(|object| object.get("receipt")))
+    });
+    let Some(receipt) = receipt else {
+        return Ok(None);
+    };
+    let object = receipt.as_object().ok_or_else(|| {
+        OrchestratorError::Api("invalid sequencer receipt: expected object".into())
+    })?;
+    let string = |snake: &str, camel: &str| {
+        receipt_field(object, snake, camel)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                OrchestratorError::Api(format!(
+                    "invalid sequencer receipt: missing {snake}/{camel}"
+                ))
+            })
+    };
+    let signed_integer = |snake: &str, camel: &str| {
+        receipt_field(object, snake, camel)
+            .and_then(serde_json::Value::as_i64)
+            .ok_or_else(|| {
+                OrchestratorError::Api(format!(
+                    "invalid sequencer receipt: {snake}/{camel} must be an ATProto i64 integer"
+                ))
+            })
+    };
+
+    let epoch = i32::try_from(signed_integer("epoch", "epoch")?).map_err(|_| {
+        OrchestratorError::Api("invalid sequencer receipt: epoch is out of i32 range".into())
+    })?;
+    if epoch < 0 {
+        return Err(OrchestratorError::Api(
+            "invalid sequencer receipt: epoch is negative".into(),
+        ));
+    }
+    let sequencer_term = u64::try_from(signed_integer("sequencer_term", "sequencerTerm")?)
+        .map_err(|_| {
+            OrchestratorError::Api("invalid sequencer receipt: sequencer term is negative".into())
+        })?;
+    let commit_hash = receipt_bytes(
+        "commit_hash",
+        receipt_field(object, "commit_hash", "commitHash").ok_or_else(|| {
+            OrchestratorError::Api("invalid sequencer receipt: missing commit hash".into())
+        })?,
+    )?;
+    let signature = receipt_bytes(
+        "signature",
+        object.get("signature").ok_or_else(|| {
+            OrchestratorError::Api("invalid sequencer receipt: missing signature".into())
+        })?,
+    )?;
+
+    Ok(Some(SequencerReceipt {
+        convo_id: string("convo_id", "convoId")?,
+        epoch,
+        sequencer_term,
+        commit_hash,
+        sequencer_did: string("sequencer_did", "sequencerDid")?,
+        issued_at: signed_integer("issued_at", "issuedAt")?,
+        signature,
+    }))
+}
+
+fn build_publish_key_package_body(
+    key_package: &[u8],
+    cipher_suite: &str,
+    expires_at: &str,
+    device_id: Option<&str>,
+) -> Result<serde_json::Value> {
+    use catbird_atproto::catbird::mls_chat::publish_key_packages;
+
+    let kp_item: publish_key_packages::KeyPackageItem = publish_key_packages::KeyPackageItemData {
+        cipher_suite: cipher_suite.to_string(),
+        expires: expires_at.parse().unwrap(),
+        key_package: key_package.to_vec(),
+    }
+    .into();
+
+    let input: publish_key_packages::Input = publish_key_packages::InputData {
+        action: "publish".to_string(),
+        convo_id: None,
+        device_id: device_id.map(str::to_string),
+        key_packages: Some(vec![kp_item]),
+        local_hashes: None,
+        reason: None,
+        target_dids: None,
+    }
+    .into();
+
+    serde_json::to_value(&input)
+        .map_err(|e| OrchestratorError::Api(format!("Serialize error: {e}")))
+}
+
 /// Jacquard session type alias.
 type Session = jacquard::client::MemoryCredentialSession;
 
@@ -528,13 +678,14 @@ impl MLSAPIClient for BirdApiClient {
             .post("blue.catbird.mlsChat.commitGroupChange", &input)
             .await?;
 
+        let receipt = parse_optional_sequencer_receipt(&output)?;
         Ok(AddMembersServerResult {
             success: output
                 .get("success")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true),
             new_epoch: parse_u64(&output, "newEpoch"),
-            receipt: None,
+            receipt,
         })
     }
 
@@ -640,14 +791,17 @@ impl MLSAPIClient for BirdApiClient {
         let envelopes = output
             .messages
             .into_iter()
-            .map(|m| IncomingEnvelope {
-                conversation_id: m.convo_id.to_string(),
-                sender_did: String::new(),
-                ciphertext: m.ciphertext.to_vec(),
-                timestamp: m.created_at.as_ref().with_timezone(&Utc),
-                server_message_id: Some(m.id.to_string()),
+            .map(|m| {
+                Ok(IncomingEnvelope {
+                    conversation_id: m.convo_id.to_string(),
+                    sender_did: String::new(),
+                    ciphertext: m.ciphertext.to_vec(),
+                    timestamp: m.created_at.as_ref().with_timezone(&Utc),
+                    server_message_id: Some(m.id.to_string()),
+                    server_epoch: server_epoch_from_wire(m.epoch)?,
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         let next_cursor = output.last_seq.map(|n| n.to_string());
 
@@ -659,30 +813,10 @@ impl MLSAPIClient for BirdApiClient {
         key_package: &[u8],
         cipher_suite: &str,
         expires_at: &str,
+        device_id: Option<&str>,
     ) -> Result<()> {
-        use catbird_atproto::catbird::mls_chat::publish_key_packages;
-
-        let kp_item: publish_key_packages::KeyPackageItem =
-            publish_key_packages::KeyPackageItemData {
-                cipher_suite: cipher_suite.to_string(),
-                expires: expires_at.parse().unwrap(),
-                key_package: key_package.to_vec(),
-            }
-            .into();
-
-        let input: publish_key_packages::Input = publish_key_packages::InputData {
-            action: "publish".to_string(),
-            convo_id: None,
-            device_id: None,
-            key_packages: Some(vec![kp_item]),
-            local_hashes: None,
-            reason: None,
-            target_dids: None,
-        }
-        .into();
-
-        let body = serde_json::to_value(&input)
-            .map_err(|e| OrchestratorError::Api(format!("Serialize error: {e}")))?;
+        let body =
+            build_publish_key_package_body(key_package, cipher_suite, expires_at, device_id)?;
 
         self.post_void("blue.catbird.mlsChat.publishKeyPackages", &body)
             .await
@@ -971,6 +1105,7 @@ impl MLSAPIClient for BirdApiClient {
             .post("blue.catbird.mlsChat.commitGroupChange", &input)
             .await?;
 
+        let receipt = parse_optional_sequencer_receipt(&output)?;
         Ok(ProcessExternalCommitResult {
             epoch: parse_u64(&output, "newEpoch"),
             rejoined_at: output
@@ -978,7 +1113,7 @@ impl MLSAPIClient for BirdApiClient {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string(),
-            receipt: None,
+            receipt,
         })
     }
 }
@@ -1226,7 +1361,10 @@ fn build_report_recovery_failure_body(
 
 #[cfg(test)]
 mod tests {
-    use super::build_report_recovery_failure_body;
+    use super::{
+        build_publish_key_package_body, build_report_recovery_failure_body,
+        parse_optional_sequencer_receipt, server_epoch_from_wire,
+    };
 
     #[test]
     fn body_contains_required_fields() {
@@ -1262,5 +1400,103 @@ mod tests {
         );
         assert_eq!(body["epochAuthenticator"], "cafebabe");
         assert!(body.get("failureMode").is_none());
+    }
+
+    #[test]
+    fn publish_key_package_body_preserves_rust_owned_device_id() {
+        let body = build_publish_key_package_body(
+            &[1, 2, 3, 4],
+            "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519",
+            "2030-01-02T03:04:05Z",
+            Some("4f61f54c-c131-4c78-bb28-cb86589dbbea"),
+        )
+        .expect("serialize publish request");
+
+        assert_eq!(
+            body["deviceId"], "4f61f54c-c131-4c78-bb28-cb86589dbbea",
+            "fresh-device key packages must stay bound to the Rust-owned UUID"
+        );
+    }
+
+    #[test]
+    fn server_epoch_conversion_preserves_nonnegative_wire_values() {
+        assert_eq!(server_epoch_from_wire(0).unwrap(), Some(0));
+        assert_eq!(server_epoch_from_wire(42).unwrap(), Some(42));
+    }
+
+    #[test]
+    fn server_epoch_conversion_rejects_negative_wire_values() {
+        assert!(
+            server_epoch_from_wire(-1).is_err(),
+            "a negative server epoch must fail closed instead of bypassing the catch-up fence"
+        );
+    }
+
+    #[test]
+    fn absent_sequencer_receipt_is_none() {
+        assert!(parse_optional_sequencer_receipt(&serde_json::json!({
+            "success": true,
+            "newEpoch": 4
+        }))
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn valid_present_sequencer_receipt_is_preserved() {
+        let receipt = parse_optional_sequencer_receipt(&serde_json::json!({
+            "success": true,
+            "receipt": {
+                "convoId": "conv-1",
+                "epoch": 4,
+                "sequencerTerm": 9,
+                "commitHash": [1, 2, 3],
+                "sequencerDid": "did:web:sequencer.example",
+                "issuedAt": 1_725_000_000,
+                "signature": [4, 5, 6]
+            }
+        }))
+        .unwrap()
+        .expect("receipt is present");
+        assert_eq!(receipt.convo_id, "conv-1");
+        assert_eq!(receipt.epoch, 4);
+        assert_eq!(receipt.sequencer_term, 9);
+        assert_eq!(receipt.commit_hash, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn malformed_present_sequencer_receipt_fails_closed() {
+        assert!(parse_optional_sequencer_receipt(&serde_json::json!({
+            "receipt": { "sequencerTerm": 9 }
+        }))
+        .is_err());
+        assert!(parse_optional_sequencer_receipt(&serde_json::json!({
+            "receipt": {
+                "convoId": "conv-1",
+                "epoch": 4,
+                "sequencerTerm": u64::MAX,
+                "commitHash": [1, 2, 3],
+                "sequencerDid": "did:web:sequencer.example",
+                "issuedAt": 1_725_000_000,
+                "signature": [4, 5, 6]
+            }
+        }))
+        .is_err());
+        assert!(parse_optional_sequencer_receipt(&serde_json::json!({
+            "receipt": {
+                "convoId": "conv-1",
+                "epoch": -1,
+                "sequencerTerm": 9,
+                "commitHash": [1, 2, 3],
+                "sequencerDid": "did:web:sequencer.example",
+                "issuedAt": 1_725_000_000,
+                "signature": [4, 5, 6]
+            }
+        }))
+        .is_err());
+        assert!(parse_optional_sequencer_receipt(&serde_json::json!({
+            "receipt": "not-an-object"
+        }))
+        .is_err());
     }
 }

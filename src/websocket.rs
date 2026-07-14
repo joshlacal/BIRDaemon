@@ -38,7 +38,7 @@ fn cbor_int(map: &[(CborValue, CborValue)], key: &str) -> Option<i64> {
     map.iter().find_map(|(k, v)| match (k, v) {
         (CborValue::Text(k), CborValue::Integer(v)) if k == key => {
             let n: i128 = (*v).into();
-            Some(n as i64)
+            i64::try_from(n).ok()
         }
         _ => None,
     })
@@ -339,7 +339,10 @@ fn handle_frame(data: &[u8]) -> Result<Option<(MlsEvent, Option<String>)>, Strin
             let id = cbor_str(msg_map, "id").ok_or("Missing message.id")?;
             let convo_id = cbor_str(msg_map, "convoId").ok_or("Missing message.convoId")?;
             let created_at = cbor_str(msg_map, "createdAt").ok_or("Missing message.createdAt")?;
-            let epoch = cbor_int(msg_map, "epoch").unwrap_or(0) as u64;
+            let wire_epoch = cbor_int(msg_map, "epoch")
+                .ok_or_else(|| "Missing or invalid message.epoch".to_string())?;
+            let epoch = u64::try_from(wire_epoch)
+                .map_err(|_| "message.epoch must be nonnegative".to_string())?;
             let ciphertext =
                 cbor_bytes(msg_map, "ciphertext").ok_or("Missing or invalid message.ciphertext")?;
 
@@ -399,9 +402,14 @@ fn handle_frame(data: &[u8]) -> Result<Option<(MlsEvent, Option<String>)>, Strin
             let new_group_id = cbor_str(top, "newGroupId")
                 .or_else(|| cbor_str(top, "new_group_id"))
                 .ok_or("Missing newGroupId in groupResetEvent")?;
-            let reset_generation = cbor_int(top, "resetGeneration")
+            let wire_reset_generation = cbor_int(top, "resetGeneration")
                 .or_else(|| cbor_int(top, "reset_generation"))
-                .unwrap_or(0) as i32;
+                .ok_or_else(|| "Missing or invalid resetGeneration".to_string())?;
+            if wire_reset_generation < 0 {
+                return Err("resetGeneration must be nonnegative".to_string());
+            }
+            let reset_generation = i32::try_from(wire_reset_generation)
+                .map_err(|_| "resetGeneration exceeds i32 range".to_string())?;
 
             tracing::info!(
                 conversation_id = %conversation_id,
@@ -442,5 +450,144 @@ fn handle_frame(data: &[u8]) -> Result<Option<(MlsEvent, Option<String>)>, Strin
                 )
             }))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn message_frame(epoch: Option<CborValue>) -> Vec<u8> {
+        let header = CborValue::Map(vec![
+            (CborValue::Text("op".into()), CborValue::Integer(1.into())),
+            (
+                CborValue::Text("t".into()),
+                CborValue::Text("#messageEvent".into()),
+            ),
+        ]);
+
+        let mut message = vec![
+            (
+                CborValue::Text("id".into()),
+                CborValue::Text("01JTESTMESSAGE0000000000000".into()),
+            ),
+            (
+                CborValue::Text("convoId".into()),
+                CborValue::Text("convo-test".into()),
+            ),
+            (
+                CborValue::Text("createdAt".into()),
+                CborValue::Text("2030-01-02T03:04:05Z".into()),
+            ),
+            (
+                CborValue::Text("ciphertext".into()),
+                CborValue::Bytes(vec![1, 2, 3]),
+            ),
+        ];
+        if let Some(epoch) = epoch {
+            message.push((CborValue::Text("epoch".into()), epoch));
+        }
+        let payload = CborValue::Map(vec![(
+            CborValue::Text("message".into()),
+            CborValue::Map(message),
+        )]);
+
+        let mut frame = Vec::new();
+        ciborium::into_writer(&header, &mut frame).expect("encode frame header");
+        ciborium::into_writer(&payload, &mut frame).expect("encode frame payload");
+        frame
+    }
+
+    fn parsed_message_epoch(frame: &[u8]) -> Result<u64, String> {
+        match handle_frame(frame)? {
+            Some((MlsEvent::Message { epoch, .. }, _)) => Ok(epoch),
+            other => Err(format!("expected message event, got {other:?}")),
+        }
+    }
+
+    fn group_reset_frame(reset_generation: Option<CborValue>) -> Vec<u8> {
+        let header = CborValue::Map(vec![
+            (CborValue::Text("op".into()), CborValue::Integer(1.into())),
+            (
+                CborValue::Text("t".into()),
+                CborValue::Text("#groupResetEvent".into()),
+            ),
+        ]);
+        let mut payload = vec![
+            (
+                CborValue::Text("convoId".into()),
+                CborValue::Text("convo-test".into()),
+            ),
+            (
+                CborValue::Text("newGroupId".into()),
+                CborValue::Text("00112233".into()),
+            ),
+        ];
+        if let Some(generation) = reset_generation {
+            payload.push((CborValue::Text("resetGeneration".into()), generation));
+        }
+
+        let mut frame = Vec::new();
+        ciborium::into_writer(&header, &mut frame).expect("encode frame header");
+        ciborium::into_writer(&CborValue::Map(payload), &mut frame).expect("encode frame payload");
+        frame
+    }
+
+    fn parsed_reset_generation(frame: &[u8]) -> Result<i32, String> {
+        match handle_frame(frame)? {
+            Some((
+                MlsEvent::GroupReset {
+                    reset_generation, ..
+                },
+                _,
+            )) => Ok(reset_generation),
+            other => Err(format!("expected group-reset event, got {other:?}")),
+        }
+    }
+
+    #[test]
+    fn message_frame_preserves_valid_epoch() {
+        let frame = message_frame(Some(CborValue::Integer(42.into())));
+        assert_eq!(parsed_message_epoch(&frame).unwrap(), 42);
+    }
+
+    #[test]
+    fn message_frame_rejects_missing_epoch() {
+        assert!(parsed_message_epoch(&message_frame(None)).is_err());
+    }
+
+    #[test]
+    fn message_frame_rejects_negative_epoch() {
+        let frame = message_frame(Some(CborValue::Integer((-1).into())));
+        assert!(parsed_message_epoch(&frame).is_err());
+    }
+
+    #[test]
+    fn message_frame_rejects_epoch_larger_than_i64() {
+        let frame = message_frame(Some(CborValue::Integer(u64::MAX.into())));
+        assert!(parsed_message_epoch(&frame).is_err());
+    }
+
+    #[test]
+    fn group_reset_frame_preserves_valid_generation() {
+        let frame = group_reset_frame(Some(CborValue::Integer(7.into())));
+        assert_eq!(parsed_reset_generation(&frame).unwrap(), 7);
+    }
+
+    #[test]
+    fn group_reset_frame_rejects_missing_generation() {
+        assert!(parsed_reset_generation(&group_reset_frame(None)).is_err());
+    }
+
+    #[test]
+    fn group_reset_frame_rejects_negative_generation() {
+        let frame = group_reset_frame(Some(CborValue::Integer((-1).into())));
+        assert!(parsed_reset_generation(&frame).is_err());
+    }
+
+    #[test]
+    fn group_reset_frame_rejects_generation_larger_than_i32() {
+        let frame = group_reset_frame(Some(CborValue::Integer(i64::MAX.into())));
+        assert!(parsed_reset_generation(&frame).is_err());
     }
 }
