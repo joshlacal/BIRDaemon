@@ -262,6 +262,45 @@ impl SqliteStorage {
             sequencer_did,
         })
     }
+
+    /// Atomically retarget a complete, reconciled ResetPending tuple after
+    /// the authoritative winner has been verified. The trait implementation
+    /// forwards here so focused tests exercise the same atomic statement.
+    fn adopt_reset_pending_target_cas(
+        &self,
+        conversation_id: &str,
+        expected_generation: i32,
+        expected_old_target: &str,
+        authoritative_new_target: &str,
+    ) -> Result<bool> {
+        if authoritative_new_target.is_empty() {
+            return Ok(false);
+        }
+        let conn = self.conn.lock().unwrap();
+        let changed = conn
+            .execute(
+                "UPDATE conversations
+                 SET reset_new_group_id = ?1,
+                     needs_rejoin = 1
+                 WHERE conversation_id = ?2
+                   AND ?1 <> ''
+                   AND state = 'ResetPending'
+                   AND reset_pending = 1
+                   AND reset_new_group_id = ?3
+                   AND reset_new_group_id <> ''
+                   AND reset_generation = ?4
+                   AND reset_notified_at_ms IS NOT NULL
+                   AND reset_generation_fence_initialized = 1",
+                rusqlite::params![
+                    authoritative_new_target,
+                    conversation_id,
+                    expected_old_target,
+                    expected_generation,
+                ],
+            )
+            .map_err(Self::map_err)?;
+        Ok(changed == 1)
+    }
 }
 
 #[async_trait]
@@ -559,6 +598,21 @@ impl MLSStorageBackend for SqliteStorage {
         Ok(())
     }
 
+    async fn adopt_reset_pending_target(
+        &self,
+        conversation_id: &str,
+        expected_generation: i32,
+        expected_old_target: &str,
+        authoritative_new_target: &str,
+    ) -> Result<bool> {
+        self.adopt_reset_pending_target_cas(
+            conversation_id,
+            expected_generation,
+            expected_old_target,
+            authoritative_new_target,
+        )
+    }
+
     async fn complete_reset_pending(
         &self,
         conversation_id: &str,
@@ -835,6 +889,7 @@ impl MLSStorageBackend for SqliteStorage {
         &[
             "get_conversation_state",
             "mark_reset_pending",
+            "adopt_reset_pending_target",
             "complete_reset_pending",
             "clear_reset_pending_for_delete",
             "set_conversation_sequencer",
@@ -1016,6 +1071,97 @@ mod tests {
                 reset_generation: 7,
                 notified_at_ms: 1_717_000_000_007,
             })
+        );
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn adopt_reset_pending_target_cas_preserves_complete_authority_and_fences() {
+        let (path, storage) = new_temp_storage();
+        let conversation_id = "conv-reset-winner-adoption";
+        storage
+            .ensure_conversation_exists("did:plc:alice", conversation_id, "old-group")
+            .await
+            .expect("create conversation");
+        storage
+            .mark_reset_pending(conversation_id, "losing-group", 23, 1_717_000_000_023)
+            .await
+            .expect("publish losing candidate");
+
+        assert!(storage
+            .adopt_reset_pending_target_cas(conversation_id, 23, "losing-group", "winner-group",)
+            .expect("adopt authoritative winner"));
+        assert_eq!(
+            reset_snapshot(&storage, conversation_id),
+            (
+                "ResetPending".into(),
+                "old-group".into(),
+                1,
+                Some("winner-group".into()),
+                Some(23),
+                Some(1_717_000_000_023),
+                -1,
+                1,
+                0,
+            )
+        );
+        assert_eq!(generation_fence(&storage, conversation_id), (-1, 1));
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn adopt_reset_pending_target_cas_rejects_stale_competing_and_unfenced_rows() {
+        let (path, storage) = new_temp_storage();
+        let conversation_id = "conv-reset-competing-winners";
+        storage
+            .ensure_conversation_exists("did:plc:alice", conversation_id, "old-group")
+            .await
+            .expect("create conversation");
+        storage
+            .mark_reset_pending(conversation_id, "losing-group", 24, 1_717_000_000_024)
+            .await
+            .expect("publish reset candidate");
+
+        assert!(!storage
+            .adopt_reset_pending_target_cas(conversation_id, 24, "losing-group", "")
+            .expect("empty winner is rejected fail closed"));
+
+        assert!(!storage
+            .adopt_reset_pending_target_cas(conversation_id, 23, "losing-group", "winner-a")
+            .expect("stale generation is a clean CAS miss"));
+        assert!(!storage
+            .adopt_reset_pending_target_cas(conversation_id, 24, "other-loser", "winner-a")
+            .expect("wrong old target is a clean CAS miss"));
+        assert!(storage
+            .adopt_reset_pending_target_cas(conversation_id, 24, "losing-group", "winner-a")
+            .expect("verified winner adopts"));
+        assert!(storage
+            .adopt_reset_pending_target_cas(conversation_id, 24, "winner-a", "winner-a")
+            .expect("exact replay is idempotent"));
+        assert!(!storage
+            .adopt_reset_pending_target_cas(conversation_id, 24, "losing-group", "winner-b")
+            .expect("competing stale winner loses CAS"));
+
+        storage
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE conversations SET reset_generation_fence_initialized = 0
+                 WHERE conversation_id = ?1",
+                [conversation_id],
+            )
+            .unwrap();
+        assert!(!storage
+            .adopt_reset_pending_target_cas(conversation_id, 24, "winner-a", "winner-b")
+            .expect("unreconciled legacy row is a clean CAS miss"));
+        assert_eq!(
+            reset_snapshot(&storage, conversation_id).3,
+            Some("winner-a".into())
         );
 
         drop(storage);
