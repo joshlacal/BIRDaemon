@@ -618,7 +618,11 @@ impl MLSStorageBackend for SqliteStorage {
         conversation_id: &str,
         expected_generation: i32,
         expected_new_group_id_hex: &str,
+        landed_epoch: u64,
     ) -> Result<bool> {
+        let landed_epoch = i64::try_from(landed_epoch).map_err(|_| {
+            OrchestratorError::Storage("landed reset epoch exceeds SQLite range".into())
+        })?;
         let conn = self.conn.lock().unwrap();
         Self::require_reconciled_reset_authority(&conn, conversation_id)?;
         let changed = conn
@@ -626,7 +630,8 @@ impl MLSStorageBackend for SqliteStorage {
                 "UPDATE conversations
                  SET state = 'Active',
                      group_id = ?1,
-                     epoch = 0,
+                     epoch = ?5,
+                     join_epoch = ?5,
                      reset_pending = 0,
                      reset_new_group_id = NULL,
                      reset_generation = NULL,
@@ -646,6 +651,7 @@ impl MLSStorageBackend for SqliteStorage {
                     Utc::now().to_rfc3339(),
                     conversation_id,
                     expected_generation,
+                    landed_epoch,
                 ],
             )
             .map_err(Self::map_err)?;
@@ -1362,11 +1368,11 @@ mod tests {
             .await
             .expect("commit reset");
         assert!(!storage
-            .complete_reset_pending(conversation_id, 6, "new-group")
+            .complete_reset_pending(conversation_id, 6, "new-group", 6)
             .await
             .expect("stale generation is a no-op"));
         assert!(!storage
-            .complete_reset_pending(conversation_id, 7, "wrong-target")
+            .complete_reset_pending(conversation_id, 7, "wrong-target", 7)
             .await
             .expect("target mismatch is a no-op"));
         assert_eq!(
@@ -1379,7 +1385,7 @@ mod tests {
             "old-group"
         );
         assert!(storage
-            .complete_reset_pending(conversation_id, 7, "new-group")
+            .complete_reset_pending(conversation_id, 7, "new-group", 7)
             .await
             .expect("exact completion commits"));
         assert_eq!(
@@ -1393,13 +1399,107 @@ mod tests {
                 None,
                 7,
                 0,
-                0,
+                7,
             )
         );
         assert!(!storage
-            .complete_reset_pending(conversation_id, 7, "new-group")
+            .complete_reset_pending(conversation_id, 7, "new-group", 7)
             .await
             .expect("completion affects exactly one pending row"));
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn completion_atomically_projects_landed_epoch_and_preserves_mismatch() {
+        let (path, storage) = new_temp_storage();
+        let conversation_id = "conv-landed-epoch";
+        storage
+            .ensure_conversation_exists("did:plc:alice", conversation_id, "old-group")
+            .await
+            .expect("create conversation");
+        storage
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE conversations SET epoch = 741, join_epoch = 742
+                 WHERE conversation_id = ?1",
+                [conversation_id],
+            )
+            .expect("seed distinct current and join epochs");
+        storage
+            .mark_reset_pending(conversation_id, "new-group", 23, 1_717_000_000_023)
+            .await
+            .expect("publish reset authority");
+
+        type CompletionSnapshot = (
+            String,
+            String,
+            u64,
+            Option<u64>,
+            i32,
+            Option<String>,
+            Option<i32>,
+            Option<i64>,
+            i32,
+            i32,
+        );
+        let snapshot = || -> CompletionSnapshot {
+            storage
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT state, group_id, epoch, join_epoch, reset_pending,
+                        reset_new_group_id, reset_generation, reset_notified_at_ms,
+                        needs_rejoin, applied_reset_generation
+                 FROM conversations WHERE conversation_id = ?1",
+                    [conversation_id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                            row.get(7)?,
+                            row.get(8)?,
+                            row.get(9)?,
+                        ))
+                    },
+                )
+                .expect("read completion snapshot")
+        };
+        let pending = snapshot();
+        assert!(!storage
+            .complete_reset_pending(conversation_id, 22, "new-group", 3)
+            .await
+            .expect("stale completion is a clean CAS miss"));
+        assert_eq!(snapshot(), pending, "mismatch preserves every field");
+
+        assert!(storage
+            .complete_reset_pending(conversation_id, 23, "new-group", 3)
+            .await
+            .expect("exact completion commits"));
+        assert_eq!(
+            snapshot(),
+            (
+                "Active".into(),
+                "new-group".into(),
+                3,
+                Some(3),
+                0,
+                None,
+                None,
+                None,
+                0,
+                23,
+            )
+        );
 
         drop(storage);
         let _ = fs::remove_file(path);
@@ -1462,7 +1562,7 @@ mod tests {
             .await
             .expect("publish generation 1");
         assert!(storage
-            .complete_reset_pending(conversation_id, 1, "group-b")
+            .complete_reset_pending(conversation_id, 1, "group-b", 1)
             .await
             .expect("complete generation 1"));
         storage
@@ -1470,7 +1570,7 @@ mod tests {
             .await
             .expect("publish generation 2");
         assert!(storage
-            .complete_reset_pending(conversation_id, 2, "group-c")
+            .complete_reset_pending(conversation_id, 2, "group-c", 2)
             .await
             .expect("complete generation 2"));
         drop(storage);
@@ -1491,7 +1591,7 @@ mod tests {
                 None,
                 2,
                 0,
-                0,
+                2,
             ),
             "completion must retain a durable monotonic fence across restart"
         );
@@ -1610,7 +1710,7 @@ mod tests {
             .await
             .is_err());
         assert!(storage
-            .complete_reset_pending("legacy-pending", 5, "group-b")
+            .complete_reset_pending("legacy-pending", 5, "group-b", 5)
             .await
             .is_err());
         assert!(storage
@@ -1663,7 +1763,7 @@ mod tests {
             .await
             .is_err());
         assert!(!storage
-            .complete_reset_pending("missing", 1, "new-group")
+            .complete_reset_pending("missing", 1, "new-group", 1)
             .await
             .expect("missing completion is false"));
         assert!(!storage
