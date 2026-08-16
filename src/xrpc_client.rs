@@ -627,15 +627,12 @@ impl MLSAPIClient for BirdApiClient {
             params.push(("toEpoch", to));
         }
 
-        use catbird_atproto::jacquard_common::IntoStatic;
-
         let body = self
             .get_text("blue.catbird.mlsChat.getMessages", &params)
             .await?;
-        let borrowed: catbird_atproto::blue_catbird::mlsChat::get_messages::GetMessagesOutput<'_> =
+        let output: catbird_atproto::blue_catbird::mlsChat::get_messages::GetMessagesOutput =
             serde_json::from_str(&body)
                 .map_err(|e| OrchestratorError::Api(format!("JSON decode: {e}")))?;
-        let output = borrowed.into_static();
 
         let envelopes = output
             .messages
@@ -646,6 +643,7 @@ impl MLSAPIClient for BirdApiClient {
                 ciphertext: m.ciphertext.to_vec(),
                 timestamp: m.created_at.as_ref().with_timezone(&Utc),
                 server_message_id: Some(m.id.to_string()),
+                server_epoch: Some(m.epoch as u64),
             })
             .collect();
 
@@ -659,6 +657,7 @@ impl MLSAPIClient for BirdApiClient {
         key_package: &[u8],
         cipher_suite: &str,
         expires_at: &str,
+        device_id: Option<&str>,
     ) -> Result<()> {
         use catbird_atproto::catbird::mls_chat::publish_key_packages;
 
@@ -673,7 +672,7 @@ impl MLSAPIClient for BirdApiClient {
         let input: publish_key_packages::Input = publish_key_packages::InputData {
             action: "publish".to_string(),
             convo_id: None,
-            device_id: None,
+            device_id: device_id.map(str::to_string),
             key_packages: Some(vec![kp_item]),
             local_hashes: None,
             reason: None,
@@ -1181,23 +1180,19 @@ impl BirdApiClient {
             .map_err(|e| OrchestratorError::Api(format!("JSON decode: {e}")))
     }
 
-    pub async fn send_typing_indicator(&self, convo_id: &str, is_typing: bool) -> Result<()> {
-        let action = if is_typing { "typing" } else { "typingStop" };
-        let no_op_ciphertext = vec![0u8; 512];
-        self.post_void(
-            "blue.catbird.mlsChat.sendMessage",
-            &json!({
-                "convoId": convo_id,
-                "delivery": "ephemeral",
-                "action": action,
-                "msgId": uuid::Uuid::new_v4().to_string(),
-                "epoch": 0,
-                "paddedSize": 512,
-                "ciphertext": { "$bytes": B64.encode(no_op_ciphertext) },
-            }),
-        )
-        .await
+    pub async fn send_typing_indicator(&self, _convo_id: &str, _is_typing: bool) -> Result<()> {
+        // Typing is a clean-chat operation, not a legacy sendMessage variant.
+        // BIRDaemon currently has no canonical device-auth/MLS typing-payload
+        // adapter, so never transmit fabricated ciphertext. The caller treats
+        // this as a best-effort UX signal and continues with the real message.
+        Err(typing_transport_unavailable())
     }
+}
+
+fn typing_transport_unavailable() -> OrchestratorError {
+    OrchestratorError::Api(
+        "MLS-encrypted typing payload adapter is not available in BIRDaemon".into(),
+    )
 }
 
 /// Build the JSON body posted to `blue.catbird.mlsChat.reportRecoveryFailure`.
@@ -1226,7 +1221,7 @@ fn build_report_recovery_failure_body(
 
 #[cfg(test)]
 mod tests {
-    use super::build_report_recovery_failure_body;
+    use super::{build_report_recovery_failure_body, typing_transport_unavailable};
 
     #[test]
     fn body_contains_required_fields() {
@@ -1262,5 +1257,13 @@ mod tests {
         );
         assert_eq!(body["epochAuthenticator"], "cafebabe");
         assert!(body.get("failureMode").is_none());
+    }
+
+    #[test]
+    fn typing_transport_is_explicitly_unavailable_without_mls_payload() {
+        let error = typing_transport_unavailable();
+        assert!(
+            matches!(error, catbird_mls::orchestrator::error::OrchestratorError::Api(message) if message.contains("MLS-encrypted typing payload"))
+        );
     }
 }
