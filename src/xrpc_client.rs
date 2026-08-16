@@ -62,9 +62,11 @@ impl BirdApiClient {
         }
     }
 
-    /// Attach the platform-owned clean-chat authentication context. The
-    /// daemon currently does not have a DPoP key/JKT source, so production
-    #[allow(dead_code)]
+    /// Attach the platform-owned clean-chat authentication context.
+    ///
+    /// The daemon startup path currently has no DPoP key/JKT or auth-generation
+    /// source. Without this context, canonical reads fail closed rather than
+    /// silently falling back to legacy bearer-only reads.
     pub fn with_canonical_auth(mut self, auth: CleanChatAuthContext) -> Self {
         self.canonical_auth = Some(auth);
         self
@@ -170,22 +172,6 @@ impl BirdApiClient {
         }
     }
 
-    /// GET an XRPC query, return the response body as a string.
-    /// Useful for types with borrowed lifetimes that need `serde_json::from_str`.
-    async fn get_text(&self, nsid: &str, params: &[(&str, &str)]) -> Result<String> {
-        let jwt = self.get_jwt().await?;
-        let result = self.raw_get_text(nsid, params, &jwt).await;
-        match &result {
-            Err(OrchestratorError::ServerError {
-                status,
-                body: resp_body,
-            }) if Self::is_token_error(*status, resp_body) => {
-                let jwt = self.refresh_jwt().await?;
-                self.raw_get_text(nsid, params, &jwt).await
-            }
-            _ => result,
-        }
-    }
 
     /// GET an XRPC query, return parsed JSON.
     async fn get(&self, nsid: &str, params: &[(&str, &str)]) -> Result<serde_json::Value> {
@@ -287,30 +273,6 @@ impl BirdApiClient {
             .map_err(|e| OrchestratorError::Api(format!("JSON decode: {e}")))
     }
 
-    async fn raw_get_text(&self, nsid: &str, params: &[(&str, &str)], jwt: &str) -> Result<String> {
-        let resp = self
-            .http
-            .get(self.xrpc_url(nsid))
-            .header("Authorization", format!("Bearer {}", jwt))
-            .header("atproto-proxy", &self.proxy_did)
-            .query(params)
-            .send()
-            .await
-            .map_err(|e| OrchestratorError::Api(format!("HTTP error: {e}")))?;
-
-        let status = resp.status().as_u16();
-        if status >= 400 {
-            let body_text = resp.text().await.unwrap_or_default();
-            return Err(OrchestratorError::ServerError {
-                status,
-                body: body_text,
-            });
-        }
-
-        resp.text()
-            .await
-            .map_err(|e| OrchestratorError::Api(format!("HTTP body error: {e}")))
-    }
 
     /// Get a subscription ticket for WebSocket authentication.
     /// POST blue.catbird.mlsChat.getSubscriptionTicket via PDS proxy.
@@ -670,29 +632,7 @@ impl MLSAPIClient for BirdApiClient {
         limit: u32,
         cursor: Option<&str>,
     ) -> Result<ConversationListPage> {
-        if self.canonical_auth.is_some() {
-            return self.get_canonical_conversations(limit, cursor).await;
-        }
-        let limit_str = limit.to_string();
-        let mut params: Vec<(&str, &str)> = vec![("limit", &limit_str)];
-        if let Some(c) = cursor {
-            params.push(("cursor", c));
-        }
-
-        let output = self.get("blue.catbird.mlsChat.getConvos", &params).await?;
-
-        let convos = output
-            .get("conversations")
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| OrchestratorError::Api("missing conversations".into()))?;
-
-        Ok(ConversationListPage {
-            conversations: convos.iter().map(parse_conversation).collect(),
-            cursor: output
-                .get("cursor")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
-        })
+        self.get_canonical_conversations(limit, cursor).await
     }
 
     async fn create_conversation(
@@ -741,6 +681,26 @@ impl MLSAPIClient for BirdApiClient {
         self.post_void(
             "blue.catbird.mlsChat.leaveConvo",
             &json!({ "convoId": convo_id }),
+        )
+        .await
+    }
+
+    async fn get_messages(
+        &self,
+        convo_id: &str,
+        cursor: Option<&str>,
+        limit: u32,
+        message_type: Option<&str>,
+        from_epoch: Option<u32>,
+        to_epoch: Option<u32>,
+    ) -> Result<(Vec<IncomingEnvelope>, Option<String>)> {
+        self.get_canonical_entries(
+            convo_id,
+            cursor,
+            limit,
+            message_type,
+            from_epoch,
+            to_epoch,
         )
         .await
     }
@@ -796,112 +756,25 @@ impl MLSAPIClient for BirdApiClient {
         }
         Ok(())
     }
-
     async fn send_message(
         &self,
-        convo_id: &str,
-        ciphertext: &[u8],
-        epoch: u64,
+        _convo_id: &str,
+        _ciphertext: &[u8],
+        _epoch: u64,
     ) -> Result<SendMessageResponse> {
-        let msg_id = uuid::Uuid::new_v4().to_string();
-        self.send_message_with_id(convo_id, ciphertext, epoch, &msg_id)
-            .await
+        Err(send_transport_unavailable())
     }
 
     async fn send_message_with_id(
         &self,
-        convo_id: &str,
-        ciphertext: &[u8],
-        epoch: u64,
-        msg_id: &str,
+        _convo_id: &str,
+        _ciphertext: &[u8],
+        _epoch: u64,
+        _msg_id: &str,
     ) -> Result<SendMessageResponse> {
-        let padded_size = ciphertext.len() as u32;
-        self.post_void(
-            "blue.catbird.mlsChat.sendMessage",
-            &json!({
-                "convoId": convo_id,
-                "ciphertext": { "$bytes": B64.encode(ciphertext) },
-                "epoch": epoch,
-                "msgId": msg_id,
-                "paddedSize": padded_size,
-            }),
-        )
-        .await?;
-
-        Ok(SendMessageResponse {
-            message_id: msg_id.to_string(),
-            seq: 0,
-            epoch,
-        })
+        Err(send_transport_unavailable())
     }
 
-    async fn get_messages(
-        &self,
-        convo_id: &str,
-        cursor: Option<&str>,
-        limit: u32,
-        message_type: Option<&str>,
-        from_epoch: Option<u32>,
-        to_epoch: Option<u32>,
-    ) -> Result<(Vec<IncomingEnvelope>, Option<String>)> {
-        if self.canonical_auth.is_some() {
-            return self
-                .get_canonical_entries(
-                    convo_id,
-                    cursor,
-                    limit,
-                    message_type,
-                    from_epoch,
-                    to_epoch,
-                )
-                .await;
-        }
-        let limit_str = limit.to_string();
-        let mut params: Vec<(&str, &str)> = vec![("convoId", convo_id), ("limit", &limit_str)];
-        if let Some(c) = cursor {
-            // For commit fetches, use fromEpoch; for app messages, use sinceSeq
-            if message_type == Some("commit") && from_epoch.is_none() {
-                params.push(("fromEpoch", c));
-            } else {
-                params.push(("sinceSeq", c));
-            }
-        }
-        if let Some(mt) = message_type {
-            params.push(("type", mt));
-        }
-        let from_epoch_str = from_epoch.map(|epoch| epoch.to_string());
-        if let Some(ref from) = from_epoch_str {
-            params.push(("fromEpoch", from));
-        }
-        let to_epoch_str = to_epoch.map(|epoch| epoch.to_string());
-        if let Some(ref to) = to_epoch_str {
-            params.push(("toEpoch", to));
-        }
-
-        let body = self
-            .get_text("blue.catbird.mlsChat.getMessages", &params)
-            .await?;
-        let output: catbird_atproto::blue_catbird::mlsChat::get_messages::GetMessagesOutput =
-            serde_json::from_str(&body)
-                .map_err(|e| OrchestratorError::Api(format!("JSON decode: {e}")))?;
-
-        let envelopes = output
-            .messages
-            .into_iter()
-            .map(|m| IncomingEnvelope {
-                conversation_id: m.convo_id.to_string(),
-                sender_did: String::new(),
-                ciphertext: m.ciphertext.to_vec(),
-                timestamp: m.created_at.as_ref().with_timezone(&Utc),
-                server_message_id: Some(m.id.to_string()),
-                server_epoch: Some(m.epoch as u64),
-            })
-            .collect();
-
-        let next_cursor = output.last_seq.map(|n| n.to_string());
-
-        Ok((envelopes, next_cursor))
-    }
 
     async fn publish_key_package(
         &self,
@@ -1445,6 +1318,12 @@ fn typing_transport_unavailable() -> OrchestratorError {
         "MLS-encrypted typing payload adapter is not available in BIRDaemon".into(),
     )
 }
+fn send_transport_unavailable() -> OrchestratorError {
+    OrchestratorError::Api(
+        "MLS-encrypted send payload adapter is not available in BIRDaemon".into(),
+    )
+}
+
 
 /// Build the JSON body posted to `blue.catbird.mlsChat.reportRecoveryFailure`.
 ///
@@ -1473,8 +1352,9 @@ fn build_report_recovery_failure_body(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_report_recovery_failure_body, canonical_entry_server_epoch,
-        canonical_get_conversations_request, typing_transport_unavailable,
+        build_report_recovery_failure_body, canonical_entry_envelope,
+        canonical_get_conversations_request, send_transport_unavailable,
+        typing_transport_unavailable,
     };
     use catbird_mls::orchestrator::{CanonicalOperation, CleanChatAuthContext};
     use serde_json::json;
@@ -1522,6 +1402,15 @@ mod tests {
             matches!(error, catbird_mls::orchestrator::error::OrchestratorError::Api(message) if message.contains("MLS-encrypted typing payload"))
         );
     }
+
+    #[test]
+    fn send_transport_is_explicitly_unavailable_without_mls_payload() {
+        let error = send_transport_unavailable();
+        assert!(
+            matches!(error, catbird_mls::orchestrator::error::OrchestratorError::Api(message) if message.contains("MLS-encrypted send payload"))
+        );
+    }
+
     #[test]
     fn canonical_read_request_binds_device_and_generation_context() {
         let auth = CleanChatAuthContext::new(
@@ -1532,6 +1421,8 @@ mod tests {
         )
         .with_auth_generation(7);
 
+        assert_eq!(auth.auth_generation, Some(7));
+
         let request = canonical_get_conversations_request(&auth, 25, Some("cursor"))
             .expect("canonical request prepares");
         assert_eq!(request.operation, CanonicalOperation::GetConversations);
@@ -1541,17 +1432,92 @@ mod tests {
         );
         assert_eq!(request.authorization, "Bearer daemon-token");
         assert_eq!(request.dpop, "signed-dpop-proof");
+
+        let missing_jkt = CleanChatAuthContext::new(
+            "Bearer daemon-token".into(),
+            "signed-dpop-proof".into(),
+            String::new(),
+            "11111111-1111-4111-8111-111111111111".into(),
+        );
+        assert!(matches!(
+            canonical_get_conversations_request(&missing_jkt, 25, None),
+            Err(catbird_mls::orchestrator::error::OrchestratorError::Api(message))
+                if message.contains("device binding is missing")
+        ));
+
+        let invalid_device = CleanChatAuthContext::new(
+            "Bearer daemon-token".into(),
+            "signed-dpop-proof".into(),
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            "not-a-uuid".into(),
+        );
+        let invalid_result = canonical_get_conversations_request(&invalid_device, 25, None);
+        assert!(invalid_result.is_err(), "{invalid_result:?}");
     }
 
     #[test]
     fn canonical_entry_epoch_is_propagated_to_incoming_envelope() {
-        let entry = json!({
+        let wire = json!({
+            "$type": "blue.catbird.chat.defs#applicationEntry",
+            "conversationId": "11111111-1111-4111-8111-111111111111",
+            "entryId": "22222222-2222-4222-8222-222222222222",
+            "receivedAt": "2026-08-16T00:00:00Z",
+            "seq": 1,
             "signedRequest": {
                 "body": {
-                    "prior": { "epoch": 42 }
-                }
+                    "aad": {
+                        "conversationId": "AA==",
+                        "generation": 7,
+                        "messageId": "AA==",
+                        "prior": {
+                            "confirmationTag": {"$bytes": "AA=="},
+                            "conversationId": "11111111-1111-4111-8111-111111111111",
+                            "epoch": 42,
+                            "generation": 7,
+                            "groupContextHash": {"$bytes": "AA=="},
+                            "groupId": {"$bytes": "AA=="},
+                            "lifecycle": "active",
+                            "stateVersion": 1
+                        },
+                        "protocolVersion": "mls-v1"
+                    },
+                    "actorDeviceId": "11111111-1111-4111-8111-111111111111",
+                    "actorDid": "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+                    "applicationMessage": {
+                        "bytes": {"$bytes": "AQID"},
+                        "contentType": "application/octet-stream",
+                        "framing": "mls",
+                        "sha256": "AA=="
+                    },
+                    "authGeneration": 7,
+                    "blobBindings": [],
+                    "keyId": "key-1",
+                    "messageId": "33333333-3333-4333-8333-333333333333",
+                    "prior": {
+                        "confirmationTag": {"$bytes": "AA=="},
+                        "conversationId": "11111111-1111-4111-8111-111111111111",
+                        "epoch": 42,
+                        "generation": 7,
+                        "groupContextHash": {"$bytes": "AA=="},
+                        "groupId": {"$bytes": "AA=="},
+                        "lifecycle": "active",
+                        "stateVersion": 1
+                    },
+                    "signatureDomain": "CATBIRD-CHAT-MESSAGE",
+                    "signedAt": "2026-08-16T00:00:00Z"
+                },
+                "signature": {"$bytes": "AA=="}
             }
         });
-        assert_eq!(canonical_entry_server_epoch(&entry), Some(42));
+        let entry = serde_json::from_str::<
+            catbird_atproto::blue_catbird::chat::ConversationEntry<String>,
+        >(&wire.to_string())
+        .expect("generated application entry fixture");
+
+        let (_, envelope) =
+            canonical_entry_envelope(entry, "11111111-1111-4111-8111-111111111111")
+                .expect("application entry maps to envelope");
+        assert_eq!(envelope.server_epoch, Some(42));
+        assert_eq!(envelope.ciphertext, vec![1, 2, 3]);
     }
 }

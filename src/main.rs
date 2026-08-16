@@ -59,7 +59,10 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Authenticated! DID: {}", did);
     tracing::info!("PDS endpoint: {}", pds_endpoint);
 
-    // Create API client — uses jacquard session for token lifecycle
+    // Create API client — uses jacquard session for token lifecycle. The
+    // daemon has no platform-owned DPoP key/JKT or auth-generation source, so
+    // canonical clean-chat reads and sends remain explicitly unavailable
+    // instead of silently using legacy bearer-only clean-chat endpoints.
     let api_client = Arc::new(BirdApiClient::new(
         pds_endpoint.clone(),
         session,
@@ -67,6 +70,9 @@ async fn main() -> anyhow::Result<()> {
         config.handle.clone(),
         secrets.app_password.clone(),
     ));
+    tracing::warn!(
+        "Canonical clean-chat transport unavailable: daemon lacks device-bound DPoP/JKT authority"
+    );
 
     // Create data directory paths
     let data_dir = data_dir();
