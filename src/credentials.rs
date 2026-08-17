@@ -65,6 +65,11 @@ impl FileCredentialStore {
         let tmp = self.path.with_extension("json.tmp");
         std::fs::write(&tmp, &json)
             .map_err(|e| OrchestratorError::Credential(format!("write credentials tmp: {e}")))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        }
         std::fs::rename(&tmp, &self.path)
             .map_err(|e| OrchestratorError::Credential(format!("rename credentials: {e}")))?;
 
@@ -212,36 +217,16 @@ impl FileCredentialStore {
 
 const KEYCHAIN_SERVICE: &str = "blue.catbird.bird-daemon.chat-session";
 
-fn keychain_error(operation: &str, output: std::process::Output) -> OrchestratorError {
-    let detail = String::from_utf8_lossy(&output.stderr);
-    OrchestratorError::Credential(format!(
-        "protected chat session {operation} failed ({})",
-        detail.trim()
-    ))
-}
-
 #[cfg(target_os = "macos")]
 fn keychain_store(account: &str, session: &str) -> Result<()> {
-    let output = Command::new("/usr/bin/security")
-        .args([
-            "add-generic-password",
-            "-a",
-            account,
-            "-s",
-            KEYCHAIN_SERVICE,
-            "-w",
-            session,
-            "-U",
-        ])
-        .output()
-        .map_err(|error| {
-            OrchestratorError::Credential(format!("protected chat session store failed: {error}"))
-        })?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(keychain_error("store", output))
-    }
+    security_framework::passwords::set_generic_password(
+        KEYCHAIN_SERVICE,
+        account,
+        session.as_bytes(),
+    )
+    .map_err(|error| {
+        OrchestratorError::Credential(format!("protected chat session store failed: {error}"))
+    })
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -253,31 +238,18 @@ fn keychain_store(_account: &str, _session: &str) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn keychain_load(account: &str) -> Result<Option<String>> {
-    let output = Command::new("/usr/bin/security")
-        .args([
-            "find-generic-password",
-            "-a",
-            account,
-            "-s",
-            KEYCHAIN_SERVICE,
-            "-w",
-        ])
-        .output()
-        .map_err(|error| {
-            OrchestratorError::Credential(format!("protected chat session read failed: {error}"))
-        })?;
-    if output.status.success() {
-        let value = String::from_utf8(output.stdout)
-            .map_err(|_| {
+    match security_framework::passwords::get_generic_password(KEYCHAIN_SERVICE, account) {
+        Ok(bytes) => {
+            let value = String::from_utf8(bytes).map_err(|_| {
                 OrchestratorError::Credential("protected chat session is invalid UTF-8".into())
-            })?
-            .trim_end_matches(['\r', '\n'])
-            .to_owned();
-        Ok((!value.is_empty()).then_some(value))
-    } else if output.status.code() == Some(44) {
-        Ok(None)
-    } else {
-        Err(keychain_error("read", output))
+            })?;
+            let trimmed = value.trim_end_matches(['\r', '\n']).to_owned();
+            Ok((!trimmed.is_empty()).then_some(trimmed))
+        }
+        Err(err) if err.code() == -25300 => Ok(None),
+        Err(err) => Err(OrchestratorError::Credential(format!(
+            "protected chat session read failed: {err}"
+        ))),
     }
 }
 
@@ -290,22 +262,12 @@ fn keychain_load(_account: &str) -> Result<Option<String>> {
 
 #[cfg(target_os = "macos")]
 fn keychain_delete(account: &str) -> Result<()> {
-    let output = Command::new("/usr/bin/security")
-        .args([
-            "delete-generic-password",
-            "-a",
-            account,
-            "-s",
-            KEYCHAIN_SERVICE,
-        ])
-        .output()
-        .map_err(|error| {
-            OrchestratorError::Credential(format!("protected chat session delete failed: {error}"))
-        })?;
-    if output.status.success() || output.status.code() == Some(44) {
-        Ok(())
-    } else {
-        Err(keychain_error("delete", output))
+    match security_framework::passwords::delete_generic_password(KEYCHAIN_SERVICE, account) {
+        Ok(()) => Ok(()),
+        Err(err) if err.code() == -25300 => Ok(()),
+        Err(err) => Err(OrchestratorError::Credential(format!(
+            "protected chat session delete failed: {err}"
+        ))),
     }
 }
 

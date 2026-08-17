@@ -46,6 +46,11 @@ impl FileKeychain {
         let tmp = self.path.with_extension("json.tmp");
         std::fs::write(&tmp, &json)
             .map_err(|e| MLSError::Internal(format!("write keychain tmp: {e}")))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        }
         std::fs::rename(&tmp, &self.path)
             .map_err(|e| MLSError::Internal(format!("rename keychain: {e}")))?;
 
