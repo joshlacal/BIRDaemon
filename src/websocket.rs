@@ -234,7 +234,7 @@ async fn do_subscribe(
         ws_url.push_str(&format!("&cursor={}", cur));
     }
 
-    tracing::info!("WebSocket URL: {}", ws_url);
+    tracing::info!("Opening direct DS WebSocket subscription");
 
     // 3. Connect
     let (mut ws_stream, _) = connect_async(&ws_url)
@@ -269,7 +269,7 @@ async fn do_subscribe(
                         let _ = ws_stream.send(WsMessage::Pong(data)).await;
                     }
                     Some(Ok(WsMessage::Text(text))) => {
-                        tracing::info!("WebSocket text frame: {}", text);
+                        tracing::debug!("WebSocket text frame received ({} bytes)", text.len());
                     }
                     Some(Ok(WsMessage::Close(reason))) => {
                         tracing::info!("WebSocket closed by server: {:?}", reason);

@@ -3,14 +3,13 @@
 //! Routes MLS calls through the PDS with the atproto-proxy header.
 //! Uses jacquard session for automatic token refresh on expiry.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use catbird_mls::orchestrator::{
-    decode_clean_chat_response, prepare_get_conversations, prepare_get_entries, CanonicalOperation,
-    CleanChatAuthContext, PreparedRequest,
+    decode_clean_chat_response, CanonicalOperation, CleanChatAuthContext,
 };
 use chrono::{DateTime, Utc};
 use serde_json::json;
@@ -18,6 +17,10 @@ use serde_json::json;
 use catbird_mls::orchestrator::error::{OrchestratorError, Result};
 use catbird_mls::orchestrator::types::*;
 use catbird_mls::orchestrator::MLSAPIClient;
+
+use crate::chat_authority::{
+    AuthorityError, AuthoritySnapshot, AuthorityState, InvalidationReason, NestClient,
+};
 
 /// Jacquard session type alias.
 type Session = jacquard::client::MemoryCredentialSession;
@@ -37,6 +40,12 @@ pub struct BirdApiClient {
     /// session is bearer-only, so canonical reads remain fail-closed until
     /// the daemon receives the device-bound DPoP context.
     canonical_auth: Option<CleanChatAuthContext>,
+    /// Clean-chat requests use only this opaque Nest session and immutable
+    /// actor/device/JKT/generation snapshot. Jacquard is never used for this
+    /// namespace.
+    nest: Option<Arc<NestClient>>,
+    authority: Option<Arc<AuthorityState>>,
+    inventory: Arc<Mutex<Option<(String, String)>>>,
     /// Stored for re-authentication when refresh token also expires.
     handle: String,
     app_password: String,
@@ -57,6 +66,9 @@ impl BirdApiClient {
             did,
             proxy_did: "did:web:mlschat.catbird.blue#atproto_mls".to_string(),
             canonical_auth: None,
+            nest: None,
+            authority: None,
+            inventory: Arc::new(Mutex::new(None)),
             handle,
             app_password,
         }
@@ -70,6 +82,22 @@ impl BirdApiClient {
     pub fn with_canonical_auth(mut self, auth: CleanChatAuthContext) -> Self {
         self.canonical_auth = Some(auth);
         self
+    }
+
+    pub fn with_chat_authority(
+        mut self,
+        nest: Arc<NestClient>,
+        authority: Arc<AuthorityState>,
+    ) -> Self {
+        self.nest = Some(nest);
+        self.authority = Some(authority);
+        self
+    }
+
+    pub fn clear_chat_authority(&self, reason: InvalidationReason) {
+        if let Some(authority) = &self.authority {
+            authority.invalidate(reason);
+        }
     }
 
     fn xrpc_url(&self, nsid: &str) -> String {
@@ -172,7 +200,6 @@ impl BirdApiClient {
         }
     }
 
-
     /// GET an XRPC query, return parsed JSON.
     async fn get(&self, nsid: &str, params: &[(&str, &str)]) -> Result<serde_json::Value> {
         let jwt = self.get_jwt().await?;
@@ -273,58 +300,60 @@ impl BirdApiClient {
             .map_err(|e| OrchestratorError::Api(format!("JSON decode: {e}")))
     }
 
-
-    /// Get a subscription ticket for WebSocket authentication.
-    /// POST blue.catbird.mlsChat.getSubscriptionTicket via PDS proxy.
-    /// Returns (ticket_jwt, websocket_endpoint).
+    /// Get a v2 subscription ticket through Nest. The returned endpoint is
+    /// opened directly by the WebSocket client; Nest explicitly refuses to
+    /// proxy `subscribeEvents` upgrades.
     pub async fn get_subscription_ticket(&self) -> Result<(String, String)> {
-        let body = serde_json::json!({}); // Subscribe to all conversations
-        let resp = self
-            .post("blue.catbird.mlsChat.getSubscriptionTicket", &body)
-            .await?;
-        let ticket = resp["ticket"]
-            .as_str()
-            .ok_or_else(|| {
-                OrchestratorError::Api("No ticket in getSubscriptionTicket response".into())
-            })?
-            .to_string();
-        let endpoint = resp["endpoint"]
-            .as_str()
-            .ok_or_else(|| {
-                OrchestratorError::Api("No endpoint in getSubscriptionTicket response".into())
-            })?
-            .to_string();
-        Ok((ticket, endpoint))
+        let (inventory_session_id, event_cursor) =
+            self.inventory.lock().unwrap().clone().ok_or_else(|| {
+                OrchestratorError::Api(
+                    "v2 subscription ticket requires a current inventory session and cursor".into(),
+                )
+            })?;
+        let (nest, authority, snapshot) = self.authority_for_call()?;
+        nest.get_subscription_ticket(&snapshot, &inventory_session_id, &event_cursor)
+            .await
+            .map_err(|error| self.map_authority_error(&authority, &snapshot, error))
     }
-    async fn canonical_get_response(&self, request: PreparedRequest) -> Result<Vec<u8>> {
-        let url = format!(
-            "{}{}",
-            self.pds_endpoint.trim_end_matches('/'),
-            request.path
-        );
-        let mut builder = self
-            .http
-            .get(url)
-            .header("Authorization", request.authorization);
-        if !request.dpop.trim().is_empty() {
-            builder = builder.header("DPoP", request.dpop);
-        }
-        let response = builder
-            .send()
+
+    fn authority_for_call(
+        &self,
+    ) -> Result<(Arc<NestClient>, Arc<AuthorityState>, AuthoritySnapshot)> {
+        let nest = self.nest.clone().ok_or_else(|| {
+            OrchestratorError::Api("clean-chat Nest transport is not configured".into())
+        })?;
+        let authority = self
+            .authority
+            .clone()
+            .ok_or_else(|| OrchestratorError::Api("clean-chat authority is not admitted".into()))?;
+        let snapshot = authority
+            .snapshot()
+            .ok_or_else(|| OrchestratorError::Api("clean-chat authority is not admitted".into()))?;
+        Ok((nest, authority, snapshot))
+    }
+
+    fn map_authority_error(
+        &self,
+        authority: &AuthorityState,
+        snapshot: &AuthoritySnapshot,
+        error: AuthorityError,
+    ) -> OrchestratorError {
+        let reason = match error {
+            AuthorityError::JktMismatch => InvalidationReason::JktChanged,
+            AuthorityError::AccountMismatch => InvalidationReason::AccountChanged,
+            AuthorityError::GenerationMismatch => InvalidationReason::GenerationChanged,
+            AuthorityError::Remote => InvalidationReason::Unauthorized,
+            _ => return OrchestratorError::Api("clean-chat Nest authority request failed".into()),
+        };
+        authority.invalidate_if_matches(snapshot, reason);
+        OrchestratorError::Api("clean-chat authority was invalidated".into())
+    }
+
+    async fn canonical_get_response(&self, path: &str) -> Result<Vec<u8>> {
+        let (nest, authority, snapshot) = self.authority_for_call()?;
+        nest.get_clean_chat_bytes(&snapshot, path)
             .await
-            .map_err(|e| OrchestratorError::Api(format!("HTTP error: {e}")))?;
-        let status = response.status().as_u16();
-        let body = response
-            .bytes()
-            .await
-            .map_err(|e| OrchestratorError::Api(format!("Read bytes: {e}")))?;
-        if status >= 400 {
-            return Err(OrchestratorError::ServerError {
-                status,
-                body: String::from_utf8_lossy(&body).into_owned(),
-            });
-        }
-        Ok(body.to_vec())
+            .map_err(|error| self.map_authority_error(&authority, &snapshot, error))
     }
 
     async fn get_canonical_conversations(
@@ -332,22 +361,29 @@ impl BirdApiClient {
         limit: u32,
         cursor: Option<&str>,
     ) -> Result<ConversationListPage> {
-        let auth = self.canonical_auth.as_ref().ok_or_else(|| {
-            OrchestratorError::Api(
-                "canonical clean-chat reads require daemon device-bound auth context".into(),
-            )
-        })?;
-        let request = canonical_get_conversations_request(auth, limit, cursor)?;
-        let body = self.canonical_get_response(request).await?;
-        let decoded =
-            decode_clean_chat_response(CanonicalOperation::GetConversations.into(), body).map_err(
-                |e| OrchestratorError::Api(format!("Canonical getConversations decode: {e}")),
-            )?;
+        if limit == 0 {
+            return Err(OrchestratorError::Api(
+                "getConversations limit must be positive".into(),
+            ));
+        }
+        let path = canonical_get_conversations_path(limit, cursor);
+        let body = self.canonical_get_response(&path).await?;
+        let decoded = decode_clean_chat_response(CanonicalOperation::GetConversations.into(), body)
+            .map_err(|e| {
+                OrchestratorError::Api(format!("Canonical getConversations decode: {e}"))
+            })?;
         let output: catbird_atproto::blue_catbird::chat::get_conversations::GetConversationsOutput<
             String,
         > = serde_json::from_slice(&decoded)
             .map_err(|e| OrchestratorError::Api(format!("Canonical getConversations JSON: {e}")))?;
 
+        {
+            let mut inventory = self.inventory.lock().unwrap();
+            *inventory = Some((
+                output.inventory_session_id.to_string(),
+                output.snapshot_event_cursor.to_string(),
+            ));
+        }
         let conversations = output
             .items
             .into_iter()
@@ -373,18 +409,18 @@ impl BirdApiClient {
         from_epoch: Option<u32>,
         to_epoch: Option<u32>,
     ) -> Result<(Vec<IncomingEnvelope>, Option<String>)> {
-        let auth = self.canonical_auth.as_ref().ok_or_else(|| {
-            OrchestratorError::Api(
-                "canonical clean-chat reads require daemon device-bound auth context".into(),
-            )
-        })?;
-        let after_seq = cursor.and_then(|value| value.parse::<i64>().ok()).unwrap_or(0);
-        let request = canonical_get_entries_request(auth, convo_id, after_seq, limit)?;
-        let body = self.canonical_get_response(request).await?;
-        let decoded =
-            decode_clean_chat_response(CanonicalOperation::GetEntries.into(), body).map_err(|e| {
-                OrchestratorError::Api(format!("Canonical getEntries decode: {e}"))
-            })?;
+        let after_seq = cursor
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        if limit == 0 {
+            return Err(OrchestratorError::Api(
+                "getEntries limit must be positive".into(),
+            ));
+        }
+        let path = canonical_get_entries_path(convo_id, after_seq, limit);
+        let body = self.canonical_get_response(&path).await?;
+        let decoded = decode_clean_chat_response(CanonicalOperation::GetEntries.into(), body)
+            .map_err(|e| OrchestratorError::Api(format!("Canonical getEntries decode: {e}")))?;
         let output: catbird_atproto::blue_catbird::chat::get_entries::GetEntriesOutput<String> =
             serde_json::from_slice(&decoded)
                 .map_err(|e| OrchestratorError::Api(format!("Canonical getEntries JSON: {e}")))?;
@@ -414,23 +450,24 @@ impl BirdApiClient {
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
-fn canonical_get_conversations_request(
-    auth: &CleanChatAuthContext,
-    limit: u32,
-    cursor: Option<&str>,
-) -> Result<PreparedRequest> {
-    prepare_get_conversations(auth, i64::from(limit), cursor)
-        .map_err(|e| OrchestratorError::Api(format!("Canonical getConversations request: {e}")))
+fn canonical_get_conversations_path(limit: u32, cursor: Option<&str>) -> String {
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    query.append_pair("limit", &limit.to_string());
+    if let Some(cursor) = cursor {
+        query.append_pair("pageCursor", cursor);
+    }
+    format!(
+        "/xrpc/blue.catbird.chat.getConversations?{}",
+        query.finish()
+    )
 }
 
-fn canonical_get_entries_request(
-    auth: &CleanChatAuthContext,
-    convo_id: &str,
-    after_seq: i64,
-    limit: u32,
-) -> Result<PreparedRequest> {
-    prepare_get_entries(auth, convo_id, after_seq, i64::from(limit))
-        .map_err(|e| OrchestratorError::Api(format!("Canonical getEntries request: {e}")))
+fn canonical_get_entries_path(convo_id: &str, after_seq: i64, limit: u32) -> String {
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    query.append_pair("afterSeq", &after_seq.to_string());
+    query.append_pair("conversationId", convo_id);
+    query.append_pair("limit", &limit.to_string());
+    format!("/xrpc/blue.catbird.chat.getEntries?{}", query.finish())
 }
 
 fn canonical_conversation_view(
@@ -516,7 +553,11 @@ fn canonical_entry_server_epoch(value: &serde_json::Value) -> Option<u64> {
         .or_else(|| value.pointer("/signedRequest/body/next/epoch"))
         .or_else(|| value.get("serverEpoch"))
         .or_else(|| value.get("epoch"))
-        .and_then(|epoch| epoch.as_u64().or_else(|| epoch.as_i64().map(|v| v.max(0) as u64)))
+        .and_then(|epoch| {
+            epoch
+                .as_u64()
+                .or_else(|| epoch.as_i64().map(|v| v.max(0) as u64))
+        })
 }
 
 fn parse_dt(s: &str) -> Option<DateTime<Utc>> {
@@ -694,15 +735,8 @@ impl MLSAPIClient for BirdApiClient {
         from_epoch: Option<u32>,
         to_epoch: Option<u32>,
     ) -> Result<(Vec<IncomingEnvelope>, Option<String>)> {
-        self.get_canonical_entries(
-            convo_id,
-            cursor,
-            limit,
-            message_type,
-            from_epoch,
-            to_epoch,
-        )
-        .await
+        self.get_canonical_entries(convo_id, cursor, limit, message_type, from_epoch, to_epoch)
+            .await
     }
 
     async fn add_members(
@@ -774,7 +808,6 @@ impl MLSAPIClient for BirdApiClient {
     ) -> Result<SendMessageResponse> {
         Err(send_transport_unavailable())
     }
-
 
     async fn publish_key_package(
         &self,
@@ -1324,7 +1357,6 @@ fn send_transport_unavailable() -> OrchestratorError {
     )
 }
 
-
 /// Build the JSON body posted to `blue.catbird.mlsChat.reportRecoveryFailure`.
 ///
 /// `epochAuthenticator` (ADR-002 / spec §8.6) and `failureMode` (ADR-008 D1 /
@@ -1353,10 +1385,8 @@ fn build_report_recovery_failure_body(
 mod tests {
     use super::{
         build_report_recovery_failure_body, canonical_entry_envelope,
-        canonical_get_conversations_request, send_transport_unavailable,
-        typing_transport_unavailable,
+        canonical_get_conversations_path, send_transport_unavailable, typing_transport_unavailable,
     };
-    use catbird_mls::orchestrator::{CanonicalOperation, CleanChatAuthContext};
     use serde_json::json;
 
     #[test]
@@ -1412,47 +1442,12 @@ mod tests {
     }
 
     #[test]
-    fn canonical_read_request_binds_device_and_generation_context() {
-        let auth = CleanChatAuthContext::new(
-            "Bearer daemon-token".into(),
-            "signed-dpop-proof".into(),
-            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
-            "11111111-1111-4111-8111-111111111111".into(),
-        )
-        .with_auth_generation(7);
-
-        assert_eq!(auth.auth_generation, Some(7));
-
-        let request = canonical_get_conversations_request(&auth, 25, Some("cursor"))
-            .expect("canonical request prepares");
-        assert_eq!(request.operation, CanonicalOperation::GetConversations);
+    fn canonical_read_path_contains_only_query_parameters() {
+        let path = canonical_get_conversations_path(25, Some("cursor"));
         assert_eq!(
-            request.path,
+            path,
             "/xrpc/blue.catbird.chat.getConversations?limit=25&pageCursor=cursor"
         );
-        assert_eq!(request.authorization, "Bearer daemon-token");
-        assert_eq!(request.dpop, "signed-dpop-proof");
-
-        let missing_jkt = CleanChatAuthContext::new(
-            "Bearer daemon-token".into(),
-            "signed-dpop-proof".into(),
-            String::new(),
-            "11111111-1111-4111-8111-111111111111".into(),
-        );
-        assert!(matches!(
-            canonical_get_conversations_request(&missing_jkt, 25, None),
-            Err(catbird_mls::orchestrator::error::OrchestratorError::Api(message))
-                if message.contains("device binding is missing")
-        ));
-
-        let invalid_device = CleanChatAuthContext::new(
-            "Bearer daemon-token".into(),
-            "signed-dpop-proof".into(),
-            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
-            "not-a-uuid".into(),
-        );
-        let invalid_result = canonical_get_conversations_request(&invalid_device, 25, None);
-        assert!(invalid_result.is_err(), "{invalid_result:?}");
     }
 
     #[test]
@@ -1514,9 +1509,8 @@ mod tests {
         >(&wire.to_string())
         .expect("generated application entry fixture");
 
-        let (_, envelope) =
-            canonical_entry_envelope(entry, "11111111-1111-4111-8111-111111111111")
-                .expect("application entry maps to envelope");
+        let (_, envelope) = canonical_entry_envelope(entry, "11111111-1111-4111-8111-111111111111")
+            .expect("application entry maps to envelope");
         assert_eq!(envelope.server_epoch, Some(42));
         assert_eq!(envelope.ciphertext, vec![1, 2, 3]);
     }

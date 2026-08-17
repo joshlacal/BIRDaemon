@@ -44,6 +44,8 @@ ciborium = "0.2"
 
 # Crypto / encoding
 base64 = "0.22"
+openmls_basic_credential = "0.5"
+openmls_traits = "0.5"
 sha2 = "0.10"
 hex = "0.4"
 

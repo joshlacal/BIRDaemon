@@ -11,8 +11,10 @@ use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 
-use catbird_mls::orchestrator::credentials::CredentialStore;
+use catbird_mls::orchestrator::credentials::{CleanChatSigningAuthority, CredentialStore};
 use catbird_mls::orchestrator::error::{OrchestratorError, Result};
+use openmls_basic_credential::SignatureKeyPair;
+use openmls_traits::signatures::Signer;
 
 /// File-based credential store using JSON.
 pub struct FileCredentialStore {
@@ -88,6 +90,118 @@ impl FileCredentialStore {
         }
         self.flush()
     }
+
+    /// Install the exact binding tuple that the Nest admission check proved.
+    /// The private signing key remains in this store; only the public binding
+    /// metadata is returned to the orchestrator's signed-request path.
+    pub fn set_clean_chat_binding(
+        &self,
+        user_did: &str,
+        device_id: &str,
+        dpop_jkt: &str,
+        auth_generation: Option<i64>,
+    ) {
+        {
+            let mut data = self.data.lock().unwrap();
+            data.insert(
+                Self::key(user_did, "clean_chat_device_id"),
+                device_id.to_owned(),
+            );
+            data.insert(
+                Self::key(user_did, "clean_chat_dpop_jkt"),
+                dpop_jkt.to_owned(),
+            );
+            match auth_generation {
+                Some(generation) => {
+                    data.insert(
+                        Self::key(user_did, "clean_chat_auth_generation"),
+                        generation.to_string(),
+                    );
+                }
+                None => {
+                    data.remove(&Self::key(user_did, "clean_chat_auth_generation"));
+                }
+            }
+        }
+        let _ = self.flush();
+    }
+
+    pub fn clear_clean_chat_binding(&self, user_did: &str) {
+        {
+            let mut data = self.data.lock().unwrap();
+            for field in [
+                "clean_chat_device_id",
+                "clean_chat_dpop_jkt",
+                "clean_chat_auth_generation",
+            ] {
+                data.remove(&Self::key(user_did, field));
+            }
+        }
+        let _ = self.flush();
+    }
+
+    pub fn get_clean_chat_binding(
+        &self,
+        user_did: &str,
+    ) -> Result<Option<(String, String, Option<i64>)>> {
+        let data = self.data.lock().unwrap();
+        let Some(device_id) = data
+            .get(&Self::key(user_did, "clean_chat_device_id"))
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let Some(dpop_jkt) = data
+            .get(&Self::key(user_did, "clean_chat_dpop_jkt"))
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let generation = data
+            .get(&Self::key(user_did, "clean_chat_auth_generation"))
+            .map(|value| {
+                value.parse::<i64>().map_err(|_| {
+                    OrchestratorError::Credential("clean-chat generation binding invalid".into())
+                })
+            })
+            .transpose()?;
+        Ok(Some((device_id, dpop_jkt, generation)))
+    }
+
+    /// Persist only the opaque Nest session handle. It is intentionally
+    /// base64-wrapped alongside the existing protected credential material and
+    /// is never interpreted as a Jacquard bearer or downstream DPoP token.
+    pub fn store_opaque_chat_session(&self, user_did: &str, session_handle: &str) -> Result<()> {
+        self.set_string(
+            user_did,
+            "chat_session",
+            &B64.encode(session_handle.as_bytes()),
+        )
+    }
+
+    pub fn get_opaque_chat_session(&self, user_did: &str) -> Result<Option<String>> {
+        let Some(encoded) = self.get_string(user_did, "chat_session") else {
+            return Ok(None);
+        };
+        let decoded = B64
+            .decode(encoded)
+            .map_err(|e| OrchestratorError::Credential(format!("decode opaque session: {e}")))?;
+        let session = String::from_utf8(decoded).map_err(|e| {
+            OrchestratorError::Credential(format!("opaque session is not UTF-8: {e}"))
+        })?;
+        if session.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(session))
+    }
+
+    pub fn delete_opaque_chat_session(&self, user_did: &str) -> Result<()> {
+        {
+            let mut data = self.data.lock().unwrap();
+            data.remove(&Self::key(user_did, "chat_session"));
+        }
+        self.flush()
+    }
 }
 
 #[async_trait]
@@ -98,6 +212,62 @@ impl CredentialStore for FileCredentialStore {
 
     async fn get_signing_key(&self, user_did: &str) -> Result<Option<Vec<u8>>> {
         self.get_bytes(user_did, "signing_key")
+    }
+
+    async fn sign_clean_chat_transcript(
+        &self,
+        user_did: &str,
+        transcript: &[u8],
+        _key_id: &str,
+    ) -> Result<Option<CleanChatSigningAuthority>> {
+        // Keep the key bytes and binding metadata under one lock. This gives
+        // each request one immutable signer/binding snapshot and prevents a
+        // concurrent account/device switch from pairing a new tuple with an
+        // old signer.
+        let (key_data, device_id, dpop_jkt, auth_generation) = {
+            let data = self.data.lock().unwrap();
+            let Some(encoded) = data.get(&Self::key(user_did, "signing_key")) else {
+                return Ok(None);
+            };
+            let key_data = B64
+                .decode(encoded)
+                .map_err(|e| OrchestratorError::Credential(format!("decode signing key: {e}")))?;
+            let device_id = data
+                .get(&Self::key(user_did, "clean_chat_device_id"))
+                .cloned()
+                .ok_or_else(|| {
+                    OrchestratorError::Credential("clean-chat device binding missing".into())
+                })?;
+            let dpop_jkt = data
+                .get(&Self::key(user_did, "clean_chat_dpop_jkt"))
+                .cloned()
+                .ok_or_else(|| {
+                    OrchestratorError::Credential("clean-chat JKT binding missing".into())
+                })?;
+            let auth_generation = data
+                .get(&Self::key(user_did, "clean_chat_auth_generation"))
+                .map(|value| {
+                    value.parse::<i64>().map_err(|_| {
+                        OrchestratorError::Credential(
+                            "clean-chat generation binding invalid".into(),
+                        )
+                    })
+                })
+                .transpose()?;
+            (key_data, device_id, dpop_jkt, auth_generation)
+        };
+        let signer: SignatureKeyPair = serde_json::from_slice(&key_data)
+            .map_err(|_| OrchestratorError::Credential("stored signing key is invalid".into()))?;
+        let signature = signer
+            .sign(transcript)
+            .map_err(|_| OrchestratorError::Credential("clean-chat signer failed".into()))?;
+        Ok(Some(CleanChatSigningAuthority {
+            public_key: signer.public().to_vec(),
+            signature,
+            device_id,
+            dpop_jkt,
+            auth_generation,
+        }))
     }
 
     async fn delete_signing_key(&self, user_did: &str) -> Result<()> {
