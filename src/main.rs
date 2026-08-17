@@ -66,10 +66,23 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Authenticated! DID: {}", did);
     tracing::info!("PDS endpoint: {}", pds_endpoint);
 
+    let data_dir = data_dir();
+    std::fs::create_dir_all(&data_dir)?;
+    let creds_path = data_dir.join("credentials.json");
+    let credentials = Arc::new(FileCredentialStore::new(creds_path));
+
     // The Jacquard session remains available for legacy non-chat identity
     // resolution only. Clean-chat calls are wired to the opaque Nest session
     // below and never use this bearer.
-    let authority_state = Arc::new(AuthorityState::new());
+    let invalidation_credentials = credentials.clone();
+    let invalidation_did = did.clone();
+    let authority_state = Arc::new(AuthorityState::with_invalidation_hook(Arc::new(
+        move || {
+            invalidation_credentials
+                .clear_clean_chat_authority(&invalidation_did)
+                .map_err(|_| AuthorityError::Unavailable)
+        },
+    )));
     let nest = match std::env::var("BIRD_NEST_BASE_URL") {
         Ok(base_url) => {
             Some(Arc::new(NestClient::new(&base_url).map_err(|_| {
@@ -90,10 +103,6 @@ async fn main() -> anyhow::Result<()> {
     } else {
         Arc::new(api_client)
     };
-
-    // Create data directory paths
-    let data_dir = data_dir();
-    std::fs::create_dir_all(&data_dir)?;
 
     // Create MLS state directory
     let mls_state_dir = data_dir.join("mls-state");
@@ -118,10 +127,6 @@ async fn main() -> anyhow::Result<()> {
     // Create storage backend
     let storage_db_path = data_dir.join("bird.db");
     let storage = Arc::new(SqliteStorage::new(storage_db_path)?);
-
-    // Create credential store
-    let creds_path = data_dir.join("credentials.json");
-    let credentials = Arc::new(FileCredentialStore::new(creds_path));
 
     // Create orchestrator
     let orchestrator = Arc::new(MLSOrchestrator::new(
@@ -202,7 +207,7 @@ async fn establish_or_restore_authority(
             return Ok(());
         }
         credentials.delete_opaque_chat_session(did)?;
-        credentials.clear_clean_chat_binding(did);
+        credentials.clear_clean_chat_binding(did)?;
     }
 
     let session = nest
@@ -238,7 +243,7 @@ async fn establish_or_restore_authority(
         .preflight(&session, &device_id)
         .await
         .map_err(|_| anyhow::anyhow!("Nest device-key preflight failed"))?;
-    credentials.set_clean_chat_binding(did, &device_id, &dpop_jkt, None);
+    credentials.set_clean_chat_binding(did, &device_id, &dpop_jkt, None)?;
 
     let enrollment_body = enrollment_body(did, &device_id, &dpop_jkt, &signer_handle, &key_package);
     let prepared = orchestrator
@@ -283,6 +288,7 @@ async fn establish_or_restore_authority(
             .map(|device| device.auth_generation)
             .ok_or_else(|| anyhow::anyhow!("Nest did not return the newly enrolled device"))?,
         signer_handle,
+        &key_package.signature_public_key,
         1,
     )
     .map_err(|_| anyhow::anyhow!("Nest device tuple could not be admitted"))?;
@@ -291,7 +297,7 @@ async fn establish_or_restore_authority(
         admitted.device_id(),
         admitted.dpop_jkt(),
         Some(admitted.auth_generation()),
-    );
+    )?;
     credentials.store_opaque_chat_session(did, admitted.session_handle())?;
     authority_state.install(admitted);
     Ok(())
@@ -308,15 +314,16 @@ async fn admit_existing_session(
 ) -> Result<AuthoritySnapshot, AuthorityError> {
     let session_info = nest.session_info(session).await?;
     let devices = nest.own_devices(session, device_id, Some(dpop_jkt)).await?;
-    let signer_handle = credentials
+    let signer = credentials
         .get_signing_key(did)
         .await
         .map_err(|_| AuthorityError::Unavailable)?
         .and_then(|key| {
             serde_json::from_slice::<openmls_basic_credential::SignatureKeyPair>(&key).ok()
         })
-        .map(|signer| crate::chat_authority::derive_key_id(signer.public()))
         .ok_or(AuthorityError::Unavailable)?;
+    let signer_handle = crate::chat_authority::derive_key_id(signer.public());
+    let signer_public_key = signer.public().to_vec();
     AuthoritySnapshot::admit(
         session.to_owned(),
         &session_info,
@@ -326,6 +333,7 @@ async fn admit_existing_session(
         dpop_jkt,
         generation,
         signer_handle,
+        &signer_public_key,
         1,
     )
 }

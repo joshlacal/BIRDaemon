@@ -96,7 +96,9 @@ impl BirdApiClient {
 
     pub fn clear_chat_authority(&self, reason: InvalidationReason) {
         if let Some(authority) = &self.authority {
-            authority.invalidate(reason);
+            if let Err(error) = authority.invalidate(reason) {
+                tracing::error!(error = %error, "Failed to persist clean-chat invalidation");
+            }
         }
     }
 
@@ -345,7 +347,9 @@ impl BirdApiClient {
             AuthorityError::Remote => InvalidationReason::Unauthorized,
             _ => return OrchestratorError::Api("clean-chat Nest authority request failed".into()),
         };
-        authority.invalidate_if_matches(snapshot, reason);
+        if let Err(error) = authority.invalidate_if_matches(snapshot, reason) {
+            tracing::error!(error = %error, "Failed to persist clean-chat invalidation");
+        }
         OrchestratorError::Api("clean-chat authority was invalidated".into())
     }
 

@@ -9,7 +9,7 @@ use std::fmt;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD};
 use base64::Engine as _;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -86,6 +86,8 @@ pub(crate) struct DeviceView {
     pub(crate) dpop_jkt: String,
     pub(crate) auth_generation: i64,
     pub(crate) status: String,
+    pub(crate) key_id: String,
+    pub(crate) signature_public_key: Vec<u8>,
 }
 
 impl DeviceView {
@@ -95,6 +97,8 @@ impl DeviceView {
             dpop_jkt,
             auth_generation,
             status: "active".into(),
+            signature_public_key: vec![0; 32],
+            key_id: derive_key_id(&[0; 32]),
         }
     }
 }
@@ -109,6 +113,7 @@ pub(crate) struct AuthoritySnapshot {
     dpop_jkt: String,
     auth_generation: i64,
     signer_handle: String,
+    signer_public_key: Vec<u8>,
     signer_version: u64,
 }
 
@@ -121,6 +126,7 @@ impl Clone for AuthoritySnapshot {
             dpop_jkt: self.dpop_jkt.clone(),
             auth_generation: self.auth_generation,
             signer_handle: self.signer_handle.clone(),
+            signer_public_key: self.signer_public_key.clone(),
             signer_version: self.signer_version,
         }
     }
@@ -134,6 +140,7 @@ impl PartialEq for AuthoritySnapshot {
             && self.dpop_jkt == other.dpop_jkt
             && self.auth_generation == other.auth_generation
             && self.signer_handle == other.signer_handle
+            && self.signer_public_key == other.signer_public_key
             && self.signer_version == other.signer_version
     }
 }
@@ -149,6 +156,7 @@ impl fmt::Debug for AuthoritySnapshot {
             .field("dpop_jkt", &"<redacted>")
             .field("auth_generation", &self.auth_generation)
             .field("signer_handle", &self.signer_handle)
+            .field("signer_public_key", &"<redacted>")
             .field("signer_version", &self.signer_version)
             .finish()
     }
@@ -162,6 +170,7 @@ impl AuthoritySnapshot {
         dpop_jkt: String,
         auth_generation: i64,
         signer_handle: String,
+        signer_public_key: Vec<u8>,
         signer_version: u64,
     ) -> Result<Self, AuthorityError> {
         if session_handle.trim().is_empty() {
@@ -175,6 +184,9 @@ impl AuthoritySnapshot {
         if signer_handle.trim().is_empty() {
             return Err(AuthorityError::Unavailable);
         }
+        if signer_public_key.len() != 32 || derive_key_id(&signer_public_key) != signer_handle {
+            return Err(AuthorityError::Unavailable);
+        }
         Ok(Self {
             session_handle,
             actor_did,
@@ -182,6 +194,7 @@ impl AuthoritySnapshot {
             dpop_jkt,
             auth_generation,
             signer_handle,
+            signer_public_key,
             signer_version,
         })
     }
@@ -197,6 +210,7 @@ impl AuthoritySnapshot {
         dpop_jkt: &str,
         auth_generation: i64,
         signer_handle: String,
+        signer_public_key: &[u8],
         signer_version: u64,
     ) -> Result<Self, AuthorityError> {
         if session_handle.trim().is_empty() {
@@ -215,6 +229,9 @@ impl AuthoritySnapshot {
         if device.auth_generation != auth_generation {
             return Err(AuthorityError::GenerationMismatch);
         }
+        if device.key_id != signer_handle || device.signature_public_key != signer_public_key {
+            return Err(AuthorityError::Unavailable);
+        }
         if device.status != "active" {
             return Err(AuthorityError::DeviceNotActive);
         }
@@ -225,6 +242,7 @@ impl AuthoritySnapshot {
             dpop_jkt.into(),
             auth_generation,
             signer_handle,
+            signer_public_key.to_vec(),
             signer_version,
         )
     }
@@ -275,11 +293,21 @@ pub(crate) enum InvalidationReason {
 #[derive(Clone, Default)]
 pub(crate) struct AuthorityState {
     current: Arc<RwLock<Option<AuthoritySnapshot>>>,
+    invalidation_hook: Option<Arc<dyn Fn() -> Result<(), AuthorityError> + Send + Sync>>,
 }
 
 impl AuthorityState {
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn with_invalidation_hook(
+        hook: Arc<dyn Fn() -> Result<(), AuthorityError> + Send + Sync>,
+    ) -> Self {
+        Self {
+            current: Arc::new(RwLock::new(None)),
+            invalidation_hook: Some(hook),
+        }
     }
 
     pub(crate) fn install(&self, snapshot: AuthoritySnapshot) {
@@ -293,23 +321,33 @@ impl AuthorityState {
             .clone()
     }
 
-    pub(crate) fn invalidate(&self, _reason: InvalidationReason) {
+    pub(crate) fn invalidate(&self, _reason: InvalidationReason) -> Result<(), AuthorityError> {
         *self.current.write().expect("authority state poisoned") = None;
+        self.persist_invalidation()
     }
 
     pub(crate) fn invalidate_if_matches(
         &self,
         expected: &AuthoritySnapshot,
         reason: InvalidationReason,
-    ) -> bool {
+    ) -> Result<bool, AuthorityError> {
         let mut current = self.current.write().expect("authority state poisoned");
         if current.as_ref() == Some(expected) {
             *current = None;
+            drop(current);
+            self.persist_invalidation()?;
             tracing::warn!(reason = ?reason, "Invalidated clean-chat authority");
-            true
+            Ok(true)
         } else {
-            false
+            Ok(false)
         }
+    }
+
+    fn persist_invalidation(&self) -> Result<(), AuthorityError> {
+        if let Some(hook) = &self.invalidation_hook {
+            hook()?;
+        }
+        Ok(())
     }
 }
 
@@ -963,6 +1001,13 @@ fn parse_own_devices(value: &serde_json::Value) -> Result<Vec<DeviceView>, Autho
         dpop_jkt: String,
         auth_generation: i64,
         status: String,
+        key_id: String,
+        signature_public_key: EncodedBytes,
+    }
+    #[derive(Deserialize)]
+    struct EncodedBytes {
+        #[serde(rename = "$bytes")]
+        value: String,
     }
     let output: Output =
         serde_json::from_value(value.clone()).map_err(|_| AuthorityError::InvalidDeviceResponse)?;
@@ -972,11 +1017,21 @@ fn parse_own_devices(value: &serde_json::Value) -> Result<Vec<DeviceView>, Autho
         .map(|item| {
             validate_device_id(&item.device.device_id)?;
             validate_jkt(&item.device.dpop_jkt)?;
+            let signature_public_key = B64
+                .decode(item.device.signature_public_key.value)
+                .map_err(|_| AuthorityError::InvalidDeviceResponse)?;
+            if signature_public_key.len() != 32
+                || derive_key_id(&signature_public_key) != item.device.key_id
+            {
+                return Err(AuthorityError::InvalidDeviceResponse);
+            }
             Ok(DeviceView {
                 device_id: item.device.device_id,
                 dpop_jkt: item.device.dpop_jkt,
                 auth_generation: item.device.auth_generation,
                 status: item.device.status,
+                key_id: item.device.key_id,
+                signature_public_key,
             })
         })
         .collect()
@@ -1022,7 +1077,8 @@ mod tests {
             device.into(),
             jkt.into(),
             generation,
-            "clean-chat-signer".into(),
+            derive_key_id(&[0; 32]),
+            vec![0; 32],
             1,
         )
         .unwrap()
@@ -1099,6 +1155,77 @@ mod tests {
         );
     }
 
+    async fn http_fixture(listener: TcpListener, status: &str, jkt: Option<&str>, body: String) {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = [0_u8; 4096];
+        let read = stream.read(&mut request).await.unwrap();
+        let request = String::from_utf8_lossy(&request[..read]);
+        assert!(request.contains("/xrpc/blue.catbird.chat.getOwnDevices"));
+        assert!(request.contains("x-catbird-chat-device-id"));
+        let jkt_header = jkt
+            .map(|value| format!("x-catbird-chat-dpop-jkt: {value}\r\n"))
+            .unwrap_or_default();
+        let response = format!(
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n{jkt_header}content-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_fixture_success_wrong_proof_and_unauthorized_fail_closed() {
+        let key_id = derive_key_id(&[0; 32]);
+        let body = serde_json::json!({
+            "items": [{"device": {
+                "deviceId": DEVICE,
+                "dpopJkt": JKT,
+                "authGeneration": 7,
+                "status": "active",
+                "keyId": key_id,
+                "signaturePublicKey": {"$bytes": B64.encode([0_u8; 32])}
+            }}]
+        })
+        .to_string();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/", listener.local_addr().unwrap());
+        let nest = NestClient::new(&base).unwrap();
+        let port = tokio::spawn(http_fixture(listener, "200 OK", Some(JKT), body.clone()));
+        let devices = nest
+            .own_devices("opaque-session", DEVICE, Some(JKT))
+            .await
+            .unwrap();
+        port.await.unwrap();
+        assert_eq!(devices[0].key_id, key_id);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let nest = NestClient::new(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let port = tokio::spawn(http_fixture(
+            listener,
+            "200 OK",
+            Some("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"),
+            body,
+        ));
+        assert!(matches!(
+            nest.own_devices("opaque-session", DEVICE, Some(JKT)).await,
+            Err(AuthorityError::JktMismatch)
+        ));
+        port.await.unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let nest = NestClient::new(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let port = tokio::spawn(http_fixture(
+            listener,
+            "401 Unauthorized",
+            None,
+            "{}".into(),
+        ));
+        assert!(matches!(
+            nest.own_devices("opaque-session", DEVICE, Some(JKT)).await,
+            Err(AuthorityError::Remote)
+        ));
+        port.await.unwrap();
+    }
+
     #[test]
     fn authority_admission_requires_exact_account_device_jkt_and_generation() {
         let session = SessionInfo::new(DID.into(), "alice.test".into());
@@ -1111,7 +1238,8 @@ mod tests {
             DEVICE,
             JKT,
             7,
-            "signer".into(),
+            derive_key_id(&[0; 32]),
+            &[0; 32],
             1,
         )
         .unwrap();
@@ -1130,7 +1258,8 @@ mod tests {
                 DEVICE,
                 JKT,
                 7,
-                "signer".into(),
+                derive_key_id(&[0; 32]),
+                &[0; 32],
                 1
             ),
             Err(AuthorityError::AccountMismatch)
@@ -1144,7 +1273,8 @@ mod tests {
                 DEVICE,
                 JKT,
                 8,
-                "signer".into(),
+                derive_key_id(&[0; 32]),
+                &[0; 32],
                 1
             ),
             Err(AuthorityError::GenerationMismatch)
@@ -1158,7 +1288,8 @@ mod tests {
                 DEVICE,
                 JKT,
                 7,
-                "signer".into(),
+                derive_key_id(&[0; 32]),
+                &[0; 32],
                 1
             ),
             Err(AuthorityError::DeviceMismatch)
@@ -1172,10 +1303,28 @@ mod tests {
                 DEVICE,
                 "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
                 7,
-                "signer".into(),
+                derive_key_id(&[0; 32]),
+                &[0; 32],
                 1
             ),
             Err(AuthorityError::JktMismatch)
+        ));
+        let mut signer_mismatch = DeviceView::new(DEVICE.into(), JKT.into(), 7);
+        signer_mismatch.key_id = "wrong-key-id".into();
+        assert!(matches!(
+            AuthoritySnapshot::admit(
+                "opaque-session".into(),
+                &session,
+                DID,
+                &[signer_mismatch],
+                DEVICE,
+                JKT,
+                7,
+                derive_key_id(&[0; 32]),
+                &[0; 32],
+                1
+            ),
+            Err(AuthorityError::Unavailable)
         ));
     }
 
@@ -1189,9 +1338,27 @@ mod tests {
         state.install(replacement.clone());
         assert_eq!(in_flight.session_handle(), "opaque-a");
         assert_eq!(state.snapshot().unwrap().auth_generation(), 8);
-        assert!(!state.invalidate_if_matches(&first, InvalidationReason::GenerationChanged));
+        assert!(!state
+            .invalidate_if_matches(&first, InvalidationReason::GenerationChanged)
+            .unwrap());
         assert!(state.snapshot().is_some());
-        assert!(state.invalidate_if_matches(&replacement, InvalidationReason::Revoked));
+        assert!(state
+            .invalidate_if_matches(&replacement, InvalidationReason::Revoked)
+            .unwrap());
+        assert!(state.snapshot().is_none());
+    }
+
+    #[test]
+    fn invalidation_clears_persistence_hook_before_restart_admission() {
+        let persisted = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let persisted_for_hook = persisted.clone();
+        let state = AuthorityState::with_invalidation_hook(Arc::new(move || {
+            persisted_for_hook.store(false, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }));
+        state.install(snapshot("opaque-a", DID, DEVICE, JKT, 7));
+        state.invalidate(InvalidationReason::Unauthorized).unwrap();
+        assert!(!persisted.load(std::sync::atomic::Ordering::SeqCst));
         assert!(state.snapshot().is_none());
     }
 
@@ -1218,7 +1385,8 @@ mod tests {
             DEVICE,
             JKT,
             8,
-            "signer".into(),
+            derive_key_id(&[0; 32]),
+            &[0; 32],
             1
         )
         .is_err());
@@ -1231,7 +1399,8 @@ mod tests {
             DEVICE,
             JKT,
             8,
-            "signer".into(),
+            derive_key_id(&[0; 32]),
+            &[0; 32],
             2
         )
         .is_ok());

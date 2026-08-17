@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
@@ -24,7 +25,7 @@ pub struct FileCredentialStore {
 
 impl FileCredentialStore {
     pub fn new(path: PathBuf) -> Self {
-        let data = if path.exists() {
+        let mut data: HashMap<String, String> = if path.exists() {
             match std::fs::read_to_string(&path) {
                 Ok(contents) => serde_json::from_str(&contents).unwrap_or_default(),
                 Err(_) => HashMap::new(),
@@ -33,10 +34,23 @@ impl FileCredentialStore {
             HashMap::new()
         };
 
-        Self {
+        let insecure_session_keys = data
+            .keys()
+            .filter(|key| key.ends_with("/chat_session"))
+            .cloned()
+            .collect::<Vec<_>>();
+        let migrated_insecure_session = !insecure_session_keys.is_empty();
+        for key in insecure_session_keys {
+            data.remove(&key);
+        }
+        let store = Self {
             path,
             data: Mutex::new(data),
+        };
+        if migrated_insecure_session {
+            let _ = store.flush();
         }
+        store
     }
 
     fn key(user_did: &str, field: &str) -> String {
@@ -100,7 +114,7 @@ impl FileCredentialStore {
         device_id: &str,
         dpop_jkt: &str,
         auth_generation: Option<i64>,
-    ) {
+    ) -> Result<()> {
         {
             let mut data = self.data.lock().unwrap();
             data.insert(
@@ -123,10 +137,10 @@ impl FileCredentialStore {
                 }
             }
         }
-        let _ = self.flush();
+        self.flush()
     }
 
-    pub fn clear_clean_chat_binding(&self, user_did: &str) {
+    pub fn clear_clean_chat_binding(&self, user_did: &str) -> Result<()> {
         {
             let mut data = self.data.lock().unwrap();
             for field in [
@@ -137,7 +151,7 @@ impl FileCredentialStore {
                 data.remove(&Self::key(user_did, field));
             }
         }
-        let _ = self.flush();
+        self.flush()
     }
 
     pub fn get_clean_chat_binding(
@@ -168,40 +182,136 @@ impl FileCredentialStore {
         Ok(Some((device_id, dpop_jkt, generation)))
     }
 
-    /// Persist only the opaque Nest session handle. It is intentionally
-    /// base64-wrapped alongside the existing protected credential material and
-    /// is never interpreted as a Jacquard bearer or downstream DPoP token.
+    /// Persist the opaque Nest session only in the platform Keychain. It is
+    /// never written to ordinary credential JSON or interpreted as a Jacquard
+    /// bearer/downstream DPoP token.
     pub fn store_opaque_chat_session(&self, user_did: &str, session_handle: &str) -> Result<()> {
-        self.set_string(
-            user_did,
-            "chat_session",
-            &B64.encode(session_handle.as_bytes()),
-        )
+        if session_handle.is_empty() {
+            return Err(OrchestratorError::Credential(
+                "opaque chat session is empty".into(),
+            ));
+        }
+        keychain_store(user_did, session_handle)
     }
 
     pub fn get_opaque_chat_session(&self, user_did: &str) -> Result<Option<String>> {
-        let Some(encoded) = self.get_string(user_did, "chat_session") else {
-            return Ok(None);
-        };
-        let decoded = B64
-            .decode(encoded)
-            .map_err(|e| OrchestratorError::Credential(format!("decode opaque session: {e}")))?;
-        let session = String::from_utf8(decoded).map_err(|e| {
-            OrchestratorError::Credential(format!("opaque session is not UTF-8: {e}"))
-        })?;
-        if session.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(session))
+        keychain_load(user_did)
     }
 
     pub fn delete_opaque_chat_session(&self, user_did: &str) -> Result<()> {
-        {
-            let mut data = self.data.lock().unwrap();
-            data.remove(&Self::key(user_did, "chat_session"));
-        }
-        self.flush()
+        keychain_delete(user_did)
     }
+
+    pub fn clear_clean_chat_authority(&self, user_did: &str) -> Result<()> {
+        // Delete the bearer first. If metadata cleanup fails, restart still
+        // cannot find a complete admission tuple and therefore fails closed.
+        self.delete_opaque_chat_session(user_did)?;
+        self.clear_clean_chat_binding(user_did)
+    }
+}
+
+const KEYCHAIN_SERVICE: &str = "blue.catbird.bird-daemon.chat-session";
+
+fn keychain_error(operation: &str, output: std::process::Output) -> OrchestratorError {
+    let detail = String::from_utf8_lossy(&output.stderr);
+    OrchestratorError::Credential(format!(
+        "protected chat session {operation} failed ({})",
+        detail.trim()
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn keychain_store(account: &str, session: &str) -> Result<()> {
+    let output = Command::new("/usr/bin/security")
+        .args([
+            "add-generic-password",
+            "-a",
+            account,
+            "-s",
+            KEYCHAIN_SERVICE,
+            "-w",
+            session,
+            "-U",
+        ])
+        .output()
+        .map_err(|error| {
+            OrchestratorError::Credential(format!("protected chat session store failed: {error}"))
+        })?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(keychain_error("store", output))
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn keychain_store(_account: &str, _session: &str) -> Result<()> {
+    Err(OrchestratorError::Credential(
+        "protected chat session store unavailable".into(),
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn keychain_load(account: &str) -> Result<Option<String>> {
+    let output = Command::new("/usr/bin/security")
+        .args([
+            "find-generic-password",
+            "-a",
+            account,
+            "-s",
+            KEYCHAIN_SERVICE,
+            "-w",
+        ])
+        .output()
+        .map_err(|error| {
+            OrchestratorError::Credential(format!("protected chat session read failed: {error}"))
+        })?;
+    if output.status.success() {
+        let value = String::from_utf8(output.stdout)
+            .map_err(|_| {
+                OrchestratorError::Credential("protected chat session is invalid UTF-8".into())
+            })?
+            .trim_end_matches(['\r', '\n'])
+            .to_owned();
+        Ok((!value.is_empty()).then_some(value))
+    } else if output.status.code() == Some(44) {
+        Ok(None)
+    } else {
+        Err(keychain_error("read", output))
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn keychain_load(_account: &str) -> Result<Option<String>> {
+    Err(OrchestratorError::Credential(
+        "protected chat session store unavailable".into(),
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn keychain_delete(account: &str) -> Result<()> {
+    let output = Command::new("/usr/bin/security")
+        .args([
+            "delete-generic-password",
+            "-a",
+            account,
+            "-s",
+            KEYCHAIN_SERVICE,
+        ])
+        .output()
+        .map_err(|error| {
+            OrchestratorError::Credential(format!("protected chat session delete failed: {error}"))
+        })?;
+    if output.status.success() || output.status.code() == Some(44) {
+        Ok(())
+    } else {
+        Err(keychain_error("delete", output))
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn keychain_delete(_account: &str) -> Result<()> {
+    Ok(())
 }
 
 #[async_trait]

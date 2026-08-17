@@ -6,10 +6,10 @@ description = "BIRD - Bluesky DM chatbot daemon using MLS encryption"
 
 [dependencies]
 # MLS protocol (from catbird-mls)
-catbird_mls = { path = "../catbird-mls", default-features = false }
+catbird_mls = { path = "../.codex-workspaces/task1-clean-chat-signed-request", default-features = false }
 
 # Generated AT Protocol types (proper $bytes serialization)
-catbird-atproto = { path = "../catbird-atproto" }
+catbird-atproto = { path = "../.codex-workspaces/catbird-atproto" }
 
 # ATProto client (jacquard) — auth, identity resolution
 jacquard = { version = "0.9", default-features = false, features = ["api_full", "dns", "cache"] }
@@ -44,6 +44,7 @@ ciborium = "0.2"
 
 # Crypto / encoding
 base64 = "0.22"
+ed25519-dalek = "2.2"
 openmls_basic_credential = "0.5"
 openmls_traits = "0.5"
 sha2 = "0.10"
