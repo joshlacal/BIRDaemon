@@ -339,7 +339,7 @@ impl BirdBot {
 // ── Background message handler (spawned per-message, never blocks event loop) ──
 
 async fn handle_message_bg(
-    did: &str,
+    _did: &str,
     api_client: &Arc<BirdApiClient>,
     orchestrator: &Arc<BirdOrchestrator>,
     llm: &Arc<BridgeClient>,

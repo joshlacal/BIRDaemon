@@ -3,15 +3,16 @@
 //! Routes MLS calls through the PDS with the atproto-proxy header.
 //! Uses jacquard session for automatic token refresh on expiry.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use catbird_mls::orchestrator::{
-    decode_clean_chat_response, CanonicalOperation, CleanChatAuthContext,
+    decode_clean_chat_response, CanonicalOperation, CleanChatAuthContext, CleanChatSigningContext,
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::json;
 
 use catbird_mls::orchestrator::error::{OrchestratorError, Result};
@@ -21,9 +22,43 @@ use catbird_mls::orchestrator::MLSAPIClient;
 use crate::chat_authority::{
     AuthorityError, AuthoritySnapshot, AuthorityState, InvalidationReason, NestClient,
 };
+use crate::credentials::FileCredentialStore;
 
 /// Jacquard session type alias.
 type Session = jacquard::client::MemoryCredentialSession;
+
+/// Trait for preparing signed clean-chat requests without leaking credentials.
+#[async_trait]
+pub trait CleanChatRequestSigner: Send + Sync {
+    async fn prepare_signed_request(
+        &self,
+        binding: CleanChatSigningContext,
+        operation: CanonicalOperation,
+        body_json: Vec<u8>,
+    ) -> std::result::Result<catbird_mls::orchestrator::PreparedRequest, OrchestratorError>;
+}
+
+#[async_trait]
+impl<S, A, C, M> CleanChatRequestSigner for catbird_mls::orchestrator::MLSOrchestrator<S, A, C, M>
+where
+    S: catbird_mls::orchestrator::storage::MLSStorageBackend + 'static,
+    A: catbird_mls::orchestrator::MLSAPIClient + 'static,
+    C: catbird_mls::orchestrator::credentials::CredentialStore + 'static,
+    M: catbird_mls::orchestrator::MlsCryptoContext + 'static,
+{
+    async fn prepare_signed_request(
+        &self,
+        binding: CleanChatSigningContext,
+        operation: CanonicalOperation,
+        body_json: Vec<u8>,
+    ) -> std::result::Result<catbird_mls::orchestrator::PreparedRequest, OrchestratorError> {
+        self.prepare_clean_chat_signed_request(binding, operation, body_json)
+            .await
+            .map_err(|e| {
+                OrchestratorError::Api(format!("prepare_clean_chat_signed_request failed: {e}"))
+            })
+    }
+}
 
 /// XRPC client that routes MLS calls through the PDS via atproto-proxy.
 /// Token lifecycle is managed by the jacquard session: on expired token errors,
@@ -45,7 +80,14 @@ pub struct BirdApiClient {
     /// namespace.
     nest: Option<Arc<NestClient>>,
     authority: Option<Arc<AuthorityState>>,
+    credentials: Option<Arc<FileCredentialStore>>,
+    signer: Arc<Mutex<Option<Arc<dyn CleanChatRequestSigner>>>>,
     inventory: Arc<Mutex<Option<(String, String)>>>,
+    cached_coordinates: Arc<
+        Mutex<
+            HashMap<String, catbird_atproto::blue_catbird::chat::ConversationCoordinates<String>>,
+        >,
+    >,
     /// Stored for re-authentication when refresh token also expires.
     handle: String,
     app_password: String,
@@ -68,7 +110,10 @@ impl BirdApiClient {
             canonical_auth: None,
             nest: None,
             authority: None,
+            credentials: None,
+            signer: Arc::new(Mutex::new(None)),
             inventory: Arc::new(Mutex::new(None)),
+            cached_coordinates: Arc::new(Mutex::new(HashMap::new())),
             handle,
             app_password,
         }
@@ -88,10 +133,17 @@ impl BirdApiClient {
         mut self,
         nest: Arc<NestClient>,
         authority: Arc<AuthorityState>,
+        credentials: Arc<FileCredentialStore>,
     ) -> Self {
         self.nest = Some(nest);
         self.authority = Some(authority);
+        self.credentials = Some(credentials);
         self
+    }
+
+    pub fn set_signer(&self, signer: Arc<dyn CleanChatRequestSigner>) {
+        let mut s = self.signer.lock().unwrap();
+        *s = Some(signer);
     }
 
     pub fn clear_chat_authority(&self, reason: InvalidationReason) {
@@ -387,6 +439,20 @@ impl BirdApiClient {
                 output.inventory_session_id.to_string(),
                 output.snapshot_event_cursor.to_string(),
             ));
+        }
+        {
+            let mut coords_map = self.cached_coordinates.lock().unwrap();
+            for item in &output.items {
+                if let catbird_atproto::blue_catbird::chat::ConversationInventoryItem::ConversationInventoryState(
+                    item,
+                ) = item
+                {
+                    coords_map.insert(
+                        item.state.coordinates.conversation_id.to_string(),
+                        item.state.coordinates.clone(),
+                    );
+                }
+            }
         }
         let conversations = output
             .items
@@ -796,21 +862,100 @@ impl MLSAPIClient for BirdApiClient {
     }
     async fn send_message(
         &self,
-        _convo_id: &str,
-        _ciphertext: &[u8],
-        _epoch: u64,
+        convo_id: &str,
+        ciphertext: &[u8],
+        epoch: u64,
     ) -> Result<SendMessageResponse> {
-        Err(send_transport_unavailable())
+        let msg_id = uuid::Uuid::new_v4().to_string();
+        self.send_message_with_id(convo_id, ciphertext, epoch, &msg_id)
+            .await
     }
 
     async fn send_message_with_id(
         &self,
-        _convo_id: &str,
-        _ciphertext: &[u8],
-        _epoch: u64,
-        _msg_id: &str,
+        convo_id: &str,
+        ciphertext: &[u8],
+        epoch: u64,
+        msg_id: &str,
     ) -> Result<SendMessageResponse> {
-        Err(send_transport_unavailable())
+        let (nest, authority, snapshot) = self.authority_for_call()?;
+        let signer = {
+            let s = self.signer.lock().unwrap();
+            s.clone().ok_or_else(|| {
+                OrchestratorError::Credential("Signer not configured for clean chat".into())
+            })?
+        };
+
+        // Look up cached coordinates for convo_id; refresh if missing.
+        let coords = {
+            let map = self.cached_coordinates.lock().unwrap();
+            map.get(convo_id).cloned()
+        };
+        let coords = match coords {
+            Some(c) => c,
+            None => {
+                let _ = self.get_canonical_conversations(50, None).await?;
+                let map = self.cached_coordinates.lock().unwrap();
+                map.get(convo_id).cloned().ok_or_else(|| {
+                    OrchestratorError::Api(format!(
+                        "Conversation coordinates not found for {convo_id}"
+                    ))
+                })?
+            }
+        };
+
+        let body_bytes = build_application_send_body(
+            snapshot.actor_did(),
+            snapshot.device_id(),
+            snapshot.signer_handle(),
+            snapshot.auth_generation(),
+            convo_id,
+            msg_id,
+            &coords.group_id,
+            epoch,
+            coords.state_version,
+            &coords.confirmation_tag,
+            &coords.group_context_hash,
+            ciphertext,
+        )?;
+
+        let signing_context = CleanChatSigningContext {
+            actor_did: snapshot.actor_did().to_string(),
+            device_id: snapshot.device_id().to_string(),
+            dpop_jkt: snapshot.dpop_jkt().to_string(),
+            auth_generation: Some(snapshot.auth_generation()),
+        };
+
+        let prepared_request = signer
+            .prepare_signed_request(signing_context, CanonicalOperation::SendMessage, body_bytes)
+            .await?;
+
+        let request_body = prepared_request
+            .body
+            .ok_or_else(|| OrchestratorError::Api("Empty signed request body".into()))?;
+
+        let response_bytes = nest
+            .post_clean_chat_signed_request(
+                &snapshot,
+                "/xrpc/blue.catbird.chat.sendMessage",
+                request_body,
+            )
+            .await
+            .map_err(|error| self.map_authority_error(&authority, &snapshot, error))?;
+
+        let decoded =
+            decode_clean_chat_response(CanonicalOperation::SendMessage.into(), response_bytes)
+                .map_err(|e| OrchestratorError::Api(format!("decode sendMessage response: {e}")))?;
+
+        let output: catbird_atproto::blue_catbird::chat::send_message::SendMessageOutput<String> =
+            serde_json::from_slice(&decoded)
+                .map_err(|e| OrchestratorError::Api(format!("parse sendMessage output: {e}")))?;
+
+        Ok(SendMessageResponse {
+            message_id: output.entry.entry_id.to_string(),
+            seq: output.entry.seq as u64,
+            epoch: output.entry.signed_request.body.prior.epoch.max(0) as u64,
+        })
     }
 
     async fn publish_key_package(
@@ -1144,58 +1289,12 @@ impl MLSAPIClient for BirdApiClient {
 }
 
 impl BirdApiClient {
-    /// Download an encrypted blob by ID from the MLS blob store.
+    /// Download an encrypted blob by ID from the canonical Nest proxy.
     pub async fn get_blob(&self, blob_id: &str) -> Result<Vec<u8>> {
-        let jwt = self.get_jwt().await?;
-        let resp = self
-            .http
-            .get(self.xrpc_url("blue.catbird.mlsChat.getBlob"))
-            .header("Authorization", format!("Bearer {}", jwt))
-            .header("atproto-proxy", &self.proxy_did)
-            .query(&[("blobId", blob_id)])
-            .send()
+        let (nest, authority, snapshot) = self.authority_for_call()?;
+        nest.get_blob(&snapshot, blob_id)
             .await
-            .map_err(|e| OrchestratorError::Api(format!("HTTP error: {e}")))?;
-
-        let status = resp.status().as_u16();
-        if status >= 400 {
-            let body_text = resp.text().await.unwrap_or_default();
-            if Self::is_token_error(status, &body_text) {
-                let jwt = self.refresh_jwt().await?;
-                let resp = self
-                    .http
-                    .get(self.xrpc_url("blue.catbird.mlsChat.getBlob"))
-                    .header("Authorization", format!("Bearer {}", jwt))
-                    .header("atproto-proxy", &self.proxy_did)
-                    .query(&[("blobId", blob_id)])
-                    .send()
-                    .await
-                    .map_err(|e| OrchestratorError::Api(format!("HTTP error: {e}")))?;
-
-                let status = resp.status().as_u16();
-                if status >= 400 {
-                    let body_text = resp.text().await.unwrap_or_default();
-                    return Err(OrchestratorError::ServerError {
-                        status,
-                        body: body_text,
-                    });
-                }
-                return resp
-                    .bytes()
-                    .await
-                    .map(|b| b.to_vec())
-                    .map_err(|e| OrchestratorError::Api(format!("Read bytes: {e}")));
-            }
-            return Err(OrchestratorError::ServerError {
-                status,
-                body: body_text,
-            });
-        }
-
-        resp.bytes()
-            .await
-            .map(|b| b.to_vec())
-            .map_err(|e| OrchestratorError::Api(format!("Read bytes: {e}")))
+            .map_err(|error| self.map_authority_error(&authority, &snapshot, error))
     }
 
     // ── Device Record Publishing (ATProto repo records) ────────────────
@@ -1383,6 +1482,75 @@ fn build_report_recovery_failure_body(
         body["failureMode"] = serde_json::Value::String(mode.to_string());
     }
     body
+}
+
+fn build_application_send_body(
+    actor_did: &str,
+    actor_device_id: &str,
+    key_id: &str,
+    auth_generation: i64,
+    convo_id: &str,
+    message_id: &str,
+    group_id: &[u8],
+    epoch: u64,
+    state_version: i64,
+    confirmation_tag: &[u8],
+    group_context_hash: &[u8],
+    ciphertext: &[u8],
+) -> Result<Vec<u8>> {
+    use sha2::Digest;
+    let convo_uuid = uuid::Uuid::parse_str(convo_id)
+        .map_err(|e| OrchestratorError::Api(format!("invalid conversationId UUID: {e}")))?;
+    let msg_uuid = uuid::Uuid::parse_str(message_id)
+        .map_err(|e| OrchestratorError::Api(format!("invalid messageId UUID: {e}")))?;
+    let ciphertext_sha256 = sha2::Sha256::digest(ciphertext);
+
+    let body = json!({
+        "$type": "blue.catbird.chat.defs#applicationSendBody",
+        "signatureDomain": "CATBIRD-CHAT-MESSAGE\u{0000}",
+        "actorDid": actor_did,
+        "actorDeviceId": actor_device_id,
+        "keyId": key_id,
+        "messageId": msg_uuid.to_string(),
+        "authGeneration": auth_generation,
+        "blobBindings": [],
+        "applicationMessage": {
+            "bytes": {"$bytes": B64.encode(ciphertext)},
+            "sha256": ciphertext_sha256.to_vec(),
+            "framing": "mlsMessage",
+            "contentType": "privateMessageApplication"
+        },
+        "prior": {
+            "conversationId": convo_uuid.to_string(),
+            "groupId": {"$bytes": B64.encode(group_id)},
+            "epoch": epoch as i64,
+            "generation": auth_generation,
+            "stateVersion": state_version,
+            "lifecycle": "active",
+            "confirmationTag": {"$bytes": B64.encode(confirmation_tag)},
+            "groupContextHash": {"$bytes": B64.encode(group_context_hash)}
+        },
+        "aad": {
+            "protocolVersion": "1",
+            "conversationId": convo_uuid.as_bytes().to_vec(),
+            "generation": auth_generation,
+            "messageId": msg_uuid.as_bytes().to_vec(),
+            "prior": {
+                "conversationId": convo_uuid.as_bytes().to_vec(),
+                "groupId": {"$bytes": B64.encode(group_id)},
+                "epoch": epoch as i64,
+                "generation": auth_generation,
+                "stateVersion": state_version,
+                "lifecycle": "active",
+                "confirmationTag": {"$bytes": B64.encode(confirmation_tag)},
+                "groupContextHash": {"$bytes": B64.encode(group_context_hash)}
+            }
+        },
+        "signedAt": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+    });
+
+    serde_json::to_vec(&body)
+        .map_err(|e| OrchestratorError::Api(format!("serialize applicationSendBody: {e}")))
 }
 
 #[cfg(test)]

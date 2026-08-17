@@ -982,6 +982,82 @@ impl NestClient {
             .to_owned();
         Ok((ticket, endpoint))
     }
+
+    pub(crate) async fn post_clean_chat_signed_request(
+        &self,
+        snapshot: &AuthoritySnapshot,
+        path: &str,
+        request_body: Vec<u8>,
+    ) -> Result<Vec<u8>, AuthorityError> {
+        let response = self
+            .clean_chat_request(
+                snapshot.session_handle(),
+                snapshot.device_id(),
+                reqwest::Method::POST,
+                path,
+                Some(request_body),
+                None,
+            )
+            .await?;
+        let status = response.status().as_u16();
+        if status == 401 || status == 403 {
+            return Err(AuthorityError::Remote);
+        }
+        if !response.status().is_success() {
+            return Err(AuthorityError::Remote);
+        }
+        let returned_jkt = response
+            .headers()
+            .get(CHAT_JKT_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .ok_or(AuthorityError::InvalidDeviceResponse)?;
+        if returned_jkt != snapshot.dpop_jkt() {
+            return Err(AuthorityError::JktMismatch);
+        }
+        response
+            .bytes()
+            .await
+            .map(|body| body.to_vec())
+            .map_err(|_| AuthorityError::Transport)
+    }
+
+    pub(crate) async fn get_blob(
+        &self,
+        snapshot: &AuthoritySnapshot,
+        blob_id: &str,
+    ) -> Result<Vec<u8>, AuthorityError> {
+        let query = [("blobId", blob_id.to_string())];
+        let response = self
+            .clean_chat_request(
+                snapshot.session_handle(),
+                snapshot.device_id(),
+                reqwest::Method::GET,
+                "/xrpc/blue.catbird.chat.getBlob",
+                None,
+                Some(&query),
+            )
+            .await?;
+        let status = response.status().as_u16();
+        if status == 401 || status == 403 {
+            return Err(AuthorityError::Remote);
+        }
+        if !response.status().is_success() {
+            return Err(AuthorityError::Remote);
+        }
+        let returned_jkt = response
+            .headers()
+            .get(CHAT_JKT_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .ok_or(AuthorityError::InvalidDeviceResponse)?;
+        if returned_jkt != snapshot.dpop_jkt() {
+            return Err(AuthorityError::JktMismatch);
+        }
+        response
+            .bytes()
+            .await
+            .map(|body| body.to_vec())
+            .map_err(|_| AuthorityError::Transport)
+    }
 }
 
 fn parse_own_devices(value: &serde_json::Value) -> Result<Vec<DeviceView>, AuthorityError> {

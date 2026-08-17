@@ -5,7 +5,6 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::Mutex;
 
 use async_trait::async_trait;

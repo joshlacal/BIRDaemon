@@ -9,6 +9,9 @@ mod storage;
 mod websocket;
 mod xrpc_client;
 
+#[cfg(test)]
+mod canonical_runtime_tests;
+
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
@@ -99,7 +102,11 @@ async fn main() -> anyhow::Result<()> {
         secrets.app_password.clone(),
     );
     let api_client = if let Some(nest) = &nest {
-        Arc::new(api_client.with_chat_authority(nest.clone(), authority_state.clone()))
+        Arc::new(api_client.with_chat_authority(
+            nest.clone(),
+            authority_state.clone(),
+            credentials.clone(),
+        ))
     } else {
         Arc::new(api_client)
     };
@@ -136,6 +143,7 @@ async fn main() -> anyhow::Result<()> {
         credentials.clone(),
         OrchestratorConfig::default(),
     ));
+    api_client.set_signer(orchestrator.clone());
 
     // Initialize orchestrator with user DID
     tracing::info!("Initializing MLS orchestrator...");
@@ -161,9 +169,18 @@ async fn main() -> anyhow::Result<()> {
     )
     .await
     {
-        Ok(()) => tracing::info!(
-            "Clean-chat authority established; Task 4 leaves the chat bot loop disabled until Task 10"
-        ),
+        Ok(()) => {
+            tracing::info!("Clean-chat authority established; starting BIRD bot loop");
+            let llm = crate::bridge_client::BridgeClient::new("http://127.0.0.1:8789");
+            let bot = crate::bot::BirdBot::new(
+                did.clone(),
+                api_client.clone(),
+                orchestrator.clone(),
+                llm,
+                config.clone(),
+            );
+            bot.run().await?;
+        }
         Err(error) => tracing::warn!(
             error = %error,
             "Clean-chat authority unavailable; chat bot loop disabled"
@@ -303,7 +320,7 @@ async fn establish_or_restore_authority(
     Ok(())
 }
 
-async fn admit_existing_session(
+pub(crate) async fn admit_existing_session(
     nest: &NestClient,
     session: &str,
     did: &str,
