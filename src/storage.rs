@@ -387,9 +387,44 @@ impl MLSStorageBackend for SqliteStorage {
         Ok(())
     }
 
-    async fn clear_reset_pending(&self, conversation_id: &str) -> Result<()> {
+    async fn adopt_reset_pending_target(
+        &self,
+        conversation_id: &str,
+        expected_generation: i32,
+        expected_old_target: &str,
+        authoritative_new_target: &str,
+    ) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
+        let rows = conn.execute(
+            "UPDATE conversations
+             SET reset_new_group_id = ?1,
+                 group_id = ?1,
+                 updated_at = ?2
+             WHERE conversation_id = ?3
+               AND reset_generation = ?4
+               AND reset_new_group_id = ?5
+               AND reset_pending = 1",
+            rusqlite::params![
+                authoritative_new_target,
+                Utc::now().to_rfc3339(),
+                conversation_id,
+                expected_generation,
+                expected_old_target,
+            ],
+        )
+        .map_err(Self::map_err)?;
+        Ok(rows > 0)
+    }
+
+    async fn complete_reset_pending(
+        &self,
+        conversation_id: &str,
+        expected_generation: i32,
+        expected_new_group_id_hex: &str,
+        landed_epoch: u64,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
             "UPDATE conversations
              SET state = 'Active',
                  reset_pending = 0,
@@ -397,12 +432,48 @@ impl MLSStorageBackend for SqliteStorage {
                  reset_generation = NULL,
                  reset_notified_at_ms = NULL,
                  needs_rejoin = 0,
-                 updated_at = ?1
-             WHERE conversation_id = ?2",
-            rusqlite::params![Utc::now().to_rfc3339(), conversation_id],
+                 epoch = ?1,
+                 updated_at = ?2
+             WHERE conversation_id = ?3
+               AND reset_generation = ?4
+               AND reset_new_group_id = ?5
+               AND reset_pending = 1",
+            rusqlite::params![
+                landed_epoch,
+                Utc::now().to_rfc3339(),
+                conversation_id,
+                expected_generation,
+                expected_new_group_id_hex,
+            ],
         )
         .map_err(Self::map_err)?;
-        Ok(())
+        Ok(rows > 0)
+    }
+
+    async fn clear_reset_pending_for_delete(
+        &self,
+        conversation_id: &str,
+        expected_generation: i32,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "UPDATE conversations
+             SET reset_pending = 0,
+                 reset_new_group_id = NULL,
+                 reset_generation = NULL,
+                 reset_notified_at_ms = NULL,
+                 updated_at = ?1
+             WHERE conversation_id = ?2
+               AND reset_generation = ?3
+               AND reset_pending = 1",
+            rusqlite::params![
+                Utc::now().to_rfc3339(),
+                conversation_id,
+                expected_generation,
+            ],
+        )
+        .map_err(Self::map_err)?;
+        Ok(rows > 0)
     }
 
     async fn set_conversation_sequencer(

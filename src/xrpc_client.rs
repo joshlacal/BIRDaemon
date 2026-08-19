@@ -778,7 +778,7 @@ impl MLSAPIClient for BirdApiClient {
         }
 
         let output = self
-            .post("blue.catbird.mlsChat.createConvo", &input)
+            .post("blue.catbird.chat.createConversation", &input)
             .await?;
 
         Ok(CreateConversationResult {
@@ -790,7 +790,7 @@ impl MLSAPIClient for BirdApiClient {
 
     async fn leave_conversation(&self, convo_id: &str) -> Result<()> {
         self.post_void(
-            "blue.catbird.mlsChat.leaveConvo",
+            "blue.catbird.chat.requestLeave",
             &json!({ "convoId": convo_id }),
         )
         .await
@@ -828,7 +828,7 @@ impl MLSAPIClient for BirdApiClient {
         }
 
         let output = self
-            .post("blue.catbird.mlsChat.commitGroupChange", &input)
+            .post("blue.catbird.chat.submitTransition", &input)
             .await?;
 
         Ok(AddMembersServerResult {
@@ -849,7 +849,7 @@ impl MLSAPIClient for BirdApiClient {
     ) -> Result<()> {
         for did in member_dids {
             self.post_void(
-                "blue.catbird.mlsChat.leaveConvo",
+                "blue.catbird.chat.requestLeave",
                 &json!({
                     "convoId": convo_id,
                     "commit": B64.encode(commit_data),
@@ -965,31 +965,18 @@ impl MLSAPIClient for BirdApiClient {
         expires_at: &str,
         device_id: Option<&str>,
     ) -> Result<()> {
-        use catbird_atproto::catbird::mls_chat::publish_key_packages;
+        use catbird_atproto::blue_catbird::chat::replenish_key_packages;
 
-        let kp_item: publish_key_packages::KeyPackageItem =
-            publish_key_packages::KeyPackageItemData {
-                cipher_suite: cipher_suite.to_string(),
-                expires: expires_at.parse().unwrap(),
-                key_package: key_package.to_vec(),
-            }
-            .into();
+        let body = json!({
+            "keyPackages": [{
+                "cipherSuite": cipher_suite,
+                "expiresAt": expires_at,
+                "data": B64.encode(key_package),
+            }],
+            "deviceId": device_id,
+        });
 
-        let input: publish_key_packages::Input = publish_key_packages::InputData {
-            action: "publish".to_string(),
-            convo_id: None,
-            device_id: device_id.map(str::to_string),
-            key_packages: Some(vec![kp_item]),
-            local_hashes: None,
-            reason: None,
-            target_dids: None,
-        }
-        .into();
-
-        let body = serde_json::to_value(&input)
-            .map_err(|e| OrchestratorError::Api(format!("Serialize error: {e}")))?;
-
-        self.post_void("blue.catbird.mlsChat.publishKeyPackages", &body)
+        self.post_void("blue.catbird.chat.replenishKeyPackages", &body)
             .await
     }
 
@@ -997,7 +984,7 @@ impl MLSAPIClient for BirdApiClient {
         let dids_str = dids.join(",");
         let output = self
             .get(
-                "blue.catbird.mlsChat.getKeyPackages",
+                "blue.catbird.chat.getKeyPackages",
                 &[("dids", dids_str.as_str())],
             )
             .await?;
@@ -1036,7 +1023,7 @@ impl MLSAPIClient for BirdApiClient {
     async fn get_key_package_stats(&self) -> Result<KeyPackageStats> {
         let output = self
             .get(
-                "blue.catbird.mlsChat.getKeyPackageStatus",
+                "blue.catbird.chat.getDevices",
                 &[("include", "stats")],
             )
             .await?;
@@ -1086,34 +1073,29 @@ impl MLSAPIClient for BirdApiClient {
         signature_key: &[u8],
         key_packages: &[Vec<u8>],
     ) -> Result<DeviceInfo> {
-        use catbird_atproto::catbird::mls_chat::register_device;
+        use catbird_atproto::blue_catbird::chat::enroll_device;
 
-        let kp_items: Vec<register_device::KeyPackageItem> = key_packages
+        let kp_items: Vec<serde_json::Value> = key_packages
             .iter()
             .map(|kp| {
                 let expires_str = (Utc::now() + chrono::Duration::days(90)).to_rfc3339();
-                register_device::KeyPackageItemData {
-                    cipher_suite: "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519".to_string(),
-                    expires: expires_str.parse().unwrap(),
-                    key_package: kp.clone(),
-                }
-                .into()
+                json!({
+                    "cipherSuite": "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
+                    "expiresAt": expires_str,
+                    "data": B64.encode(kp),
+                })
             })
             .collect();
 
-        let input: register_device::Input = register_device::InputData {
-            device_uuid: Some(device_uuid.to_string()),
-            device_name: device_name.to_string(),
-            signature_public_key: signature_key.to_vec(),
-            key_packages: kp_items,
-        }
-        .into();
-
-        let body = serde_json::to_value(&input)
-            .map_err(|e| OrchestratorError::Api(format!("Serialize error: {e}")))?;
+        let body = json!({
+            "deviceUuid": device_uuid,
+            "deviceName": device_name,
+            "signaturePublicKey": { "$bytes": B64.encode(signature_key) },
+            "keyPackages": kp_items,
+        });
 
         let output = self
-            .post("blue.catbird.mlsChat.registerDevice", &body)
+            .post("blue.catbird.chat.enrollDevice", &body)
             .await?;
 
         Ok(DeviceInfo {
@@ -1133,7 +1115,7 @@ impl MLSAPIClient for BirdApiClient {
     }
 
     async fn list_devices(&self) -> Result<Vec<DeviceInfo>> {
-        let output = self.get("blue.catbird.mlsChat.listDevices", &[]).await?;
+        let output = self.get("blue.catbird.chat.getDevices", &[]).await?;
 
         let devices = output
             .get("devices")
@@ -1167,30 +1149,19 @@ impl MLSAPIClient for BirdApiClient {
     }
 
     async fn remove_device(&self, device_id: &str) -> Result<()> {
-        use catbird_atproto::catbird::mls_chat::register_device;
+        use catbird_atproto::blue_catbird::chat::revoke_device;
 
-        // Build a valid RegisterDevice input with action=delete.
-        // The server requires all fields even for delete action.
-        let input: register_device::Input = register_device::InputData {
-            device_uuid: None,
-            device_name: "delete".to_string(),
-            signature_public_key: vec![0u8; 32],
-            key_packages: vec![],
-        }
-        .into();
+        let body = json!({
+            "deviceId": device_id,
+        });
 
-        let mut body = serde_json::to_value(&input)
-            .map_err(|e| OrchestratorError::Api(format!("Serialize error: {e}")))?;
-        body["action"] = json!("delete");
-        body["deviceId"] = json!(device_id);
-
-        self.post_void("blue.catbird.mlsChat.registerDevice", &body)
+        self.post_void("blue.catbird.chat.revokeDevice", &body)
             .await
     }
 
     async fn publish_group_info(&self, convo_id: &str, group_info: &[u8]) -> Result<()> {
         self.post_void(
-            "blue.catbird.mlsChat.commitGroupChange",
+            "blue.catbird.chat.submitTransition",
             &json!({
                 "action": "updateGroupInfo",
                 "convoId": convo_id,
@@ -1203,7 +1174,7 @@ impl MLSAPIClient for BirdApiClient {
     async fn get_group_info(&self, convo_id: &str) -> Result<Vec<u8>> {
         let output = self
             .get(
-                "blue.catbird.mlsChat.getGroupState",
+                "blue.catbird.chat.getConversationState",
                 &[("convoId", convo_id), ("include", "groupInfo,epoch")],
             )
             .await?;
@@ -1219,7 +1190,7 @@ impl MLSAPIClient for BirdApiClient {
     async fn get_welcome(&self, convo_id: &str) -> Result<Vec<u8>> {
         let output = self
             .get(
-                "blue.catbird.mlsChat.getGroupState",
+                "blue.catbird.chat.getConversationState",
                 &[("convoId", convo_id), ("include", "welcome")],
             )
             .await?;
@@ -1249,7 +1220,7 @@ impl MLSAPIClient for BirdApiClient {
             failure_mode,
         );
 
-        self.post_void("blue.catbird.mlsChat.reportRecoveryFailure", &body)
+        self.post_void("blue.catbird.chat.requestLeafRecovery", &body)
             .await
     }
 
@@ -1273,7 +1244,7 @@ impl MLSAPIClient for BirdApiClient {
         }
 
         let output = self
-            .post("blue.catbird.mlsChat.commitGroupChange", &input)
+            .post("blue.catbird.chat.submitTransition", &input)
             .await?;
 
         Ok(ProcessExternalCommitResult {
@@ -1299,13 +1270,13 @@ impl BirdApiClient {
 
     // ── Device Record Publishing (ATProto repo records) ────────────────
 
-    /// Publish a `blue.catbird.mlsChat.device` record to the user's ATProto repo.
+    /// Publish a `blue.catbird.chat.device` record to the user's ATProto repo.
     /// This allows other clients to verify that key packages belong to an authorized device.
     /// Mirrors `MLSDeviceRecordService.ensureDeviceRecordPublished` in CatbirdMLSCore.
     pub async fn ensure_device_record_published(&self, signature_public_key: &[u8]) -> Result<()> {
         // Check if a device record with this key already exists
         let existing = self
-            .list_repo_records("blue.catbird.mlsChat.device")
+            .list_repo_records("blue.catbird.chat.device")
             .await?;
         let our_key_b64 = B64.encode(signature_public_key);
 
@@ -1325,9 +1296,9 @@ impl BirdApiClient {
         // Publish new device record
         let now = Utc::now().to_rfc3339();
         self.create_repo_record(
-            "blue.catbird.mlsChat.device",
+            "blue.catbird.chat.device",
             &json!({
-                "$type": "blue.catbird.mlsChat.device",
+                "$type": "blue.catbird.chat.device",
                 "mlsSignaturePublicKey": { "$bytes": our_key_b64 },
                 "algorithm": "ed25519",
                 "createdAt": now,
@@ -1460,7 +1431,7 @@ fn send_transport_unavailable() -> OrchestratorError {
     )
 }
 
-/// Build the JSON body posted to `blue.catbird.mlsChat.reportRecoveryFailure`.
+/// Build the JSON body posted to `blue.catbird.chat.requestLeafRecovery`.
 ///
 /// `epochAuthenticator` (ADR-002 / spec §8.6) and `failureMode` (ADR-008 D1 /
 /// spec §8.6.1) are only included when present so pre-A7 / pre-D1 servers
