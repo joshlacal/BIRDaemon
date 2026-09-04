@@ -4,7 +4,7 @@ set -euo pipefail
 # No path overrides are accepted: production provenance comes only from this
 # tracked checkout and the sibling Cargo resolves from its own manifest.
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-sibling_root="$repo_root/../.codex-workspaces/task1-clean-chat-signed-request"
+sibling_root="$repo_root/../catbird-mls"
 manifest="$repo_root/scripts/canonical-sibling-provenance.env"
 
 if [[ $# -ne 0 ]]; then

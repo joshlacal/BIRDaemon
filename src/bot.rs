@@ -386,6 +386,7 @@ async fn handle_message_bg(
         timestamp,
         server_message_id: Some(id.to_string()),
         server_epoch: Some(msg_epoch),
+        server_sequence: None,
     };
 
     let decrypted = match orchestrator.process_incoming(&envelope).await {
