@@ -139,8 +139,7 @@ fn empty_conversations_json() -> String {
         "inventorySessionId": "inv-session-123",
         "snapshotEventCursor": "cursor-456",
         "snapshotExpiresAt": "2026-08-17T12:00:00.000Z",
-        "items": [],
-        "nextPageCursor": null
+        "items": []
     })
     .to_string()
 }
@@ -155,17 +154,17 @@ fn populated_conversations_json(convo_id: &str) -> String {
         "items": [{
             "$type": "blue.catbird.chat.defs#conversationInventoryState",
             "state": {
-                "cipherSuite": "MLS_128_DHKEMP256_AES128GCM_SHA256_P256",
+                "cipherSuite": "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
                 "conversationKind": "direct",
                 "snapshotSeq": 1,
-                "leaves": [],
-                "participants": [],
+                "leaves": [{"userDid":TEST_DID,"deviceId":TEST_DEVICE_ID,"keyId":derive_key_id(&[1u8;32]),"leafOrigin":"genesis","deviceStatus":"active"}],
+                "participants": [{"userDid":TEST_DID,"role":"admin","status":"active","leafCount":1},{"userDid":"did:plc:bobfixtureaaaaaaaaaaaaaa","role":"admin","status":"active","leafCount":0}],
                 "metadataSnapshot": {
                     "metadataVersion": 1,
                     "authorProof": {
                         "authorDid": TEST_DID,
                         "authorDeviceId": TEST_DEVICE_ID,
-                        "authorKeyId": "key-1",
+                        "authorKeyId": derive_key_id(&[1u8;32]),
                         "authGenerationAtOrigin": 7,
                         "deviceStatusAtOrigin": "active",
                         "originSeq": 1,
@@ -173,11 +172,11 @@ fn populated_conversations_json(convo_id: &str) -> String {
                         "roleAtOrigin": "admin",
                         "signaturePublicKey": {"$bytes": B64.encode([1u8; 32])}
                     },
-                    "ciphertext": {"$bytes": B64.encode([1u8; 3])},
-                    "ciphertextSha256": vec![1u8; 32],
-                    "ciphertextSize": 3,
+                    "ciphertext": {"$bytes": B64.encode([1u8; 32])},
+                    "ciphertextSha256": {"$bytes": B64.encode(sha2::Sha256::digest([1u8;32]))},
+                    "ciphertextSize": 32,
                     "coordinate": {
-                        "conversationId": convo_uuid.as_bytes().to_vec(),
+                        "conversationId": {"$bytes":B64.encode(convo_uuid.as_bytes())},
                         "groupId": {"$bytes": B64.encode([2u8; 32])},
                         "epoch": 1,
                         "generation": 7,
@@ -198,8 +197,7 @@ fn populated_conversations_json(convo_id: &str) -> String {
                     "groupContextHash": {"$bytes": B64.encode([3u8; 32])}
                 }
             }
-        }],
-        "nextPageCursor": null
+        }]
     })
     .to_string()
 }
@@ -230,13 +228,7 @@ async fn test_canonical_read_through_nest_with_bearer_and_device_header() {
     let base_url = format!("http://127.0.0.1:{port}/");
 
     let signer = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
-    let snapshot = test_snapshot(
-        TEST_OPAQUE_SESSION,
-        TEST_DID,
-        TEST_DEVICE_ID,
-        7,
-        &signer,
-    );
+    let snapshot = test_snapshot(TEST_OPAQUE_SESSION, TEST_DID, TEST_DEVICE_ID, 7, &signer);
     let authority_state = Arc::new(AuthorityState::new());
     authority_state.install(snapshot);
 
@@ -298,13 +290,7 @@ async fn test_canonical_send_message_with_task5_signed_request_through_nest() {
     let base_url = format!("http://127.0.0.1:{port}/");
 
     let signer = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
-    let snapshot = test_snapshot(
-        TEST_OPAQUE_SESSION,
-        TEST_DID,
-        TEST_DEVICE_ID,
-        7,
-        &signer,
-    );
+    let snapshot = test_snapshot(TEST_OPAQUE_SESSION, TEST_DID, TEST_DEVICE_ID, 7, &signer);
     let authority_state = Arc::new(AuthorityState::new());
     authority_state.install(snapshot.clone());
 
@@ -387,7 +373,7 @@ async fn test_canonical_send_message_with_task5_signed_request_through_nest() {
                     "entryId": "entry-uuid-999",
                     "conversationId": TEST_CONVO_ID,
                     "seq": 42,
-                    "receivedAt": "2026-08-17T12:00:00Z",
+                    "receivedAt": "2026-08-17T12:00:00.000Z",
                     "signedRequest": {
                         "body": response_body,
                         "signature": signed_req["signature"].clone()
@@ -425,13 +411,7 @@ async fn test_canonical_blob_download_through_nest() {
     let base_url = format!("http://127.0.0.1:{port}/");
 
     let signer = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
-    let snapshot = test_snapshot(
-        TEST_OPAQUE_SESSION,
-        TEST_DID,
-        TEST_DEVICE_ID,
-        7,
-        &signer,
-    );
+    let snapshot = test_snapshot(TEST_OPAQUE_SESSION, TEST_DID, TEST_DEVICE_ID, 7, &signer);
     let authority_state = Arc::new(AuthorityState::new());
     authority_state.install(snapshot);
 
@@ -486,13 +466,7 @@ async fn test_canonical_subscription_ticket_and_websocket_isolation() {
     let ws_endpoint = format!("ws://127.0.0.1:{ws_port}/subscribeEvents");
 
     let signer = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
-    let snapshot = test_snapshot(
-        TEST_OPAQUE_SESSION,
-        TEST_DID,
-        TEST_DEVICE_ID,
-        7,
-        &signer,
-    );
+    let snapshot = test_snapshot(TEST_OPAQUE_SESSION, TEST_DID, TEST_DEVICE_ID, 7, &signer);
     let authority_state = Arc::new(AuthorityState::new());
     authority_state.install(snapshot);
 
@@ -552,10 +526,11 @@ async fn test_canonical_subscription_ticket_and_websocket_isolation() {
 
     // Prime inventory state
     let _ = client.get_conversations(25, None).await.unwrap();
-    let (ticket, endpoint) = client.get_subscription_ticket().await.unwrap();
+    let (ticket, endpoint, ticket_cursor) = client.get_subscription_ticket().await.unwrap();
     nest_task.await.unwrap();
 
     assert_eq!(ticket, "single-use-ds-ticket-token-777");
+    assert_eq!(ticket_cursor, "cursor-456");
     assert_eq!(endpoint, ws_endpoint);
 
     // Verify WebSocket connection to DS receives ONLY the ticket in query, NEVER the session bearer
@@ -586,13 +561,7 @@ async fn test_bearer_never_sent_to_pds_or_ds_and_downstream_tokens_never_enter_b
     let nest_url = format!("http://127.0.0.1:{nest_port}/");
 
     let signer = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
-    let snapshot = test_snapshot(
-        TEST_OPAQUE_SESSION,
-        TEST_DID,
-        TEST_DEVICE_ID,
-        7,
-        &signer,
-    );
+    let snapshot = test_snapshot(TEST_OPAQUE_SESSION, TEST_DID, TEST_DEVICE_ID, 7, &signer);
     let authority_state = Arc::new(AuthorityState::new());
     authority_state.install(snapshot);
 
@@ -675,13 +644,7 @@ async fn ordinary_http_failures_are_preserved_without_invalidating_authority() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base_url = format!("http://{}/", listener.local_addr().unwrap());
         let signer = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
-        let snapshot = test_snapshot(
-            TEST_OPAQUE_SESSION,
-            TEST_DID,
-            TEST_DEVICE_ID,
-            7,
-            &signer,
-        );
+        let snapshot = test_snapshot(TEST_OPAQUE_SESSION, TEST_DID, TEST_DEVICE_ID, 7, &signer);
         let invalidated = Arc::new(AtomicBool::new(false));
         let invalidated_for_hook = invalidated.clone();
         let authority_state = Arc::new(AuthorityState::with_invalidation_hook(Arc::new(
@@ -744,13 +707,7 @@ async fn proven_account_session_expiry_invalidates_but_preserves_response() {
     let base_url = format!("http://127.0.0.1:{port}/");
 
     let signer = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
-    let snapshot = test_snapshot(
-        TEST_OPAQUE_SESSION,
-        TEST_DID,
-        TEST_DEVICE_ID,
-        7,
-        &signer,
-    );
+    let snapshot = test_snapshot(TEST_OPAQUE_SESSION, TEST_DID, TEST_DEVICE_ID, 7, &signer);
     let invalidated = Arc::new(AtomicBool::new(false));
     let inv_clone = invalidated.clone();
     let authority_state = Arc::new(AuthorityState::with_invalidation_hook(Arc::new(
@@ -815,13 +772,7 @@ async fn proven_account_session_expiry_invalidates_but_preserves_response() {
 #[tokio::test]
 async fn caller_scope_mismatch_fails_before_network_or_authority_mutation() {
     let signer = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
-    let snapshot = test_snapshot(
-        TEST_OPAQUE_SESSION,
-        TEST_DID,
-        TEST_DEVICE_ID,
-        7,
-        &signer,
-    );
+    let snapshot = test_snapshot(TEST_OPAQUE_SESSION, TEST_DID, TEST_DEVICE_ID, 7, &signer);
     let authority_state = Arc::new(AuthorityState::new());
     authority_state.install(snapshot);
     let nest = Arc::new(NestClient::new("http://127.0.0.1:9/").unwrap());
@@ -1059,8 +1010,8 @@ async fn pending_welcome_is_device_fenced_and_never_acknowledged_before_durable_
             "inventorySessionId": "inv-session-123",
             "snapshotEventCursor": "cursor-456",
             "snapshotExpiresAt": "2026-08-23T12:15:00.000Z",
-            "nextPageCursor": null,
             "items": [{
+                "$type": "blue.catbird.chat.defs#welcomeView",
                 "welcomeId": "33333333-3333-4333-9333-333333333333",
                 "conversationId": TEST_CONVO_ID,
                 "transitionSeq": 9,
@@ -1156,13 +1107,19 @@ async fn test_process_restart_recovery_and_stale_rejection() {
         assert!(req2.contains("getOwnDevices"));
 
         let dev_body = json!({
+            "hasMore": false,
+            "snapshotExpiresAt": "2099-08-23T12:05:00.000Z",
             "items": [{
                 "device": {
                     "deviceId": TEST_DEVICE_ID,
                     "authGeneration": 7,
                     "status": "active",
                     "keyId": signer_handle,
-                    "signaturePublicKey": {"$bytes": B64.encode(signer.public())}
+                    "signaturePublicKey": {"$bytes": B64.encode(signer.public())},
+                    "availablePackageCount": 0,
+                    "reservedPackageCount": 0,
+                    "createdAt": "2026-08-23T12:00:00.000Z",
+                    "updatedAt": "2026-08-23T12:00:00.000Z"
                 }
             }]
         })
@@ -1409,25 +1366,35 @@ async fn real_orchestrator_sync_adopts_the_stable_uuid_and_retires_the_raw_alias
         );
         stream.write_all(response.as_bytes()).await.unwrap();
 
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let mut request = [0_u8; 8192];
-        let read = stream.read(&mut request).await.unwrap();
-        let request = String::from_utf8_lossy(&request[..read]);
-        assert!(request.contains("blue.catbird.chat.getEntries"));
-        assert!(request.contains(&format!("conversationId={TEST_CONVO_ID}")));
-        assert!(!request.contains(&server_raw_group_id));
-        let body = json!({
-            "entries": [],
-            "hasMore": false,
-            "nextAfterSeq": 0,
-        })
-        .to_string();
-        let response = format!(
-            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        stream.write_all(response.as_bytes()).await.unwrap();
+        for _ in 0..4 {
+            let (mut stream, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let mut request = [0_u8; 8192];
+            let read = stream.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..read]);
+            let inventory = request.contains("blue.catbird.chat.getConversations");
+            assert!(
+                inventory || request.contains("blue.catbird.chat.getEntries"),
+                "unexpected request {}",
+                request.lines().next().unwrap_or_default()
+            );
+            assert!(!request.contains(&server_raw_group_id));
+            let body = if inventory {
+                projection_conversations_json(TEST_CONVO_ID)
+            } else {
+                assert!(request.contains(&format!("conversationId={TEST_CONVO_ID}")));
+                json!({"entries":[],"hasMore":false,"nextAfterSeq":0}).to_string()
+            };
+            let response = format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",body.len(),body);
+            stream.write_all(response.as_bytes()).await.unwrap();
+            if !inventory {
+                return;
+            }
+        }
+        panic!("inventory reads exceeded fixture bound");
     });
 
     orchestrator.sync_with_server(true).await.unwrap();
@@ -1444,7 +1411,7 @@ async fn real_orchestrator_sync_adopts_the_stable_uuid_and_retires_the_raw_alias
         .is_none());
     let history = storage.get_messages(TEST_CONVO_ID, 10, None).await.unwrap();
     assert_eq!(history.len(), 1);
-    assert_eq!(history[0].conversation_id, raw_group_id);
+    assert_eq!(history[0].conversation_id, TEST_CONVO_ID);
     assert!(storage
         .get_group_state(&raw_group_id)
         .await
@@ -1487,13 +1454,7 @@ async fn test_simulated_bot_receive_decrypt_reply_flow() {
     let base_url = format!("http://127.0.0.1:{port}/");
 
     let signer = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
-    let snapshot = test_snapshot(
-        TEST_OPAQUE_SESSION,
-        TEST_DID,
-        TEST_DEVICE_ID,
-        7,
-        &signer,
-    );
+    let snapshot = test_snapshot(TEST_OPAQUE_SESSION, TEST_DID, TEST_DEVICE_ID, 7, &signer);
     let authority_state = Arc::new(AuthorityState::new());
     authority_state.install(snapshot);
 
@@ -1540,10 +1501,10 @@ async fn test_simulated_bot_receive_decrypt_reply_flow() {
             "nextAfterSeq": 10,
             "entries": [{
                 "$type": "blue.catbird.chat.defs#applicationEntry",
-                "entryId": "inbound-msg-001",
+                "entryId": "73737373-7373-4373-9373-737373737373",
                 "conversationId": TEST_CONVO_ID,
                 "seq": 10,
-                "receivedAt": "2026-08-17T12:00:00Z",
+                "receivedAt": "2026-08-17T12:00:00.000Z",
                 "signedRequest": {
                     "body": {
                         "$type": "blue.catbird.chat.defs#applicationSendBody",
@@ -1624,7 +1585,7 @@ async fn test_simulated_bot_receive_decrypt_reply_flow() {
                 "entryId": "reply-entry-uuid-002",
                 "conversationId": TEST_CONVO_ID,
                 "seq": 11,
-                "receivedAt": "2026-08-17T12:01:00Z",
+                "receivedAt": "2026-08-17T12:01:00.000Z",
                 "signedRequest": {
                     "body": response_body,
                     "signature": signed_req["signature"].clone()
@@ -1653,7 +1614,7 @@ async fn test_simulated_bot_receive_decrypt_reply_flow() {
     assert_eq!(entries.len(), 1);
     assert_eq!(
         entries[0].server_message_id.as_deref(),
-        Some("inbound-msg-001")
+        Some("73737373-7373-4373-9373-737373737373")
     );
 
     // 3. Send reply

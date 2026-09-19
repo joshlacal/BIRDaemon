@@ -101,7 +101,10 @@ async fn account_exit_preserves_history_and_exact_terminal_retry() {
             .complete_account_exit(CID, NEW, Some(8), 3, terminal.clone())
             .await
             .unwrap());
-        assert!(!storage.complete_account_exit(CID, NEW, Some(7), 2, terminal).await.unwrap());
+        assert!(!storage
+            .complete_account_exit(CID, NEW, Some(7), 2, terminal)
+            .await
+            .unwrap());
         assert_eq!(snapshot(&storage), after);
         assert!(storage.mark_reset_pending(CID, NEW, 7, 123).await.is_err());
         assert_eq!(snapshot(&storage), after);
@@ -222,8 +225,20 @@ async fn account_exit_advances_device_removal_only_with_dedicated_authority() {
 async fn account_exit_retained_generation_cannot_authorize_a_new_terminal_record() {
     let storage = fixture().await;
     storage.mark_reset_pending(CID, NEW, 7, 123).await.unwrap();
-    assert!(storage.complete_account_exit(CID, NEW, Some(7), 3, ConversationState::DeviceRemoved).await.unwrap());
-    assert!(!storage.complete_account_exit(CID, NEW, Some(8), 4, ConversationState::Closed).await.unwrap());
-    assert!(!storage.complete_account_exit(CID, NEW, Some(7), 4, ConversationState::Closed).await.unwrap());
-    assert!(storage.complete_account_exit(CID, NEW, None, 4, ConversationState::Closed).await.unwrap());
+    assert!(storage
+        .complete_account_exit(CID, NEW, Some(7), 3, ConversationState::DeviceRemoved)
+        .await
+        .unwrap());
+    assert!(!storage
+        .complete_account_exit(CID, NEW, Some(8), 4, ConversationState::Closed)
+        .await
+        .unwrap());
+    assert!(!storage
+        .complete_account_exit(CID, NEW, Some(7), 4, ConversationState::Closed)
+        .await
+        .unwrap());
+    assert!(storage
+        .complete_account_exit(CID, NEW, None, 4, ConversationState::Closed)
+        .await
+        .unwrap());
 }

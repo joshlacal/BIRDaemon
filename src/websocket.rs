@@ -105,6 +105,8 @@ fn split_frame(data: &[u8]) -> Option<(FrameHeader, &[u8])> {
 /// Events received from the MLS WebSocket.
 #[derive(Debug)]
 pub enum MlsEvent {
+    /// Canonical scheduling hint; no plaintext or consent authority.
+    CanonicalHint,
     /// Encrypted message received.
     Message {
         id: String,
@@ -217,34 +219,36 @@ impl MlsWebSocket {
 /// Single WebSocket connection session. Returns the last cursor on clean disconnect.
 async fn do_subscribe(
     api_client: &BirdApiClient,
-    cursor: Option<&str>,
+    _cursor: Option<&str>,
     tx: &mpsc::Sender<MlsEvent>,
     shutdown: &tokio::sync::watch::Receiver<bool>,
     reconnect: &Notify,
 ) -> Result<Option<String>, String> {
     // 1. Get subscription ticket via PDS proxy
-    let (ticket, ws_endpoint) = api_client
+    let (ticket, ws_endpoint, initial_cursor) = api_client
         .get_subscription_ticket()
         .await
         .map_err(|e| format!("Ticket request failed: {}", e))?;
 
-    // 2. Build WebSocket URL
-    let mut ws_url = format!("{}?ticket={}", ws_endpoint, ticket);
-    if let Some(cur) = cursor {
-        ws_url.push_str(&format!("&cursor={}", cur));
-    }
+    // The ticket belongs to this exact capable inventory. Never reuse a cursor
+    // from an earlier audience/session after renegotiation.
+    let mut ws_url = url::Url::parse(&ws_endpoint).map_err(|_| "Invalid subscription endpoint")?;
+    ws_url
+        .query_pairs_mut()
+        .append_pair("ticket", &ticket)
+        .append_pair("cursor", &initial_cursor);
 
     tracing::info!("Opening direct DS WebSocket subscription");
 
     // 3. Connect
-    let (mut ws_stream, _) = connect_async(&ws_url)
+    let (mut ws_stream, _) = connect_async(ws_url.as_str())
         .await
         .map_err(|e| format!("WebSocket connect failed: {}", e))?;
 
     tracing::info!("WebSocket connected");
     let _ = tx.send(MlsEvent::Connected).await;
 
-    let mut last_cursor: Option<String> = cursor.map(String::from);
+    let mut last_cursor = Some(initial_cursor);
     let mut shutdown = shutdown.clone();
 
     // 4. Event loop
@@ -269,7 +273,10 @@ async fn do_subscribe(
                         let _ = ws_stream.send(WsMessage::Pong(data)).await;
                     }
                     Some(Ok(WsMessage::Text(text))) => {
-                        tracing::debug!("WebSocket text frame received ({} bytes)", text.len());
+                        if let Some(cursor) = canonical_hint_cursor(&text, last_cursor.as_deref())? {
+                            last_cursor = Some(cursor);
+                            let _ = tx.send(MlsEvent::CanonicalHint).await;
+                        }
                     }
                     Some(Ok(WsMessage::Close(reason))) => {
                         tracing::info!("WebSocket closed by server: {:?}", reason);
@@ -324,6 +331,21 @@ fn handle_frame(data: &[u8]) -> Result<Option<(MlsEvent, Option<String>)>, Strin
     let event_type = header.t.as_deref().unwrap_or("");
 
     match event_type {
+        "#event" | "#eventEnvelope" => {
+            let payload: CborValue = ciborium::from_reader(Cursor::new(payload_bytes))
+                .map_err(|_| "Invalid canonical event envelope")?;
+            let CborValue::Map(top) = payload else {
+                return Err("Invalid canonical envelope".into());
+            };
+            let cursor = cbor_str(&top, "cursor").ok_or("Missing canonical cursor")?;
+            let event = cbor_map(&top, "payload").ok_or("Missing canonical event payload")?;
+            let kind = cbor_str(event, "$type").ok_or("Missing canonical event type")?;
+            if !kind.starts_with("blue.catbird.chat.defs#") {
+                return Err("Invalid canonical event type".into());
+            }
+            Ok(Some((MlsEvent::CanonicalHint, Some(cursor))))
+        }
+
         "#messageEvent" => {
             let payload: CborValue = ciborium::from_reader(Cursor::new(payload_bytes))
                 .map_err(|e| format!("Failed to decode messageEvent CBOR: {}", e))?;
@@ -375,7 +397,7 @@ fn handle_frame(data: &[u8]) -> Result<Option<(MlsEvent, Option<String>)>, Strin
                 _ => ("heartbeat".to_string(), None),
             };
 
-            tracing::debug!(info = %info, "Info event");
+            tracing::debug!("Info event received");
             Ok(Some((
                 MlsEvent::Info {
                     info,
@@ -442,5 +464,41 @@ fn handle_frame(data: &[u8]) -> Result<Option<(MlsEvent, Option<String>)>, Strin
                 )
             }))
         }
+    }
+}
+
+fn canonical_hint_cursor(text: &str, previous: Option<&str>) -> Result<Option<String>, String> {
+    use catbird_atproto::blue_catbird::chat::SubscriptionMessage;
+    if text.len() > 1024 * 1024 {
+        return Err("Canonical event exceeds limit".into());
+    }
+    let event: SubscriptionMessage =
+        serde_json::from_str(text).map_err(|_| "Malformed canonical event")?;
+    match event {
+        SubscriptionMessage::TypingEvent(_) => Ok(None),
+        SubscriptionMessage::EventEnvelope(event) => {
+            if previous != Some(event.previous_cursor.as_str())
+                || event.cursor.is_empty()
+                || event.cursor.len() > 512
+            {
+                return Err("Canonical event cursor discontinuity".into());
+            }
+            Ok(Some(event.cursor.to_string()))
+        }
+    }
+}
+
+#[cfg(test)]
+mod request_tests {
+    use super::*;
+    #[test]
+    fn canonical_request_hint_requires_cursor_continuity_and_never_becomes_message() {
+        let event=serde_json::json!({"$type":"blue.catbird.chat.defs#eventEnvelope","previousCursor":"old","cursor":"next","createdAt":"2026-09-19T00:00:00.000Z","payload":{"$type":"blue.catbird.chat.defs#conversationChangedEvent","conversationId":"11111111-1111-4111-8111-111111111111"}}).to_string();
+        assert_eq!(
+            canonical_hint_cursor(&event, Some("old")).unwrap(),
+            Some("next".into())
+        );
+        assert!(canonical_hint_cursor(&event, Some("next")).is_err());
+        assert!(canonical_hint_cursor("{", Some("old")).is_err());
     }
 }

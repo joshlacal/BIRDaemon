@@ -1154,10 +1154,7 @@ mod tests {
         let nest = NestClient::new(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
         let server = tokio::spawn(http_fixture(listener, "200 OK", body));
 
-        let devices = nest
-            .own_devices("opaque-session", DEVICE)
-            .await
-            .unwrap();
+        let devices = nest.own_devices("opaque-session", DEVICE).await.unwrap();
         server.await.unwrap();
         assert_eq!(devices.len(), 1);
         assert_eq!(devices[0].device_id, DEVICE);

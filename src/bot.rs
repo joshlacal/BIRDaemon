@@ -2,7 +2,7 @@
 
 use base64::Engine;
 use chrono::Utc;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
@@ -14,9 +14,12 @@ use catbird_mls::MLSContext;
 use crate::bridge_client::BridgeClient;
 use crate::config::BirdConfig;
 use crate::credentials::FileCredentialStore;
+use crate::request_policy::{request_key_action, RequestAction, RequestKeyAction, RequestPolicy};
 use crate::storage::SqliteStorage;
 use crate::websocket::{MlsEvent, MlsWebSocket};
 use crate::xrpc_client::BirdApiClient;
+use catbird_mls::orchestrator::MlsCryptoContext;
+use catbird_mls::orchestrator::{RequestConsent, RequestCrypto, RequestPreview};
 use tokio::sync::Notify;
 
 /// Type alias for our concrete orchestrator (generic params: S, A, C).
@@ -38,6 +41,7 @@ pub struct BirdBot {
     orchestrator: Arc<BirdOrchestrator>,
     llm: Arc<BridgeClient>,
     config: BirdConfig,
+    effect_slots: Arc<tokio::sync::Semaphore>,
     /// Tracks when we last rejoined each conversation to prevent rejoin storms.
     recent_rejoins: Arc<Mutex<HashMap<String, Instant>>>,
 }
@@ -56,6 +60,7 @@ impl BirdBot {
             orchestrator,
             llm: Arc::new(llm),
             config,
+            effect_slots: Arc::new(tokio::sync::Semaphore::new(4)),
             recent_rejoins: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -66,6 +71,8 @@ impl BirdBot {
     /// orchestrator, generates LLM responses, and encrypts + sends replies.
     pub async fn run(&self) -> anyhow::Result<()> {
         tracing::info!("BIRD bot starting for DID: {}", self.did);
+
+        self.maintain_request_keys().await;
 
         // Initial sync to catch up on any missed state
         tracing::info!("Running initial sync with server...");
@@ -78,6 +85,7 @@ impl BirdBot {
         // participants who haven't processed the commit yet. Instead, we rely on the
         // reactive rejoin in handle_message which only fires when decryption actually fails.
         self.log_epoch_gaps().await;
+        self.handle_request_views().await;
 
         // Create shutdown signal
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -108,18 +116,22 @@ impl BirdBot {
                         } => {
                             // Spawn message handling as a background task so the
                             // event loop stays responsive during LLM calls (up to 300s).
+                            let policy = self.config.request_policy();
                             let did = self.did.clone();
                             let api_client = Arc::clone(&self.api_client);
                             let orchestrator = Arc::clone(&self.orchestrator);
                             let llm = Arc::clone(&self.llm);
                             let recent_rejoins = Arc::clone(&self.recent_rejoins);
+                            let slots = self.effect_slots.clone();
                             tokio::spawn(async move {
+                                let Ok(_permit) = slots.acquire_owned().await else { return; };
                                 handle_message_bg(
                                     &did,
                                     &api_client,
                                     &orchestrator,
                                     &llm,
                                     &recent_rejoins,
+                                    policy,
                                     &id,
                                     &conversation_id,
                                     ciphertext,
@@ -174,6 +186,10 @@ impl BirdBot {
                                 }
                             }
                         }
+                        MlsEvent::CanonicalHint => {
+                            // A notification is scheduling only; sync verifies current authority.
+                            self.sync_and_reconnect_if_needed(&ws_reconnect).await;
+                        }
                         MlsEvent::Connected => {
                             tracing::info!("WebSocket connected");
                         }
@@ -181,7 +197,7 @@ impl BirdBot {
                             tracing::warn!("WebSocket disconnected, will reconnect");
                         }
                         MlsEvent::Info { info, .. } => {
-                            tracing::debug!("Info event: {}", info);
+                            let _ = info; // Never log an untrusted event body.
                         }
                     }
                 }
@@ -205,76 +221,213 @@ impl BirdBot {
         Ok(())
     }
 
-    // handle_message is now the free function handle_message_bg() below
-
-    async fn begin_typing_signal(
-        &self,
-        conversation_id: &str,
-    ) -> Option<tokio::task::JoinHandle<()>> {
-        if let Err(e) = self
-            .api_client
-            .send_typing_indicator(conversation_id, true)
+    async fn maintain_request_keys(&self) {
+        // Delivery is an explicit configuration choice, separate from consent.
+        if let Ok(current) = self
+            .orchestrator
+            .get_direct_request_delivery_enabled()
             .await
         {
-            tracing::debug!("Failed to send typing start: {}", e);
-        }
-
-        let api_client = Arc::clone(&self.api_client);
-        let convo_id = conversation_id.to_string();
-        Some(tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                if let Err(e) = api_client.send_typing_indicator(&convo_id, true).await {
-                    tracing::debug!("Failed to send typing heartbeat: {}", e);
+            match request_key_action(self.config.request_delivery_enabled(), current) {
+                RequestKeyAction::Enable => {
+                    let _ = self
+                        .orchestrator
+                        .set_direct_request_delivery_enabled(true)
+                        .await;
                 }
+                RequestKeyAction::Disable => {
+                    let _ = self
+                        .orchestrator
+                        .set_direct_request_delivery_enabled(false)
+                        .await;
+                }
+                RequestKeyAction::Replenish => {
+                    let _ = self
+                        .orchestrator
+                        .replenish_direct_request_keys_if_needed()
+                        .await;
+                }
+                RequestKeyAction::None => {}
             }
-        }))
+        }
     }
 
-    async fn end_typing_signal(
-        &self,
-        conversation_id: &str,
-        heartbeat: Option<tokio::task::JoinHandle<()>>,
-    ) {
-        if let Some(handle) = heartbeat {
-            handle.abort();
-        }
-
-        if let Err(e) = self
-            .api_client
-            .send_typing_indicator(conversation_id, false)
+    /// Distinct request path: only a freshly verified accepted projection can
+    /// release an introduction to the bridge. Pending text stays in native SQLCipher.
+    async fn handle_request_views(&self) {
+        let Ok(views) = self.orchestrator.list_direct_request_views().await else {
+            return;
+        };
+        for retained in views {
+            let Ok(mut view) = self
+                .orchestrator
+                .refresh_request_preview(&retained.conversation_id)
+                .await
+            else {
+                continue;
+            };
+            if view
+                .introduction
+                .as_ref()
+                .is_none_or(|intro| intro.sender_did == self.did)
+            {
+                continue;
+            }
+            if self.config.request_policy().action(&view) == RequestAction::Accept {
+                if self
+                    .orchestrator
+                    .accept_conversation(&view.conversation_id)
+                    .await
+                    .is_err()
+                {
+                    continue;
+                }
+                let Ok(accepted) = self
+                    .orchestrator
+                    .refresh_request_preview(&view.conversation_id)
+                    .await
+                else {
+                    continue;
+                };
+                view = accepted;
+            }
+            if self.config.request_policy().action(&view) != RequestAction::Reply {
+                continue;
+            }
+            let (Some(message_id), Some(intro), Some(RequestPreview::Ready { text, .. })) = (
+                view.first_message_id.as_ref(),
+                view.introduction.as_ref(),
+                view.preview.as_ref(),
+            ) else {
+                continue;
+            };
+            let _ = message_id;
+            if !crate::request_policy::claim_request_effect(
+                self.config.request_policy(),
+                &view,
+                self.orchestrator.storage().as_ref(),
+            ) {
+                continue;
+            }
+            // The same ordinary gate is applied after the durable dedup claim.
+            if !ordinary_effects_allowed(
+                &self.orchestrator,
+                &self.did,
+                &view.conversation_id,
+                self.config.request_policy(),
+            )
             .await
-        {
-            tracing::debug!("Failed to send typing stop: {}", e);
+            {
+                continue;
+            }
+            let (did, cid, sender, text, policy, max_chars) = (
+                self.did.clone(),
+                view.conversation_id.clone(),
+                intro.sender_did.clone(),
+                text.clone(),
+                self.config.request_policy(),
+                self.config.max_reply_characters,
+            );
+            let orchestrator = self.orchestrator.clone();
+            let llm = self.llm.clone();
+            let slots = self.effect_slots.clone();
+            tokio::spawn(async move {
+                let Ok(_permit) = slots.acquire_owned().await else {
+                    return;
+                };
+                if !ordinary_effects_allowed(&orchestrator, &did, &cid, policy).await {
+                    return;
+                }
+                if let Ok(response) = llm.generate(&cid, &sender, &text, None, None).await {
+                    if !response.is_empty()
+                        && ordinary_effects_allowed(&orchestrator, &did, &cid, policy).await
+                    {
+                        let response: String = response.chars().take(max_chars as usize).collect();
+                        let _ = orchestrator.send_message(&cid, &response).await;
+                    }
+                }
+            });
         }
-    }
-
-    /// Download an encrypted image blob and decrypt it.
-    async fn download_and_decrypt_image(
-        &self,
-        image: &catbird_mls::orchestrator::types::MLSImageEmbed,
-    ) -> anyhow::Result<Vec<u8>> {
-        tracing::info!(blob_id = %image.blob_id, "Downloading image blob");
-        let encrypted = self.api_client.get_blob(&image.blob_id).await?;
-        let plaintext = decrypt_blob(&encrypted, &image.key, &image.iv, &image.sha256)?;
-        tracing::info!(
-            blob_id = %image.blob_id,
-            size = plaintext.len(),
-            "Image blob decrypted"
-        );
-        Ok(plaintext)
     }
 
     /// Run periodic sync and trigger WebSocket reconnect if new conversations are discovered.
     async fn sync_and_reconnect_if_needed(&self, ws_reconnect: &Arc<Notify>) {
-        let count_before = self.orchestrator.conversations().lock().await.len();
-
+        let known: Vec<_> = self
+            .orchestrator
+            .conversations()
+            .lock()
+            .await
+            .keys()
+            .cloned()
+            .collect();
+        let count_before = known.len();
+        let mut previous = HashSet::new();
+        for cid in known {
+            let Ok(messages) = self
+                .orchestrator
+                .storage()
+                .get_messages(&cid, 100, None)
+                .await
+            else {
+                return;
+            };
+            previous.extend(messages.into_iter().map(|message| message.id));
+        }
         if let Err(e) = self.orchestrator.sync_with_server(false).await {
             tracing::warn!("Periodic sync failed: {}", e);
             return;
         }
 
-        let count_after = self.orchestrator.conversations().lock().await.len();
+        self.maintain_request_keys().await;
+        self.handle_request_views().await;
+        let current: Vec<_> = self
+            .orchestrator
+            .conversations()
+            .lock()
+            .await
+            .keys()
+            .cloned()
+            .collect();
+        let count_after = current.len();
+        for cid in current {
+            if !ordinary_effects_allowed(
+                &self.orchestrator,
+                &self.did,
+                &cid,
+                self.config.request_policy(),
+            )
+            .await
+            {
+                continue;
+            }
+            let Ok(messages) = self
+                .orchestrator
+                .storage()
+                .get_messages(&cid, 100, None)
+                .await
+            else {
+                continue;
+            };
+            for message in messages
+                .into_iter()
+                .rev()
+                .filter(|message| !previous.contains(&message.id))
+            {
+                let did = self.did.clone();
+                let api = self.api_client.clone();
+                let orchestrator = self.orchestrator.clone();
+                let llm = self.llm.clone();
+                let policy = self.config.request_policy();
+                let slots = self.effect_slots.clone();
+                tokio::spawn(async move {
+                    let Ok(_permit) = slots.acquire_owned().await else {
+                        return;
+                    };
+                    handle_decrypted_message(&did, &api, &orchestrator, &llm, policy, message)
+                        .await;
+                });
+            }
+        }
 
         if count_after > count_before {
             tracing::info!(
@@ -339,17 +492,21 @@ impl BirdBot {
 // ── Background message handler (spawned per-message, never blocks event loop) ──
 
 async fn handle_message_bg(
-    _did: &str,
+    did: &str,
     api_client: &Arc<BirdApiClient>,
     orchestrator: &Arc<BirdOrchestrator>,
     llm: &Arc<BridgeClient>,
     recent_rejoins: &Arc<Mutex<HashMap<String, Instant>>>,
+    policy: RequestPolicy,
     id: &str,
     conversation_id: &str,
     ciphertext: Vec<u8>,
     msg_epoch: u64,
     created_at: &str,
 ) {
+    if !ordinary_effects_allowed(orchestrator, did, conversation_id, policy).await {
+        return;
+    }
     let local_epoch = orchestrator
         .group_states()
         .lock()
@@ -380,6 +537,7 @@ async fn handle_message_bg(
 
     let timestamp = created_at.parse().unwrap_or_else(|_| Utc::now());
     let envelope = IncomingEnvelope {
+        canonical_entry_json: None,
         conversation_id: conversation_id.to_string(),
         sender_did: String::new(),
         ciphertext,
@@ -440,6 +598,18 @@ async fn handle_message_bg(
         }
     };
 
+    handle_decrypted_message(did, api_client, orchestrator, llm, policy, decrypted).await;
+}
+
+async fn handle_decrypted_message(
+    did: &str,
+    api_client: &Arc<BirdApiClient>,
+    orchestrator: &Arc<BirdOrchestrator>,
+    llm: &Arc<BridgeClient>,
+    policy: RequestPolicy,
+    decrypted: catbird_mls::orchestrator::Message,
+) {
+    let conversation_id = decrypted.conversation_id.as_str();
     if decrypted.is_own {
         tracing::debug!("Skipping own message");
         return;
@@ -450,9 +620,17 @@ async fn handle_message_bg(
         return;
     }
 
+    if !ordinary_effects_allowed(orchestrator, did, conversation_id, policy).await
+        || !orchestrator
+            .storage()
+            .claim_bot_effect(conversation_id, &decrypted.id)
+            .unwrap_or(false)
+    {
+        return;
+    }
+
     tracing::info!(
         sender = %decrypted.sender_did,
-        text = %decrypted.text,
         has_image = decrypted.image_embed().is_some(),
         "Decrypted message"
     );
@@ -466,9 +644,16 @@ async fn handle_message_bg(
     }
     let typing_api = Arc::clone(api_client);
     let typing_convo = conversation_id.to_string();
+    let typing_orchestrator = orchestrator.clone();
+    let typing_did = did.to_string();
     let typing_handle = tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            if !ordinary_effects_allowed(&typing_orchestrator, &typing_did, &typing_convo, policy)
+                .await
+            {
+                break;
+            }
             if let Err(e) = typing_api.send_typing_indicator(&typing_convo, true).await {
                 tracing::debug!("Failed to send typing heartbeat: {}", e);
             }
@@ -477,6 +662,10 @@ async fn handle_message_bg(
 
     // Download and decrypt image if present
     let image_data = if let Some(image) = decrypted.image_embed() {
+        if !ordinary_effects_allowed(orchestrator, did, conversation_id, policy).await {
+            typing_handle.abort();
+            return;
+        }
         tracing::info!(blob_id = %image.blob_id, "Downloading image blob");
         match api_client.get_blob(&image.blob_id).await {
             Ok(encrypted) => match decrypt_blob(&encrypted, &image.key, &image.iv, &image.sha256) {
@@ -522,7 +711,11 @@ async fn handle_message_bg(
     });
     let embed_ctx_ref = embed_context.as_deref();
 
-    tracing::info!("Calling OpenClaw for conversation {}", conversation_id);
+    if !ordinary_effects_allowed(orchestrator, did, conversation_id, policy).await {
+        typing_handle.abort();
+        return;
+    }
+    tracing::info!("Calling bridge for conversation {}", conversation_id);
     let response = match llm
         .generate(
             conversation_id,
@@ -565,6 +758,9 @@ async fn handle_message_bg(
         .send_typing_indicator(conversation_id, false)
         .await;
 
+    if !ordinary_effects_allowed(orchestrator, did, conversation_id, policy).await {
+        return;
+    }
     match orchestrator.send_message(conversation_id, &response).await {
         Ok(_msg) => {
             tracing::info!("Response sent successfully to {}", conversation_id);
@@ -573,4 +769,35 @@ async fn handle_message_bg(
             tracing::error!("Failed to send response: {}", e);
         }
     }
+}
+
+/// Missing, malformed, pending or closed authority fails closed before effects.
+async fn ordinary_effects_allowed(
+    orchestrator: &BirdOrchestrator,
+    did: &str,
+    cid: &str,
+    policy: RequestPolicy,
+) -> bool {
+    if !policy.reply {
+        return false;
+    }
+    let Ok(requests) = orchestrator.list_direct_request_views().await else {
+        return false;
+    };
+    if requests.iter().any(|view| view.conversation_id == cid) {
+        return orchestrator
+            .refresh_request_preview(cid)
+            .await
+            .is_ok_and(|view| {
+                view.consent == RequestConsent::Accepted
+                    && view.crypto == RequestCrypto::Ready
+                    && view.capabilities.can_send
+            });
+    }
+    // A list miss cannot classify a conversation. Require the shared core's
+    // protected, verified retained policy for this exact account and UUID.
+    let Ok(Some(state)) = orchestrator.mls_context().get_conversation_policy(did, cid) else {
+        return false;
+    };
+    crate::request_policy::legacy_effects_allowed(&state, did)
 }

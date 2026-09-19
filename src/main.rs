@@ -4,6 +4,7 @@ mod chat_authority;
 mod config;
 mod credentials;
 mod keychain;
+mod request_policy;
 
 mod storage;
 mod websocket;
@@ -23,8 +24,7 @@ use crate::storage::SqliteStorage;
 use crate::xrpc_client::BirdApiClient;
 
 use catbird_atproto::blue_catbird::chat::{
-    enroll_device::EnrollDeviceOutput, DeviceCapability, DeviceEnrollmentBody,
-    KeyPackageArtifact,
+    enroll_device::EnrollDeviceOutput, DeviceCapability, DeviceEnrollmentBody, KeyPackageArtifact,
 };
 use catbird_mls::orchestrator::credentials::CredentialStore;
 use catbird_mls::orchestrator::{
@@ -132,7 +132,8 @@ async fn main() -> anyhow::Result<()> {
     // Use a sanitized DID for the database filename (replace : and . with _)
     let did_sanitized = did.replace([':', '.'], "_");
     let mls_db_path = mls_state_dir.join(format!("{}.db", did_sanitized));
-    let mls_db_key = get_or_create_mls_db_key(&mls_state_dir, &did_sanitized, &secrets.app_password)?;
+    let mls_db_key =
+        get_or_create_mls_db_key(&mls_state_dir, &did_sanitized, &secrets.app_password)?;
     let mls_context = MLSContext::new(
         mls_db_path.to_string_lossy().to_string(),
         mls_db_key,
@@ -254,11 +255,9 @@ async fn establish_or_restore_authority(
     let persisted_session = credentials.get_opaque_chat_session(did)?;
     let persisted_tuple = credentials.get_admitted_device_tuple(did);
     let pending_enrollment = credentials.get_pending_enrollment(did);
-    if let (Some(session), Ok(Some(tuple)), Ok(None)) = (
-        &persisted_session,
-        &persisted_tuple,
-        &pending_enrollment,
-    ) {
+    if let (Some(session), Ok(Some(tuple)), Ok(None)) =
+        (&persisted_session, &persisted_tuple, &pending_enrollment)
+    {
         if let Ok(snapshot) = admit_existing_session(
             &nest,
             session,
@@ -274,20 +273,12 @@ async fn establish_or_restore_authority(
             return Ok(());
         }
     }
-    if let (Some(session), Ok(None), Ok(Some(pending))) = (
-        &persisted_session,
-        &persisted_tuple,
-        &pending_enrollment,
-    ) {
+    if let (Some(session), Ok(None), Ok(Some(pending))) =
+        (&persisted_session, &persisted_tuple, &pending_enrollment)
+    {
         if pending.prepared_body.is_some() {
-            let snapshot = reconcile_pending_enrollment(
-                &nest,
-                session,
-                did,
-                pending,
-                credentials,
-            )
-            .await?;
+            let snapshot =
+                reconcile_pending_enrollment(&nest, session, did, pending, credentials).await?;
             authority_state.install(snapshot);
             prepare_admitted_device_runtime(orchestrator, credentials, did).await?;
             return Ok(());
@@ -365,8 +356,9 @@ async fn establish_or_restore_authority(
         .body
         .ok_or_else(|| anyhow::anyhow!("Task 1 returned an empty enrollment body"))?;
     let typed: catbird_atproto::blue_catbird::chat::enroll_device::EnrollDevice<String> =
-        serde_json::from_slice(&body)
-            .map_err(|error| anyhow::anyhow!("prepared enrollment is not generated DTO JSON: {error}"))?;
+        serde_json::from_slice(&body).map_err(|error| {
+            anyhow::anyhow!("prepared enrollment is not generated DTO JSON: {error}")
+        })?;
     if typed.signed_request.body.idempotency_key.as_str() != idempotency_key
         || typed.signed_request.body.actor_did.as_str() != did
         || typed.signed_request.body.device_id.as_str() != device_id
@@ -379,7 +371,8 @@ async fn establish_or_restore_authority(
     let pending = credentials
         .get_pending_enrollment(did)?
         .ok_or_else(|| anyhow::anyhow!("pending enrollment disappeared before submission"))?;
-    let admitted = reconcile_pending_enrollment(&nest, &session, did, &pending, credentials).await?;
+    let admitted =
+        reconcile_pending_enrollment(&nest, &session, did, &pending, credentials).await?;
     authority_state.install(admitted);
     prepare_admitted_device_runtime(orchestrator, credentials, did).await?;
     Ok(())
@@ -463,11 +456,15 @@ async fn reconcile_pending_enrollment(
             String::from_utf8_lossy(&response.body)
         ));
     }
-    if response.content_type.as_deref().is_some_and(|content_type| {
-        !content_type
-            .to_ascii_lowercase()
-            .starts_with("application/json")
-    }) {
+    if response
+        .content_type
+        .as_deref()
+        .is_some_and(|content_type| {
+            !content_type
+                .to_ascii_lowercase()
+                .starts_with("application/json")
+        })
+    {
         return Err(anyhow::anyhow!(
             "Nest enrollment returned non-JSON content type"
         ));
@@ -544,6 +541,7 @@ fn enrollment_body(
         actor_did: catbird_atproto::types::string::Did::<String>::new(did.to_owned())
             .map_err(|error| anyhow::anyhow!("invalid enrollment actor DID: {error}"))?,
         capability: DeviceCapability {
+            direct_request_profile: Some("encryptedIntroduction1".into()),
             add_by_value: "supported".into(),
             application_frame_profile: "dagCborApplication1".into(),
             attachment_profile: "aes256GcmBlob1".into(),
