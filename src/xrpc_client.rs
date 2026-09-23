@@ -86,6 +86,17 @@ pub struct BirdApiClient {
     /// Stored for re-authentication when refresh token also expires.
     handle: String,
     app_password: String,
+    /// Debug-only counters at the real outbound effect boundaries, so live
+    /// qualification observes attempts rather than inferring them.
+    #[cfg(debug_assertions)]
+    effect_probe: Arc<EffectProbe>,
+}
+
+#[cfg(debug_assertions)]
+#[derive(Debug, Default)]
+pub struct EffectProbe {
+    pub typing_attempts: std::sync::atomic::AtomicUsize,
+    pub blob_downloads: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Debug, Clone)]
@@ -133,6 +144,8 @@ impl BirdApiClient {
             cached_coordinates: Arc::new(Mutex::new(HashMap::new())),
             handle,
             app_password,
+            #[cfg(debug_assertions)]
+            effect_probe: Arc::new(EffectProbe::default()),
         }
     }
 
@@ -150,6 +163,10 @@ impl BirdApiClient {
     pub fn with_http_client(mut self, http: reqwest::Client) -> Self {
         self.http = http;
         self
+    }
+    #[cfg(debug_assertions)]
+    pub fn effect_probe(&self) -> Arc<EffectProbe> {
+        self.effect_probe.clone()
     }
 
     pub fn set_signer(&self, signer: Arc<dyn CleanChatRequestSigner>) {
@@ -1624,6 +1641,10 @@ impl BirdApiClient {
 
     /// Download an encrypted blob by ID from the canonical Nest proxy.
     pub async fn get_blob(&self, blob_id: &str) -> Result<Vec<u8>> {
+        #[cfg(debug_assertions)]
+        self.effect_probe
+            .blob_downloads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let call = self.authority_for_call()?;
         let response = call
             .nest
@@ -1795,6 +1816,10 @@ impl BirdApiClient {
     }
 
     pub async fn send_typing_indicator(&self, _convo_id: &str, _is_typing: bool) -> Result<()> {
+        #[cfg(debug_assertions)]
+        self.effect_probe
+            .typing_attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         // Typing is a clean-chat operation, not a legacy sendMessage variant.
         // BIRDaemon currently has no canonical device-auth/MLS typing-payload
         // adapter, so never transmit fabricated ciphertext. The caller treats

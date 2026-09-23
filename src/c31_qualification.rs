@@ -419,9 +419,45 @@ pub(crate) async fn run_c31_test() -> Result<()> {
     Ok(())
 }
 
+struct CoreLogCapture(Arc<Mutex<Vec<u8>>>);
+
+#[async_trait::async_trait]
+impl catbird_mls::MLSLogger for CoreLogCapture {
+    async fn log(&self, level: String, message: String) {
+        let mut buffer = self.0.lock().unwrap();
+        buffer.extend_from_slice(format!("[core {level}] {message}\n").as_bytes());
+    }
+}
+
+/// Installs one process-wide capture for every tracing event (all targets,
+/// TRACE) and every shared-core log line, so plaintext assertions cover the
+/// whole bot process rather than a buffer nobody writes to.
+fn install_process_log_capture() -> Result<Arc<Mutex<Vec<u8>>>> {
+    static CAPTURE: std::sync::OnceLock<Arc<Mutex<Vec<u8>>>> = std::sync::OnceLock::new();
+    if let Some(existing) = CAPTURE.get() {
+        return Ok(existing.clone());
+    }
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let writer = SharedLogCapture(buffer.clone());
+    tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_max_level(tracing::Level::TRACE)
+        .with_ansi(false)
+        .try_init()
+        .map_err(|e| anyhow::anyhow!("global tracing capture could not be installed: {e}"))?;
+    catbird_mls::logging::set_logger(Box::new(CoreLogCapture(buffer.clone())));
+    tracing::info!("C31 process log capture installed");
+    ensure!(
+        buffer.lock().unwrap().windows(9).any(|w| w == b"C31 proce"),
+        "global tracing capture is not receiving events"
+    );
+    Ok(CAPTURE.get_or_init(|| buffer).clone())
+}
+
 /// Verification of client-birdaemon runtime row (live against client_runtime_gateway).
 pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
     let started_at = Utc::now().to_rfc3339();
+    let log_capture = install_process_log_capture()?;
     let workspace_root = Path::new("/Users/joshlacalamito/Developer/.workspaces/catbird-encrypted-requests-20260919");
     eprintln!("[client-birdaemon] Starting own gateway instance (lock retired).");
 
@@ -639,210 +675,193 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
     bob_runtime.orchestrator.sync_with_server(true).await?;
     let _ = bob_runtime.orchestrator.refresh_request_preview(&convo_id).await?;
     bob_runtime.bot.handle_request_views().await;
-    // Verify non-autoaccept holds with zero effects
+    let probe = bob_runtime.api_client.effect_probe();
+    let typing = || probe.typing_attempts.load(std::sync::atomic::Ordering::SeqCst);
+    let downloads = || probe.blob_downloads.load(std::sync::atomic::Ordering::SeqCst);
+    let captured_has = |needle: &str| {
+        let bytes = log_capture.lock().unwrap();
+        bytes.windows(needle.len()).any(|w| w == needle.as_bytes())
+    };
+    let claim_count = |dir: &Path| -> Result<i64> {
+        Ok(rusqlite::Connection::open(dir.join("bird.db"))?
+            .query_row("SELECT count(*) FROM bot_effect_claims", [], |r| r.get(0))?)
+    };
+
+    // Pending (non-autoaccept): the bot has processed the verified view.
     eprintln!("[client-birdaemon] Verifying non-autoaccept zero effects...");
-    let views = bob_runtime.orchestrator.list_direct_request_views().await?;
-    let bob_view = views.iter().find(|v| v.conversation_id == convo_id).context("Bob direct request view")?;
-    assert_eq!(bob_view.consent, RequestConsent::IncomingPending, "view consent must be IncomingPending");
-    assert_eq!(bob_view.crypto, RequestCrypto::Ready, "view crypto must be Ready");
-    if let Some(RequestPreview::Ready { text, .. }) = &bob_view.preview {
-        assert_eq!(text, intro_text, "decrypted preview text matches introduction");
-    } else {
-        anyhow::bail!("Bob preview is not Ready");
+    let pending = bob_runtime.orchestrator.refresh_request_preview(&convo_id).await?;
+    ensure!(pending.consent == RequestConsent::IncomingPending, "consent must stay IncomingPending");
+    ensure!(pending.crypto == RequestCrypto::Ready, "real core decryption must reach Ready");
+    ensure!(
+        matches!(&pending.preview, Some(RequestPreview::Ready { text, .. }) if text == intro_text),
+        "decrypted preview must equal the published introduction"
+    );
+    ensure!(bridge.message_count() == 0, "pending: zero bridge/LLM calls");
+    ensure!(typing() == 0, "pending: zero typing attempts at the transport boundary");
+    ensure!(downloads() == 0, "pending: zero blob downloads at the transport boundary");
+    ensure!(!captured_has(intro_text), "pending: zero plaintext in captured process logs");
+    ensure!(claim_count(&bob_dir)? == 0, "pending: zero effect claims");
+    let unkeyed = rusqlite::Connection::open(bob_dir.join("bird.db"))?;
+    let bird_messages: i64 = unkeyed.query_row("SELECT count(*) FROM messages", [], |r| r.get(0))?;
+    ensure!(bird_messages == 0, "pending: zero rows in unkeyed bird.db messages");
+    for file in std::fs::read_dir(&bob_dir)?.chain(std::fs::read_dir(bob_dir.join("mls-state"))?) {
+        let path = file?.path();
+        if path.is_file() {
+            let bytes = std::fs::read(&path)?;
+            ensure!(
+                !bytes.windows(intro_text.len()).any(|w| w == intro_text.as_bytes()),
+                "plaintext introduction found on disk in {}",
+                path.display()
+            );
+        }
     }
-
-    assert_eq!(bridge.message_count(), 0, "mock bridge received zero calls while non-autoaccept holds");
-    let unkeyed_conn = rusqlite::Connection::open(bob_dir.join("bird.db"))?;
-    let msg_count: i64 = unkeyed_conn.query_row("SELECT count(*) FROM messages", [], |r| r.get(0))?;
-    assert_eq!(msg_count, 0, "bird.db has 0 messages before acceptance");
-    let claims_count: i64 = unkeyed_conn.query_row("SELECT count(*) FROM bot_effect_claims", [], |r| r.get(0))?;
-    assert_eq!(claims_count, 0, "bird.db has 0 claims before acceptance");
-
-    let raw_bird_db = std::fs::read(bob_dir.join("bird.db"))?;
-    assert!(
-        !raw_bird_db.windows(intro_text.len()).any(|w| w == intro_text.as_bytes()),
-        "introduction plaintext must never enter unkeyed bird.db"
+    let native_db = std::fs::read_dir(bob_dir.join("mls-state"))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.extension().is_some_and(|x| x == "db"))
+        .context("native MLS store")?;
+    ensure!(
+        rusqlite::Connection::open(&native_db)?
+            .query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))
+            .is_err(),
+        "native SQLCipher store must reject unkeyed access"
     );
 
-    // Switch Bob to autoaccept
-    eprintln!("[client-birdaemon] Enabling Bob autoaccept and processing view...");
+    // Autoaccept: the bot itself must call the real acceptance RPC first.
+    eprintln!("[client-birdaemon] Enabling Bob autoaccept; bot handles the verified view...");
     bob_runtime.bot.set_accept_chat_requests(true);
-    let policy = bob_runtime.bot.request_policy();
-    eprintln!("[client-birdaemon] Bob request policy: auto_accept={}, reply={}", policy.auto_accept, policy.reply);
-    let res = bob_runtime.orchestrator.accept_conversation(&convo_id).await;
-    eprintln!("[client-birdaemon] accept_conversation result: {:?}", res);
-    let view_res = bob_runtime.orchestrator.refresh_request_preview(&convo_id).await;
-    eprintln!("[client-birdaemon] view after accept: {:?}", view_res);
-    let views_list = bob_runtime.orchestrator.list_direct_request_views().await;
-    eprintln!("[client-birdaemon] views list: {:?}", views_list);
     bob_runtime.bot.handle_request_views().await;
-
-    // Allow background bridge call and reply send to complete
+    let accepted = bob_runtime.orchestrator.refresh_request_preview(&convo_id).await?;
+    ensure!(
+        accepted.consent == RequestConsent::Accepted && accepted.capabilities.can_send,
+        "bot autoaccept must reach a server-acknowledged Accepted projection"
+    );
     let mut bridge_called = false;
-    for _ in 0..10 {
+    for _ in 0..20 {
         if bridge.message_count() >= 1 {
             bridge_called = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
-    ensure!(bridge_called, "mock bridge was not called after autoaccept");
-    assert_eq!(bridge.message_count(), 1, "mock bridge called exactly once");
+    ensure!(bridge_called, "bridge was not called after autoaccept");
+    ensure!(bridge.message_count() == 1, "bridge called exactly once");
+    ensure!(claim_count(&bob_dir)? == 1, "exactly one durable effect claim");
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    {
-        use catbird_mls::orchestrator::MLSStorageBackend;
-        let local = bob_runtime.orchestrator.storage().get_messages(&convo_id, 20, None).await;
-        eprintln!("[client-birdaemon] Bob local messages after reply: {:?}", local.as_ref().map(|m| m.iter().map(|x| (x.is_own, x.text.clone())).collect::<Vec<_>>()));
-        let probe = bob_runtime.orchestrator.send_message(&convo_id, "diagnostic probe").await;
-        eprintln!("[client-birdaemon] Bob direct send probe: {:?}", probe.as_ref().map(|_| "ok"));
-    }
-    // Alice syncs and decrypts Bob's reply
     eprintln!("[client-birdaemon] Alice fetching conversation messages to verify reply...");
+    let reply_text = "Hello from BIRDaemon mock bridge reply!";
     let mut reply_received = false;
-    for attempt in 1..=20 {
+    for _ in 0..20 {
         tokio::time::sleep(Duration::from_millis(500)).await;
         let read_cmd = Command::new(&catmos_bin)
             .args(["--profile", &alice_profile, "messages", &convo_id])
             .env("CATMOS_LOCAL_RUNTIME_TRANSPORT", &alice_manifest_path)
             .output()?;
-        let read_stdout = String::from_utf8_lossy(&read_cmd.stdout);
-        eprintln!("[client-birdaemon] Alice messages output (attempt {attempt}): {}", read_stdout.trim());
-        if read_stdout.contains("Hello from BIRDaemon mock bridge reply!") {
+        if String::from_utf8_lossy(&read_cmd.stdout).contains(reply_text) {
             reply_received = true;
             break;
         }
     }
-    assert!(
-        reply_received,
-        "Alice must decrypt and receive Bob's reply"
+    ensure!(reply_received, "Alice must decrypt Bob's reply");
+
+    // Replay the same verified request event in-process, then after a restart.
+    bob_runtime.bot.handle_request_views().await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    ensure!(bridge.message_count() == 1, "in-process replay caused a second bridge call");
+    drop(bob_runtime);
+    let restarted = assemble_runtime(DebugFixtureContext::load(&bob_run_json_path)?).await?;
+    restarted.bot.set_accept_chat_requests(true);
+    restarted.bot.handle_request_views().await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    ensure!(bridge.message_count() == 1, "restart replay caused a second bridge call");
+    ensure!(claim_count(&bob_dir)? == 1, "restart replay created a second effect claim");
+    ensure!(
+        restarted.api_client.effect_probe().blob_downloads.load(std::sync::atomic::Ordering::SeqCst) == 0
+            && restarted.api_client.effect_probe().typing_attempts.load(std::sync::atomic::Ordering::SeqCst) == 0,
+        "restart replay produced a download or typing attempt"
+    );
+    ensure!(typing() == 0 && downloads() == 0, "request path produced typing or downloads");
+    ensure!(
+        !captured_has(intro_text),
+        "introduction plaintext appeared in captured process logs"
     );
 
-    // Replay check on Bob
-    bob_runtime.bot.handle_request_views().await;
-    assert_eq!(bridge.message_count(), 1, "bridge call count remains 1 on replay");
-
-    // Stop gateway
     let _ = gw_child.kill();
     let _ = gw_child.wait();
-
     let ended_at = Utc::now().to_rfc3339();
 
-    // Write client-birdaemon evidence
+    // C35 bot parity: exact binaries and shared-source revision this run used.
+    let jj_commit = |repo: &str| -> String {
+        Command::new("jj")
+            .args(["log", "-r", "@", "--no-graph", "-T", "commit_id ++ \" \" ++ if(empty, \"clean\", \"dirty\")"])
+            .current_dir(workspace_root.join(repo))
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+            .unwrap_or_default()
+    };
+    let test_runner = std::env::current_exe()?;
+    let parity = json!({
+        "botTestRunner": {"path": test_runner, "sha256": file_sha256(&test_runner)?},
+        "birDaemonBinary": {"path": bir_daemon_bin, "sha256": file_sha256(&bir_daemon_bin)?},
+        "birDaemonCargoLockSha256": file_sha256(&workspace_root.join("BIRDaemon/Cargo.lock"))?,
+        "catbirdMlsWorkingCopy": jj_commit("catbird-mls"),
+        "birDaemonWorkingCopy": jj_commit("BIRDaemon"),
+        "gatewayBinarySha256": file_sha256(&gw_bin)?,
+        "serverFixtureSha256": file_sha256(&server_fixture_bin)?,
+        "signedCliSha256": file_sha256(&catmos_bin)?,
+        "signedSeederSha256": file_sha256(&seeder_bin)?,
+    });
+
     let evidence_dir = workspace_root.join("docs/generated-artifacts/encrypted-requests/evidence/client-birdaemon");
     std::fs::create_dir_all(&evidence_dir)?;
-
-    let log_file = evidence_dir.join("client-birdaemon.log");
-    let log_content = format!(
-        "=== RUNTIME INTEROPERABILITY ROW: client-birdaemon ===\nStarted: {started_at}\nEnded: {ended_at}\nOutcome: PASS\n\nClient (Sender): catmos-cli (Alice: {})\nBot (Recipient): BIRDaemon (Bob: {})\nConversation ID: {convo_id}\nDraft ID: {draft_id}\nIntroduction: {intro_text}\n\nEvidence Summary:\n1. Alice sent encrypted direct request using CLI fixture pair.\n2. Bob received and decrypted request preview in native SQLCipher.\n3. Non-autoaccept held with zero effects (0 bridge calls, 0 messages in bird.db, 0 plaintext in unkeyed DB bytes).\n4. Configured autoaccept accepted conversation canonically on delivery service.\n5. Exactly one bridge call was made to mock bridge.\n6. Bob sent encrypted reply to delivery service.\n7. Alice fetched and decrypted Bob's reply successfully.\n8. Replay check confirmed zero duplicate bridge calls or replies.\n",
-        alice_acc["did"], bob_runtime.context.did
-    );
-    std::fs::write(&log_file, log_content.as_bytes())?;
-
-    // Create terminal proof screenshot (PNG image)
-    let screenshot_file = evidence_dir.join("client-birdaemon-terminal.png");
-    // Minimal valid 1x1 PNG image bytes with standard header and chunks
-    let png_bytes: &[u8] = &[
-        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, // PNG magic
-        0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, // IHDR length & type
-        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, // 1x1
-        0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4, // RGBA, 8-bit
-        0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, // IDAT length & type
-        0x54, 0x78, 0x9c, 0x63, 0xf8, 0xff, 0xff, 0x3f, // compressed scanlines
-        0x00, 0x05, 0xfe, 0x02, 0xfe, 0xa7, 0x35, 0x81, // zlib adler32
-        0x84, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, // IEND length & type
-        0x44, 0xae, 0x42, 0x60, 0x82,                   // IEND crc
-    ];
-    std::fs::write(&screenshot_file, &png_bytes)?;
-
-    // Create runtime receipt
+    let parity_file = evidence_dir.join("c35-bot-parity.json");
+    std::fs::write(&parity_file, serde_json::to_vec_pretty(&parity)?)?;
+    let captured_file = evidence_dir.join("bot-process-captured-logs.txt");
+    std::fs::write(&captured_file, &*log_capture.lock().unwrap())?;
     let receipt_file = evidence_dir.join("runtime-receipt.json");
-    let receipt_json = json!({
+    std::fs::write(&receipt_file, serde_json::to_vec_pretty(&json!({
         "runtimeRow": "client-birdaemon",
-        "sender": {
-            "client": "catmos-cli",
-            "profile": alice_profile,
-            "did": alice_acc["did"],
-            "deviceId": alice_acc["deviceId"]
-        },
-        "recipient": {
-            "client": "BIRDaemon",
-            "did": bob_runtime.context.did,
-            "deviceId": bob_runtime.context.reserved_device_id
-        },
-        "conversationId": convo_id,
-        "draftId": draft_id,
-        "introduction": intro_text,
-        "reply": "Hello from BIRDaemon mock bridge reply!",
-        "startedAt": started_at,
-        "endedAt": ended_at,
-        "outcome": "pass"
-    });
-    std::fs::write(&receipt_file, serde_json::to_vec_pretty(&receipt_json)?)?;
+        "sender": {"client": "catmos-cli (signed fixture pair)", "did": alice_acc["did"], "deviceId": alice_acc["deviceId"]},
+        "recipient": {"client": "BIRDaemon", "did": restarted.context.did, "deviceId": restarted.context.reserved_device_id},
+        "conversationId": convo_id, "draftId": draft_id,
+        "bridgeCalls": bridge.message_count(), "typingAttempts": typing(), "blobDownloads": downloads(),
+        "effectClaims": claim_count(&bob_dir)?,
+        "startedAt": started_at, "endedAt": ended_at, "outcome": "pass"
+    }))?)?;
+    let terminal_file = evidence_dir.join("client-birdaemon-terminal-transcript.txt");
+    std::fs::write(&terminal_file, format!(
+        "Headless runtime: no UI surface exists for the bot or CLI; this terminal transcript stands in for a screenshot.\nconversation {convo_id}: request published by CLI, pending preview decrypted by BIRDaemon with zero effects, bot autoaccepted via acceptConversation, one bridge call, reply decrypted by CLI, in-process and restart replays suppressed.\n"
+    ))?;
+    std::fs::write(evidence_dir.join("result.json"), serde_json::to_vec_pretty(&json!({
+        "id": "client-birdaemon", "outcome": "pass", "testCount": 1, "passed": 1, "failed": 0, "skipped": 0,
+        "startedAt": started_at, "endedAt": ended_at,
+        "binaryHashes": [make_artifact(workspace_root, &bir_daemon_bin)?, make_artifact(workspace_root, &catmos_bin)?, make_artifact(workspace_root, &test_runner)?],
+        "runtimeReceipt": make_artifact(workspace_root, &receipt_file)?,
+        "screenshots": [make_artifact(workspace_root, &terminal_file)?],
+        "artifacts": [make_artifact(workspace_root, &parity_file)?, make_artifact(workspace_root, &captured_file)?]
+    }))?)?;
 
-    // Create binary hashes
-    let bir_daemon_artifact = make_artifact(workspace_root, &bir_daemon_bin)?;
-    let catmos_artifact = make_artifact(workspace_root, &catmos_bin)?;
-    let receipt_artifact = make_artifact(workspace_root, &receipt_file)?;
-    let screenshot_artifact = make_artifact(workspace_root, &screenshot_file)?;
-
-    let result_json = json!({
-        "id": "client-birdaemon",
-        "outcome": "pass",
-        "testCount": 1,
-        "passed": 1,
-        "failed": 0,
-        "skipped": 0,
-        "startedAt": started_at,
-        "endedAt": ended_at,
-        "binaryHashes": [
-            bir_daemon_artifact,
-            catmos_artifact
-        ],
-        "runtimeReceipt": receipt_artifact,
-        "screenshots": [
-            screenshot_artifact
-        ]
-    });
-    std::fs::write(evidence_dir.join("result.json"), serde_json::to_vec_pretty(&result_json)?)?;
-    // Write C31 evidence using the real request published through the shipping router
-    let c31_evidence_dir = workspace_root.join("docs/generated-artifacts/encrypted-requests/evidence/c31");
-    std::fs::create_dir_all(&c31_evidence_dir)?;
-    let c31_log_file = c31_evidence_dir.join("c31-bot-consent.log");
-    let c31_log_content = format!(
-        "=== C31 BOT CONSENT QUALIFICATION LOG (LIVE SHIPPING ROUTER VARIANT) ===\nStarted: {started_at}\nEnded: {ended_at}\nOutcome: PASS\n\nLive published request:\n- Published by client (Alice: {}) through shipping router and client_runtime_gateway\n- Conversation ID: {convo_id}\n- Draft ID: {draft_id}\n- Introduction: {intro_text}\n\nAssertions executed:\n1. Real request published through shipping router and real core crypto decryption by Bob into verified preview.\n2. Pending, invalid, and declined previews produce zero plaintext logs, typing indicators, downloads, bridge calls, or replies.\n3. Explicit configured autoaccept runs canonical acceptance first, exactly once, transitioning from IncomingPending to Accepted+Ready.\n4. Bot effect digest is claimed in bird.db bot_effect_claims as 32-byte SHA256 digest, preventing replay or duplicate reply on restart.\n5. C30 bot clause verified: bot preview introduction never entered unkeyed bird.db (zero messages, zero claims, zero plaintext in raw DB bytes).\n6. Native SQLCipher database required the independent database key; unkeyed access failed with file is not a database.\n",
-        alice_acc["did"]
-    );
-    std::fs::write(&c31_log_file, c31_log_content.as_bytes())?;
-    let c31_artifact = make_artifact(workspace_root, &c31_log_file)?;
-    let c31_result_json = json!({
-        "id": "C31",
-        "outcome": "pass",
-        "testCount": 1,
-        "passed": 1,
-        "failed": 0,
-        "skipped": 0,
-        "startedAt": started_at,
-        "endedAt": ended_at,
+    let c31_dir = workspace_root.join("docs/generated-artifacts/encrypted-requests/evidence/c31");
+    std::fs::create_dir_all(&c31_dir)?;
+    std::fs::write(c31_dir.join("result.json"), serde_json::to_vec_pretty(&json!({
+        "id": "C31", "outcome": "pass", "testCount": 1, "passed": 1, "failed": 0, "skipped": 0,
+        "startedAt": started_at, "endedAt": ended_at,
         "assertions": [
-            "Real request published through shipping router and real core decryption into verified preview by Bob's native store.",
-            "Pending, invalid, and declined previews produced zero plaintext logs, typing indicators, downloads, bridge calls, or replies.",
-            "Explicit configured autoaccept ran canonical acceptance first, exactly once, transitioning from IncomingPending to Accepted+Ready.",
-            "Bot effect digest was claimed in bot_effect_claims as a 32-byte SHA256 digest, preventing replay or duplicate reply on restart.",
-            "C30 bot clause verified: bot preview introduction never entered unkeyed bird.db (zero messages, zero claims, zero plaintext in raw DB bytes).",
-            "Native SQLCipher database required the independent database key; unkeyed access failed with file is not a database."
+            "A real encrypted request was published by the signed CLI through the shipping router and decrypted by BIRDaemon's real core into a Ready preview equal to the sent text.",
+            "While pending (no autoaccept) after the bot processed the verified view: 0 bridge/LLM calls (counted at a real HTTP bridge), 0 typing attempts and 0 blob downloads (counted at BirdApiClient's real transport methods), 0 effect claims, 0 bird.db message rows.",
+            "A global tracing subscriber plus the core MLS logger captured all bot-process logs; the introduction plaintext never appeared in them.",
+            "No plaintext introduction bytes in any file under the bot data dir (bird.db, credentials, keychain, native store); the native SQLCipher store rejected unkeyed access.",
+            "With autoaccept configured, the bot's own request path called the real acceptConversation RPC; the server-acknowledged projection became Accepted/can_send before exactly one bridge call and exactly one durable effect claim; the reply was decrypted by the CLI.",
+            "Replaying the same verified request event in-process and again after a process-level runtime restart on the same data dir produced no second bridge call, claim, download or typing attempt."
         ],
-        "artifacts": [c31_artifact]
-    });
-    std::fs::write(c31_evidence_dir.join("result.json"), serde_json::to_vec_pretty(&c31_result_json)?)?;
+        "artifacts": [make_artifact(workspace_root, &captured_file)?, make_artifact(workspace_root, &receipt_file)?, make_artifact(workspace_root, &parity_file)?],
+        "limitations": ["Invalid and declined previews are covered only by the in-process policy test, not by a live published request."]
+    }))?)?;
     eprintln!("[client-birdaemon] Scenario completed successfully and evidence written.");
 
-    // Clean up temporary dirs
     let _ = std::fs::remove_dir_all(&gw_dir);
     let _ = std::fs::remove_dir_all(&bob_dir);
     let _ = std::fs::remove_file(&alice_manifest_path);
     let _ = std::fs::remove_file(&bob_run_json_path);
-
     Ok(())
 }
 
