@@ -63,3 +63,7 @@ dirs = "5"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3.7"
+
+[dev-dependencies]
+# Debug-only live qualification: malicious-but-authentic sender (C31 invalid leg).
+mls-e2e-tests = { path = "../mls-ds/e2e-tests", features = ["local-runtime-fixture"] }

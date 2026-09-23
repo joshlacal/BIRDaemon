@@ -568,6 +568,143 @@ impl Drop for GatewayChild {
     }
 }
 
+/// Invalid leg: runs on its own gateway instance, because each synthetic
+/// account reserves exactly one device and the CLI owns the main run's Alice.
+/// A malicious-but-authentic sender publishes a re-signed, tampered
+/// introduction through the real router. The recipient is a real BIRDaemon
+/// runtime configured for the strongest case: autoaccept and reply enabled.
+async fn run_invalid_introduction_leg(
+    workspace_root: &Path,
+    gw_bin: &Path,
+    server_fixture_bin: &Path,
+    log_capture: &Arc<Mutex<Vec<u8>>>,
+) -> Result<Value> {
+    use catbird_mls::orchestrator::MlsCryptoContext;
+    use mls_e2e_tests::gateway_tampered_request::GatewaySender;
+    eprintln!("[c31-invalid] Starting a second, independent gateway instance...");
+    let gw_dir = std::env::temp_dir().join(format!("gw-c31-invalid-{}", uuid::Uuid::new_v4()));
+    let mut gateway = GatewayChild::spawn(
+        gw_bin,
+        &json!({"output_dir": gw_dir, "cors_origin": "http://127.0.0.1:5173", "lifetime_seconds": 600}),
+        server_fixture_bin,
+    )?;
+    let ready = gateway.stdout_line()?;
+    ensure!(!ready.trim().is_empty(), "invalid-leg gateway exited: {}", gateway.take_stderr()?);
+    let manifest_path = PathBuf::from(
+        serde_json::from_str::<Value>(&ready)?["manifest"].as_str().context("manifest")?,
+    );
+    let sessions_path = gw_dir.join("sessions.json");
+    let manifest: Value = serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
+    let sessions: Value = serde_json::from_slice(&std::fs::read(&sessions_path)?)?;
+    let pick = |doc: &Value, label: &str| -> Result<Value> {
+        doc["accounts"].as_array().context("accounts")?.iter().find(|a| a["label"] == label).cloned().context("account")
+    };
+    let alice = pick(&manifest, "alice")?;
+    let alice_session = pick(&sessions, "alice")?["session"].as_str().context("session")?.to_owned();
+
+    let bridge = MockBridge::start().await?;
+    let bob_dir = std::env::temp_dir().join(format!("bob-invalid-{}", uuid::Uuid::new_v4()));
+    let run_path = std::env::temp_dir().join(format!("bob-invalid-run-{}.json", uuid::Uuid::new_v4()));
+    std::fs::write(&run_path, serde_json::to_vec(&DebugFixtureRunConfig {
+        manifest_path,
+        sessions_path,
+        account_label: "bob".into(),
+        data_dir: bob_dir.clone(),
+        bridge_url: format!("http://127.0.0.1:{}", bridge.port),
+        receive_chat_requests: true,
+        accept_chat_requests: true,
+        reply_to_all_messages: true,
+        max_reply_characters: 1000,
+    })?)?;
+    let bob = assemble_runtime(DebugFixtureContext::load(&run_path)?).await?;
+    bob.bot.maintain_request_keys().await;
+    ensure!(
+        bob.orchestrator.get_direct_request_delivery_enabled().await? == Some(true),
+        "invalid-leg Bob request delivery not acknowledged"
+    );
+    bob.orchestrator.replenish_direct_request_keys_if_needed().await?;
+    let bob_public = bob.orchestrator.mls_context().identity_public_key(
+        format!("{}#{}", bob.context.did, bob.context.reserved_device_id),
+    )?;
+
+    let engine = mls_e2e_tests::mls_engine::MlsEngine::new("c31-invalid-alice")?;
+    let alice_did = alice["did"].as_str().context("alice did")?.to_owned();
+    let alice_device = alice["deviceId"].as_str().context("alice device")?.to_owned();
+    let alice_identity = format!("{alice_did}#{alice_device}");
+    engine.create_key_package(&alice_identity)?;
+    let alice_public = engine.identity_public_key(&alice_identity)?;
+    let enroll = bob
+        .context
+        .http
+        .post(format!("{}/fixture/enroll", bob.context.origin))
+        .bearer_auth(&alice_session)
+        .json(&json!({"device_id": alice_device, "signature_public_key": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &alice_public)}))
+        .send()
+        .await?;
+    ensure!(enroll.status().is_success(), "harness sender preseed failed: {}", enroll.status());
+    let published = GatewaySender {
+        http: &bob.context.http,
+        origin: &bob.context.origin,
+        session: &alice_session,
+        did: &alice_did,
+        device_id: &alice_device,
+        engine: &engine,
+    }
+    .publish_unverifiable_introduction(&bob.context.did, &bob_public)
+    .await?;
+    let cid = published.conversation_id.clone();
+    eprintln!("[c31-invalid] Tampered request published: {cid}");
+
+    bob.orchestrator.sync_with_server(true).await?;
+    let refreshed = bob.orchestrator.refresh_request_preview(&cid).await;
+    eprintln!("[c31-invalid] Bob refresh of tampered request: {:?}", refreshed.as_ref().map(|v| (&v.consent, &v.crypto, &v.preview)));
+    bob.bot.handle_request_views().await;
+    bob.bot.handle_request_views().await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let view = bob.orchestrator.refresh_request_preview(&cid).await;
+    let (consent, preview) = match &view {
+        Ok(v) => (format!("{:?}", v.consent), format!("{:?}", v.preview)),
+        Err(e) => ("unavailable".to_owned(), format!("refresh error: {e}")),
+    };
+    if let Ok(v) = &view {
+        ensure!(
+            !matches!(v.preview, Some(RequestPreview::Ready { .. })),
+            "tampered introduction must never become a Ready preview"
+        );
+        ensure!(v.consent != RequestConsent::Accepted, "bot must never accept an invalid introduction");
+    }
+    let probe = bob.api_client.effect_probe();
+    let claims: i64 = rusqlite::Connection::open(bob_dir.join("bird.db"))?
+        .query_row("SELECT count(*) FROM bot_effect_claims", [], |r| r.get(0))?;
+    let bird_messages: i64 = rusqlite::Connection::open(bob_dir.join("bird.db"))?
+        .query_row("SELECT count(*) FROM messages", [], |r| r.get(0))?;
+    ensure!(bridge.message_count() == 0, "invalid: bridge was called");
+    ensure!(probe.typing_attempts.load(std::sync::atomic::Ordering::SeqCst) == 0, "invalid: typing attempted");
+    ensure!(probe.blob_downloads.load(std::sync::atomic::Ordering::SeqCst) == 0, "invalid: blob downloaded");
+    ensure!(claims == 0 && bird_messages == 0, "invalid: effect claim or bird.db message written");
+    let secret = "Unverifiable introduction the recipient must never surface";
+    ensure!(
+        !log_capture.lock().unwrap().windows(secret.len()).any(|w| w == secret.as_bytes()),
+        "invalid: introduction text reached captured logs"
+    );
+
+    drop(bob);
+    gateway.shutdown()?;
+    let _ = std::fs::remove_dir_all(&gw_dir);
+    let _ = std::fs::remove_dir_all(&bob_dir);
+    let _ = std::fs::remove_file(&run_path);
+    let _ = workspace_root;
+    Ok(json!({
+        "conversationId": cid,
+        "requestId": published.request_id,
+        "finalConsent": consent,
+        "finalPreview": preview,
+        "bridgeCalls": 0, "typingAttempts": 0, "blobDownloads": 0, "effectClaims": 0, "birdDbMessages": 0,
+        "botPolicy": {"autoAccept": true, "reply": true}
+    }))
+}
+
 /// Verification of client-birdaemon runtime row (live against client_runtime_gateway).
 pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
     let started_at = Utc::now().to_rfc3339();
@@ -887,6 +1024,7 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
     );
 
     gw_child.shutdown()?;
+    let invalid = run_invalid_introduction_leg(workspace_root, &gw_bin, &server_fixture_bin, &log_capture).await?;
     let ended_at = Utc::now().to_rfc3339();
 
     // C35 bot parity: exact binaries and shared-source revision this run used.
@@ -944,7 +1082,7 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
     let c31_dir = workspace_root.join("docs/generated-artifacts/encrypted-requests/evidence/c31");
     std::fs::create_dir_all(&c31_dir)?;
     std::fs::write(c31_dir.join("result.json"), serde_json::to_vec_pretty(&json!({
-        "id": "C31", "outcome": "not_run", "testCount": 0, "passed": 0, "failed": 0, "skipped": 0,
+        "id": "C31", "outcome": "pass", "testCount": 1, "passed": 1, "failed": 0, "skipped": 0,
         "startedAt": started_at, "endedAt": ended_at,
         "assertions": [
             "A real encrypted request was published by the signed CLI through the shipping router and decrypted by BIRDaemon's real core into a Ready preview equal to the sent text.",
@@ -953,10 +1091,11 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
             "No plaintext introduction bytes in any file under the bot data dir (bird.db, credentials, keychain, native store); the native SQLCipher store rejected unkeyed access.",
             "With autoaccept configured, the bot's own request path called the real acceptConversation RPC; the server-acknowledged projection became Accepted/can_send before exactly one bridge call and exactly one durable effect claim; the reply was decrypted by the CLI.",
             "A second real published request was declined through the real close RPC; with autoaccept then enabled the bot never reopened or accepted it, and it produced zero bridge, typing, download or claim effects (the single bridge call carried the accepted conversation id).",
-            "Replaying the same verified request event in-process and again after a process-level runtime restart on the same data dir produced no second bridge call, claim, download or typing attempt."
+            "Replaying the same verified request event in-process and again after a process-level runtime restart on the same data dir produced no second bridge call, claim, download or typing attempt.",
+            "Invalid leg: a malicious-but-authentic sender published a re-signed request with a tampered introduction through the real router to a separate BIRDaemon device configured to autoaccept and reply. Bob's real core rejected the introduction (preview never Ready), the bot never accepted it, and bridge, typing, download and claim effects were all zero.",
         ],
         "artifacts": [make_artifact(workspace_root, &captured_file)?, make_artifact(workspace_root, &receipt_file)?, make_artifact(workspace_root, &parity_file)?],
-        "reason": "not_run until the live invalid-introduction leg exists: every other C31 clause above ran live, but no CLI or bot-side path can publish a re-signed tampered introduction to a BIRDaemon device without a core test hook (awaiting approval); the invalid preview is currently exercised only by the in-process policy test."
+        "invalidLeg": invalid,
     }))?)?;
     eprintln!("[client-birdaemon] Scenario completed successfully and evidence written.");
 
@@ -972,5 +1111,26 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
 async fn test_client_birdaemon_live_scenario() {
     if let Err(e) = run_client_birdaemon_live_scenario().await {
         panic!("test_client_birdaemon_live_scenario failed: {e:?}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the local client runtime gateway fixture"]
+async fn test_c31_invalid_introduction_leg_live() {
+    let root = Path::new("/Users/joshlacalamito/Developer/.workspaces/catbird-encrypted-requests-20260919");
+    let result = async {
+        let capture = install_process_log_capture()?;
+        run_invalid_introduction_leg(
+            root,
+            &root.join("mls-ds/e2e-tests/target/debug/examples/client_runtime_gateway"),
+            &root.join("mls-ds/target/debug/encrypted_request_server_fixture"),
+            &capture,
+        )
+        .await
+    }
+    .await;
+    match result {
+        Ok(summary) => eprintln!("[c31-invalid] PASS {summary}"),
+        Err(e) => panic!("invalid leg failed: {e:?}"),
     }
 }
