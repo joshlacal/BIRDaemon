@@ -454,6 +454,120 @@ fn install_process_log_capture() -> Result<Arc<Mutex<Vec<u8>>>> {
     Ok(CAPTURE.get_or_init(|| buffer).clone())
 }
 
+/// Publishes one real request through the signed fixture CLI (text via stdin,
+/// never a process argument). Returns (draftId, conversationId).
+fn cli_send_request(
+    catmos_bin: &Path,
+    profile: &str,
+    transport: &Path,
+    recipient: &str,
+    text: &str,
+) -> Result<(String, String)> {
+    let draft_id = uuid::Uuid::new_v4().to_string();
+    let mut child = Command::new(catmos_bin)
+        .args(["--profile", profile, "--no-startup-sync", "request", "send", recipient, "--draft-id", &draft_id, "--file", "-"])
+        .env("CATMOS_LOCAL_RUNTIME_TRANSPORT", transport)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    {
+        let mut stdin = child.stdin.take().context("send stdin")?;
+        stdin.write_all(text.as_bytes())?;
+    }
+    let out = child.wait_with_output()?;
+    ensure!(out.status.success(), "catmos request send failed: {}", String::from_utf8_lossy(&out.stderr));
+    let result: Value = serde_json::from_slice(&out.stdout)?;
+    eprintln!("[client-birdaemon] Request sent. Result: {result}");
+    ensure!(result["outcome"]["type"] == "requestSent", "request was not published: {result}");
+    let convo = result["outcome"]["conversationId"].as_str().context("conversationId")?.to_owned();
+    Ok((draft_id, convo))
+}
+
+/// Owns one client_runtime_gateway process. The gateway only runs its child
+/// cleanup (TLS relay, shipping server fixture) on SIGINT, so shutdown and Drop
+/// send SIGINT to this exact PID, wait, and then confirm the recorded child PIDs
+/// are gone. Nothing is ever signalled by process name.
+struct GatewayChild {
+    child: std::process::Child,
+    stdout: std::io::BufReader<std::process::ChildStdout>,
+    finished: bool,
+}
+
+impl GatewayChild {
+    fn spawn(gw_bin: &Path, config: &Value, server_fixture_bin: &Path) -> Result<Self> {
+        let mut child = Command::new(gw_bin)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .env("REQUEST_TEST_DATABASE_URL", "postgresql://127.0.0.1:5432/catbird_direct_requests_test_20260919")
+            .env("REQUEST_SERVER_FIXTURE_BINARY", server_fixture_bin)
+            .spawn()
+            .context("spawn client_runtime_gateway")?;
+        {
+            let mut stdin = child.stdin.take().context("gw stdin")?;
+            stdin.write_all(&serde_json::to_vec(config)?)?;
+        }
+        let stdout = std::io::BufReader::new(child.stdout.take().context("gw stdout")?);
+        Ok(Self { child, stdout, finished: false })
+    }
+
+    fn stdout_line(&mut self) -> Result<String> {
+        let mut line = String::new();
+        self.stdout.read_line(&mut line)?;
+        Ok(line)
+    }
+
+    fn take_stderr(&mut self) -> Result<String> {
+        let mut err = String::new();
+        if let Some(mut stderr) = self.child.stderr.take() {
+            std::io::Read::read_to_string(&mut stderr, &mut err)?;
+        }
+        Ok(err)
+    }
+
+    fn descendants(&self) -> Vec<String> {
+        Command::new("pgrep")
+            .args(["-P", &self.child.id().to_string()])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).split_whitespace().map(str::to_owned).collect())
+            .unwrap_or_default()
+    }
+
+    /// SIGINT, wait up to 30s, then verify every recorded child PID exited.
+    fn shutdown(&mut self) -> Result<()> {
+        if self.finished {
+            return Ok(());
+        }
+        self.finished = true;
+        let children = self.descendants();
+        let _ = Command::new("kill").args(["-INT", &self.child.id().to_string()]).status();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if self.child.try_wait()?.is_some() {
+                break;
+            }
+            ensure!(std::time::Instant::now() < deadline, "gateway did not exit after SIGINT");
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        let alive: Vec<_> = children
+            .into_iter()
+            .filter(|pid| Command::new("kill").args(["-0", pid]).status().is_ok_and(|s| s.success()))
+            .collect();
+        ensure!(alive.is_empty(), "gateway children still running after SIGINT: {alive:?}");
+        Ok(())
+    }
+}
+
+impl Drop for GatewayChild {
+    fn drop(&mut self) {
+        if let Err(e) = self.shutdown() {
+            eprintln!("[client-birdaemon] gateway shutdown problem: {e}");
+        }
+    }
+}
+
 /// Verification of client-birdaemon runtime row (live against client_runtime_gateway).
 pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
     let started_at = Utc::now().to_rfc3339();
@@ -494,33 +608,14 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
     }
 
     eprintln!("[client-birdaemon] Launching client_runtime_gateway...");
-    let mut gw_child = Command::new(&gw_bin)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env("REQUEST_TEST_DATABASE_URL", "postgresql://127.0.0.1:5432/catbird_direct_requests_test_20260919")
-        .env("REQUEST_SERVER_FIXTURE_BINARY", &server_fixture_bin)
-        .spawn()
-        .context("spawn client_runtime_gateway")?;
-
-    {
-        let mut stdin = gw_child.stdin.take().context("gw stdin")?;
-        stdin.write_all(&serde_json::to_vec(&gw_config)?)?;
-        stdin.flush()?;
-        drop(stdin);
-    }
-
-    let mut stdout_reader = std::io::BufReader::new(gw_child.stdout.take().unwrap());
-    let mut ready_line = String::new();
-    stdout_reader.read_line(&mut ready_line)?;
+    let mut gw_child = GatewayChild::spawn(&gw_bin, &gw_config, &server_fixture_bin)?;
+    let ready_line = gw_child.stdout_line()?;
     eprintln!("[client-birdaemon] Gateway stdout: {}", ready_line.trim());
-    if ready_line.trim().is_empty() {
-        let mut err = String::new();
-        if let Some(mut stderr) = gw_child.stderr.take() {
-            let _ = std::io::Read::read_to_string(&mut stderr, &mut err);
-        }
-        anyhow::bail!("Gateway exited before readiness: {err}");
-    }
+    ensure!(
+        !ready_line.trim().is_empty(),
+        "Gateway exited before readiness: {}",
+        gw_child.take_stderr()?
+    );
     let ready_val: Value = serde_json::from_str(&ready_line).context("parse gateway readiness JSON")?;
     let manifest_path = PathBuf::from(ready_val["manifest"].as_str().context("manifest path in readiness")?);
     let sessions_path = gw_dir.join("sessions.json");
@@ -636,44 +731,20 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
     ensure!(delivery_out.status.success(), "alice delivery enable failed: {}", String::from_utf8_lossy(&delivery_out.stderr));
 
     let intro_text = "Hello Bob, this is Alice qualifying client-birdaemon.";
-    let draft_id = uuid::Uuid::new_v4().to_string();
-    eprintln!("[client-birdaemon] Alice sending encrypted direct request to Bob ({}) ...", bob_runtime.context.did);
-    let mut send_cmd = Command::new(&catmos_bin)
-        .args([
-            "--profile",
-            &alice_profile,
-            "--no-startup-sync",
-            "request",
-            "send",
-            bob_runtime.context.did.as_str(),
-            "--draft-id",
-            &draft_id,
-            "--file",
-            "-",
-        ])
-        .env("CATMOS_LOCAL_RUNTIME_TRANSPORT", &alice_manifest_path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    {
-        let mut stdin = send_cmd.stdin.take().context("send stdin")?;
-        stdin.write_all(intro_text.as_bytes())?;
-        drop(stdin);
-    }
-    let send_out = send_cmd.wait_with_output()?;
-    ensure!(send_out.status.success(), "catmos request send failed: {}", String::from_utf8_lossy(&send_out.stderr));
-    let send_res: Value = serde_json::from_slice(&send_out.stdout)?;
-    eprintln!("[client-birdaemon] Request sent. Result: {}", send_res);
-    let convo_id = send_res["outcome"]["conversationId"]
-        .as_str()
-        .or_else(|| send_res["conversationId"].as_str())
-        .context("conversationId in send result")?
-        .to_string();
+    let declined_text = "Hello Bob, this second introduction will be declined.";
+    eprintln!("[client-birdaemon] Alice sending two encrypted direct requests to Bob ({}) ...", bob_runtime.context.did);
+    let (declined_draft, declined_convo) = cli_send_request(
+        &catmos_bin, &alice_profile, &alice_manifest_path, &bob_runtime.context.did, declined_text,
+    )?;
+    let (draft_id, convo_id) = cli_send_request(
+        &catmos_bin, &alice_profile, &alice_manifest_path, &bob_runtime.context.did, intro_text,
+    )?;
 
-    eprintln!("[client-birdaemon] Bob syncing with server and refreshing request preview...");
+    eprintln!("[client-birdaemon] Bob syncing with server and refreshing request previews...");
     bob_runtime.orchestrator.sync_with_server(true).await?;
-    let _ = bob_runtime.orchestrator.refresh_request_preview(&convo_id).await?;
+    for cid in [&convo_id, &declined_convo] {
+        let _ = bob_runtime.orchestrator.refresh_request_preview(cid).await?;
+    }
     bob_runtime.bot.handle_request_views().await;
     let probe = bob_runtime.api_client.effect_probe();
     let typing = || probe.typing_attempts.load(std::sync::atomic::Ordering::SeqCst);
@@ -696,10 +767,19 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
         matches!(&pending.preview, Some(RequestPreview::Ready { text, .. }) if text == intro_text),
         "decrypted preview must equal the published introduction"
     );
+    let declined_pending = bob_runtime.orchestrator.refresh_request_preview(&declined_convo).await?;
+    ensure!(
+        declined_pending.consent == RequestConsent::IncomingPending
+            && matches!(&declined_pending.preview, Some(RequestPreview::Ready { text, .. }) if text == declined_text),
+        "second request must decrypt as an ordinary pending preview before decline"
+    );
     ensure!(bridge.message_count() == 0, "pending: zero bridge/LLM calls");
     ensure!(typing() == 0, "pending: zero typing attempts at the transport boundary");
     ensure!(downloads() == 0, "pending: zero blob downloads at the transport boundary");
-    ensure!(!captured_has(intro_text), "pending: zero plaintext in captured process logs");
+    ensure!(
+        !captured_has(intro_text) && !captured_has(declined_text),
+        "pending: zero plaintext in captured process logs"
+    );
     ensure!(claim_count(&bob_dir)? == 0, "pending: zero effect claims");
     let unkeyed = rusqlite::Connection::open(bob_dir.join("bird.db"))?;
     let bird_messages: i64 = unkeyed.query_row("SELECT count(*) FROM messages", [], |r| r.get(0))?;
@@ -708,11 +788,13 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
         let path = file?.path();
         if path.is_file() {
             let bytes = std::fs::read(&path)?;
-            ensure!(
-                !bytes.windows(intro_text.len()).any(|w| w == intro_text.as_bytes()),
-                "plaintext introduction found on disk in {}",
-                path.display()
-            );
+            for secret in [intro_text, declined_text] {
+                ensure!(
+                    !bytes.windows(secret.len()).any(|w| w == secret.as_bytes()),
+                    "plaintext introduction found on disk in {}",
+                    path.display()
+                );
+            }
         }
     }
     let native_db = std::fs::read_dir(bob_dir.join("mls-state"))?
@@ -726,6 +808,17 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
         "native SQLCipher store must reject unkeyed access"
     );
 
+    // Declined: the operator declines through the real close RPC; the bot must
+    // treat the closed request as inert even once autoaccept is enabled below.
+    eprintln!("[client-birdaemon] Declining the second request via the real close RPC...");
+    let declined = bob_runtime.orchestrator.close_direct_request(&declined_convo).await?;
+    ensure!(declined.consent == RequestConsent::Closed, "close RPC must yield a Closed projection");
+    bob_runtime.bot.handle_request_views().await;
+    ensure!(
+        bridge.message_count() == 0 && typing() == 0 && downloads() == 0 && claim_count(&bob_dir)? == 0,
+        "declined: zero bridge, typing, download or claim effects"
+    );
+
     // Autoaccept: the bot itself must call the real acceptance RPC first.
     eprintln!("[client-birdaemon] Enabling Bob autoaccept; bot handles the verified view...");
     bob_runtime.bot.set_accept_chat_requests(true);
@@ -734,6 +827,10 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
     ensure!(
         accepted.consent == RequestConsent::Accepted && accepted.capabilities.can_send,
         "bot autoaccept must reach a server-acknowledged Accepted projection"
+    );
+    ensure!(
+        bob_runtime.orchestrator.refresh_request_preview(&declined_convo).await?.consent == RequestConsent::Closed,
+        "autoaccept must never reopen or accept the declined request"
     );
     let mut bridge_called = false;
     for _ in 0..20 {
@@ -745,6 +842,10 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
     }
     ensure!(bridge_called, "bridge was not called after autoaccept");
     ensure!(bridge.message_count() == 1, "bridge called exactly once");
+    ensure!(
+        bridge.received_messages.lock().unwrap()[0]["conversation_id"] == convo_id.as_str(),
+        "the only bridge call must belong to the accepted request, never the declined one"
+    );
     ensure!(claim_count(&bob_dir)? == 1, "exactly one durable effect claim");
 
     eprintln!("[client-birdaemon] Alice fetching conversation messages to verify reply...");
@@ -781,12 +882,11 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
     );
     ensure!(typing() == 0 && downloads() == 0, "request path produced typing or downloads");
     ensure!(
-        !captured_has(intro_text),
+        !captured_has(intro_text) && !captured_has(declined_text),
         "introduction plaintext appeared in captured process logs"
     );
 
-    let _ = gw_child.kill();
-    let _ = gw_child.wait();
+    gw_child.shutdown()?;
     let ended_at = Utc::now().to_rfc3339();
 
     // C35 bot parity: exact binaries and shared-source revision this run used.
@@ -823,6 +923,7 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
         "sender": {"client": "catmos-cli (signed fixture pair)", "did": alice_acc["did"], "deviceId": alice_acc["deviceId"]},
         "recipient": {"client": "BIRDaemon", "did": restarted.context.did, "deviceId": restarted.context.reserved_device_id},
         "conversationId": convo_id, "draftId": draft_id,
+        "declinedConversationId": declined_convo, "declinedDraftId": declined_draft,
         "bridgeCalls": bridge.message_count(), "typingAttempts": typing(), "blobDownloads": downloads(),
         "effectClaims": claim_count(&bob_dir)?,
         "startedAt": started_at, "endedAt": ended_at, "outcome": "pass"
@@ -843,7 +944,7 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
     let c31_dir = workspace_root.join("docs/generated-artifacts/encrypted-requests/evidence/c31");
     std::fs::create_dir_all(&c31_dir)?;
     std::fs::write(c31_dir.join("result.json"), serde_json::to_vec_pretty(&json!({
-        "id": "C31", "outcome": "pass", "testCount": 1, "passed": 1, "failed": 0, "skipped": 0,
+        "id": "C31", "outcome": "not_run", "testCount": 0, "passed": 0, "failed": 0, "skipped": 0,
         "startedAt": started_at, "endedAt": ended_at,
         "assertions": [
             "A real encrypted request was published by the signed CLI through the shipping router and decrypted by BIRDaemon's real core into a Ready preview equal to the sent text.",
@@ -851,10 +952,11 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
             "A global tracing subscriber plus the core MLS logger captured all bot-process logs; the introduction plaintext never appeared in them.",
             "No plaintext introduction bytes in any file under the bot data dir (bird.db, credentials, keychain, native store); the native SQLCipher store rejected unkeyed access.",
             "With autoaccept configured, the bot's own request path called the real acceptConversation RPC; the server-acknowledged projection became Accepted/can_send before exactly one bridge call and exactly one durable effect claim; the reply was decrypted by the CLI.",
+            "A second real published request was declined through the real close RPC; with autoaccept then enabled the bot never reopened or accepted it, and it produced zero bridge, typing, download or claim effects (the single bridge call carried the accepted conversation id).",
             "Replaying the same verified request event in-process and again after a process-level runtime restart on the same data dir produced no second bridge call, claim, download or typing attempt."
         ],
         "artifacts": [make_artifact(workspace_root, &captured_file)?, make_artifact(workspace_root, &receipt_file)?, make_artifact(workspace_root, &parity_file)?],
-        "limitations": ["Invalid and declined previews are covered only by the in-process policy test, not by a live published request."]
+        "reason": "not_run until the live invalid-introduction leg exists: every other C31 clause above ran live, but no CLI or bot-side path can publish a re-signed tampered introduction to a BIRDaemon device without a core test hook (awaiting approval); the invalid preview is currently exercised only by the in-process policy test."
     }))?)?;
     eprintln!("[client-birdaemon] Scenario completed successfully and evidence written.");
 
