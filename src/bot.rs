@@ -40,7 +40,7 @@ pub struct BirdBot {
     api_client: Arc<BirdApiClient>,
     orchestrator: Arc<BirdOrchestrator>,
     llm: Arc<BridgeClient>,
-    config: BirdConfig,
+    config: std::sync::RwLock<BirdConfig>,
     effect_slots: Arc<tokio::sync::Semaphore>,
     /// Tracks when we last rejoined each conversation to prevent rejoin storms.
     recent_rejoins: Arc<Mutex<HashMap<String, Instant>>>,
@@ -59,11 +59,31 @@ impl BirdBot {
             api_client,
             orchestrator,
             llm: Arc::new(llm),
-            config,
+            config: std::sync::RwLock::new(config),
             effect_slots: Arc::new(tokio::sync::Semaphore::new(4)),
             recent_rejoins: Arc::new(Mutex::new(HashMap::new())),
         }
     }
+    pub fn request_policy(&self) -> RequestPolicy {
+        self.config.read().unwrap().request_policy()
+    }
+
+    pub fn request_delivery_enabled(&self) -> bool {
+        self.config.read().unwrap().request_delivery_enabled()
+    }
+
+    pub fn max_reply_characters(&self) -> u32 {
+        self.config.read().unwrap().max_reply_characters
+    }
+
+    pub fn set_accept_chat_requests(&self, accept: bool) {
+        self.config.write().unwrap().accept_chat_requests = accept;
+    }
+
+    pub fn set_receive_chat_requests(&self, receive: bool) {
+        self.config.write().unwrap().receive_chat_requests = receive;
+    }
+
 
     /// Run the main event loop.
     ///
@@ -116,7 +136,7 @@ impl BirdBot {
                         } => {
                             // Spawn message handling as a background task so the
                             // event loop stays responsive during LLM calls (up to 300s).
-                            let policy = self.config.request_policy();
+                            let policy = self.request_policy();
                             let did = self.did.clone();
                             let api_client = Arc::clone(&self.api_client);
                             let orchestrator = Arc::clone(&self.orchestrator);
@@ -221,14 +241,14 @@ impl BirdBot {
         Ok(())
     }
 
-    async fn maintain_request_keys(&self) {
+    pub(crate) async fn maintain_request_keys(&self) {
         // Delivery is an explicit configuration choice, separate from consent.
         if let Ok(current) = self
             .orchestrator
             .get_direct_request_delivery_enabled()
             .await
         {
-            match request_key_action(self.config.request_delivery_enabled(), current) {
+            match request_key_action(self.request_delivery_enabled(), current) {
                 RequestKeyAction::Enable => {
                     let _ = self
                         .orchestrator
@@ -254,7 +274,7 @@ impl BirdBot {
 
     /// Distinct request path: only a freshly verified accepted projection can
     /// release an introduction to the bridge. Pending text stays in native SQLCipher.
-    async fn handle_request_views(&self) {
+    pub(crate) async fn handle_request_views(&self) {
         let Ok(views) = self.orchestrator.list_direct_request_views().await else {
             return;
         };
@@ -273,7 +293,7 @@ impl BirdBot {
             {
                 continue;
             }
-            if self.config.request_policy().action(&view) == RequestAction::Accept {
+            if self.request_policy().action(&view) == RequestAction::Accept {
                 if self
                     .orchestrator
                     .accept_conversation(&view.conversation_id)
@@ -291,7 +311,7 @@ impl BirdBot {
                 };
                 view = accepted;
             }
-            if self.config.request_policy().action(&view) != RequestAction::Reply {
+            if self.request_policy().action(&view) != RequestAction::Reply {
                 continue;
             }
             let (Some(message_id), Some(intro), Some(RequestPreview::Ready { text, .. })) = (
@@ -303,7 +323,7 @@ impl BirdBot {
             };
             let _ = message_id;
             if !crate::request_policy::claim_request_effect(
-                self.config.request_policy(),
+                self.request_policy(),
                 &view,
                 self.orchestrator.storage().as_ref(),
             ) {
@@ -314,7 +334,7 @@ impl BirdBot {
                 &self.orchestrator,
                 &self.did,
                 &view.conversation_id,
-                self.config.request_policy(),
+                self.request_policy(),
             )
             .await
             {
@@ -325,8 +345,8 @@ impl BirdBot {
                 view.conversation_id.clone(),
                 intro.sender_did.clone(),
                 text.clone(),
-                self.config.request_policy(),
-                self.config.max_reply_characters,
+                self.request_policy(),
+                self.max_reply_characters(),
             );
             let orchestrator = self.orchestrator.clone();
             let llm = self.llm.clone();
@@ -394,7 +414,7 @@ impl BirdBot {
                 &self.orchestrator,
                 &self.did,
                 &cid,
-                self.config.request_policy(),
+                self.request_policy(),
             )
             .await
             {
@@ -417,7 +437,7 @@ impl BirdBot {
                 let api = self.api_client.clone();
                 let orchestrator = self.orchestrator.clone();
                 let llm = self.llm.clone();
-                let policy = self.config.request_policy();
+                let policy = self.request_policy();
                 let slots = self.effect_slots.clone();
                 tokio::spawn(async move {
                     let Ok(_permit) = slots.acquire_owned().await else {

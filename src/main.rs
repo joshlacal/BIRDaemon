@@ -3,6 +3,8 @@ mod bridge_client;
 mod chat_authority;
 mod config;
 mod credentials;
+#[cfg(debug_assertions)]
+mod debug_fixture;
 mod keychain;
 mod request_policy;
 
@@ -12,6 +14,8 @@ mod xrpc_client;
 
 #[cfg(test)]
 mod canonical_runtime_tests;
+#[cfg(test)]
+mod c31_qualification;
 
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
@@ -43,6 +47,20 @@ async fn main() -> anyhow::Result<()> {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
+    #[cfg(debug_assertions)]
+    if std::env::args().any(|arg| arg == "--fixture")
+        || std::env::var_os("BIRD_RUNTIME_FIXTURE_CONFIG").is_some()
+    {
+        let config_path = debug_fixture::required_config_path()?;
+        return debug_fixture::run(&config_path).await;
+    }
+    #[cfg(not(debug_assertions))]
+    if std::env::args().any(|arg| arg == "--fixture")
+        || std::env::var_os("BIRD_RUNTIME_FIXTURE_CONFIG").is_some()
+    {
+        anyhow::bail!("Fixture mode is forbidden in release artifacts");
+    }
+
 
     tracing::info!("BIRD Daemon starting...");
 
@@ -203,7 +221,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn get_or_create_mls_db_key(
+pub(crate) fn get_or_create_mls_db_key(
     dir: &std::path::Path,
     did_sanitized: &str,
     fallback_app_password: &str,
@@ -237,7 +255,7 @@ fn get_or_create_mls_db_key(
     Ok(hex_key)
 }
 
-type BirdOrchestrator =
+pub(crate) type BirdOrchestrator =
     MLSOrchestrator<SqliteStorage, BirdApiClient, FileCredentialStore, MLSContext>;
 
 /// Restore only a protected opaque Nest session after restart, and admit it
@@ -378,7 +396,7 @@ async fn establish_or_restore_authority(
     Ok(())
 }
 
-async fn prepare_admitted_device_runtime(
+pub(crate) async fn prepare_admitted_device_runtime(
     orchestrator: &Arc<BirdOrchestrator>,
     credentials: &Arc<FileCredentialStore>,
     did: &str,

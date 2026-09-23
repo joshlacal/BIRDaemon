@@ -3323,6 +3323,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let canonical = projection_view(wanted_id, raw_group_id, 4, &[owner]);
         let mut stale_authority =
             AliasRetirementAuthority::from_views(owner, &canonical, &alias).unwrap();
         stale_authority.alias_incarnation = 3;

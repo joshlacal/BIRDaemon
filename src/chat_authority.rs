@@ -562,6 +562,23 @@ impl NestClient {
             base_url,
         })
     }
+    #[cfg(debug_assertions)]
+    pub(crate) fn new_with_client(
+        base_url: &str,
+        http: reqwest::Client,
+    ) -> Result<Self, AuthorityError> {
+        let base_url = Url::parse(base_url).map_err(|_| AuthorityError::InvalidUrl)?;
+        if !matches!(base_url.scheme(), "http" | "https")
+            || base_url.host_str().is_none()
+            || !base_url.username().is_empty()
+            || base_url.password().is_some()
+            || base_url.query().is_some()
+            || base_url.fragment().is_some()
+        {
+            return Err(AuthorityError::InvalidUrl);
+        }
+        Ok(Self { http, base_url })
+    }
 
     fn endpoint(&self, path: &str) -> Result<Url, AuthorityError> {
         if !path.starts_with('/')

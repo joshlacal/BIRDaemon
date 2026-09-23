@@ -146,6 +146,11 @@ impl BirdApiClient {
         self.authority = Some(authority);
         self
     }
+    #[cfg(debug_assertions)]
+    pub fn with_http_client(mut self, http: reqwest::Client) -> Self {
+        self.http = http;
+        self
+    }
 
     pub fn set_signer(&self, signer: Arc<dyn CleanChatRequestSigner>) {
         let mut s = self.signer.lock().unwrap();
