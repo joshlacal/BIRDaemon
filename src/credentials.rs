@@ -22,6 +22,8 @@ use crate::chat_authority::derive_key_id;
 pub struct FileCredentialStore {
     path: PathBuf,
     data: Mutex<HashMap<String, String>>,
+    #[cfg(debug_assertions)]
+    http_client: Mutex<Option<reqwest::Client>>,
 }
 
 /// The exact device identity admitted by Nest and exposed to the shared
@@ -82,11 +84,17 @@ impl FileCredentialStore {
         let store = Self {
             path,
             data: Mutex::new(data),
+            #[cfg(debug_assertions)]
+            http_client: Mutex::new(None),
         };
         if migrated_insecure_session || migrated_metadata {
             store.flush()?;
         }
         Ok(store)
+    }
+    #[cfg(debug_assertions)]
+    pub fn set_http_client(&self, client: reqwest::Client) {
+        *self.http_client.lock().unwrap() = Some(client);
     }
 
     fn key(user_did: &str, field: &str) -> String {
@@ -437,6 +445,18 @@ fn keychain_delete(_account: &str) -> Result<()> {
 impl CredentialStore for FileCredentialStore {
     async fn direct_request_receipt_authority_document(&self) -> Result<Option<Vec<u8>>> {
         // Fixed independently authenticated authority, never a receipt-provided URL.
+        #[cfg(debug_assertions)]
+        let http = if let Some(client) = self.http_client.lock().unwrap().clone() {
+            client
+        } else {
+            reqwest::Client::builder()
+                .https_only(true)
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .map_err(|_| OrchestratorError::Credential("receipt resolver unavailable".into()))?
+        };
+        #[cfg(not(debug_assertions))]
         let http = reqwest::Client::builder()
             .https_only(true)
             .redirect(reqwest::redirect::Policy::none())

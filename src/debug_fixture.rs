@@ -334,6 +334,7 @@ pub(crate) async fn assemble_runtime(context: DebugFixtureContext) -> Result<Deb
         crate::credentials::FileCredentialStore::new(creds_path)
             .map_err(|e| anyhow::anyhow!("Failed to open MLS credentials: {e}"))?,
     );
+    credentials.set_http_client(context.http.clone());
     let invalidation_credentials = credentials.clone();
     let invalidation_did = context.did.clone();
     let authority_state = std::sync::Arc::new(crate::chat_authority::AuthorityState::with_invalidation_hook(std::sync::Arc::new(

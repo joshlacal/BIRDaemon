@@ -946,7 +946,11 @@ fn validate_prepared_request_scope(
         let value: serde_json::Value = serde_json::from_slice(body).map_err(|_| {
             OrchestratorError::Serialization("prepared XRPC body is not valid JSON".into())
         })?;
-        let signed_body = value.pointer("/signedRequest/body").unwrap_or(&value);
+        let signed_body = value
+            .pointer("/directRequest/body")
+            .or_else(|| value.pointer("/directRequest/signedRequest/body"))
+            .or_else(|| value.pointer("/signedRequest/body"))
+            .unwrap_or(&value);
         let actor_did = signed_body
             .get("actorDid")
             .and_then(serde_json::Value::as_str);

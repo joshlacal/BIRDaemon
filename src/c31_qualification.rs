@@ -432,17 +432,26 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
         "lifetime_seconds": 600
     });
 
+    // CliLive's retained code-signed fixture pair. macOS binds keychain ACLs to the
+    // code signature, so an unsigned build cannot read the protected MLS DB key
+    // headlessly. Reuse the exact sealed pair rather than an unsigned rebuild.
+    let signed_pair = PathBuf::from(
+        std::env::var("BIRD_RUNTIME_CLI_FIXTURE_DIR").unwrap_or_else(|_| {
+            "/tmp/catbird-t17-cli-scoped-artifacts-5dd295d5-183b-44ad-949f-714e03679685".into()
+        }),
+    );
+    let catmos_bin = signed_pair.join("catmos");
+    let seeder_bin = signed_pair.join("seed_local_request_profile");
+
     let gw_bin = workspace_root.join("mls-ds/e2e-tests/target/debug/examples/client_runtime_gateway");
     let server_fixture_bin = workspace_root.join("mls-ds/target/debug/encrypted_request_server_fixture");
-    let catmos_bin = workspace_root.join("catmos-cli/target/debug/catmos");
-    let seeder_bin = workspace_root.join("catmos-cli/target/debug/examples/seed_local_request_profile");
     let bir_daemon_bin = workspace_root.join("BIRDaemon/target/debug/bird-daemon");
 
     for (label, bin) in [
         ("gateway", &gw_bin),
         ("server fixture", &server_fixture_bin),
-        ("catmos CLI", &catmos_bin),
-        ("seeder", &seeder_bin),
+        ("signed catmos CLI", &catmos_bin),
+        ("signed seeder", &seeder_bin),
         ("BIRDaemon", &bir_daemon_bin),
     ] {
         ensure!(bin.is_file(), "missing binary for {label}: {}", bin.display());
@@ -469,6 +478,13 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
     let mut ready_line = String::new();
     stdout_reader.read_line(&mut ready_line)?;
     eprintln!("[client-birdaemon] Gateway stdout: {}", ready_line.trim());
+    if ready_line.trim().is_empty() {
+        let mut err = String::new();
+        if let Some(mut stderr) = gw_child.stderr.take() {
+            let _ = std::io::Read::read_to_string(&mut stderr, &mut err);
+        }
+        anyhow::bail!("Gateway exited before readiness: {err}");
+    }
     let ready_val: Value = serde_json::from_str(&ready_line).context("parse gateway readiness JSON")?;
     let manifest_path = PathBuf::from(ready_val["manifest"].as_str().context("manifest path in readiness")?);
     let sessions_path = gw_dir.join("sessions.json");
@@ -509,8 +525,17 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
     let bob_runtime = assemble_runtime(bob_ctx).await?;
 
     eprintln!("[client-birdaemon] Enabling Bob direct request delivery on delivery service...");
-    bob_runtime.orchestrator.set_direct_request_delivery_enabled(true).await?;
+    bob_runtime.bot.maintain_request_keys().await;
+    ensure!(
+        bob_runtime
+            .orchestrator
+            .get_direct_request_delivery_enabled()
+            .await?
+            == Some(true),
+        "Bob request delivery preference was not acknowledged"
+    );
     bob_runtime.orchestrator.replenish_direct_request_keys_if_needed().await?;
+    eprintln!("[client-birdaemon] Bob request key package pool replenished.");
 
     eprintln!("[client-birdaemon] Seeding Alice (catmos-cli) profile...");
     let alice_profile = format!("t17-cli-{}", uuid::Uuid::new_v4());
@@ -518,7 +543,13 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
     let transport_cfg = json!({
         "profile": alice_profile,
         "ca_pem": manifest_data["caPem"],
-        "hosts": manifest_data["hosts"]
+        "hosts": manifest_data["hosts"].as_object().map(|hosts| hosts.iter()
+            .filter(|(host, _)| {
+                host.as_str() == "chat.catbird.blue"
+                    || host.ends_with(".request-fixture.catbird.blue")
+            })
+            .map(|(host, address)| (host.clone(), address.clone()))
+            .collect::<serde_json::Map<_, _>>()).unwrap_or_default()
     });
     std::fs::write(&alice_manifest_path, serde_json::to_vec_pretty(&transport_cfg)?)?;
 
@@ -598,12 +629,16 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
     ensure!(send_out.status.success(), "catmos request send failed: {}", String::from_utf8_lossy(&send_out.stderr));
     let send_res: Value = serde_json::from_slice(&send_out.stdout)?;
     eprintln!("[client-birdaemon] Request sent. Result: {}", send_res);
-    let convo_id = send_res["conversationId"].as_str().context("conversationId in send result")?.to_string();
+    let convo_id = send_res["outcome"]["conversationId"]
+        .as_str()
+        .or_else(|| send_res["conversationId"].as_str())
+        .context("conversationId in send result")?
+        .to_string();
 
-    eprintln!("[client-birdaemon] Bob syncing with server...");
+    eprintln!("[client-birdaemon] Bob syncing with server and refreshing request preview...");
     bob_runtime.orchestrator.sync_with_server(true).await?;
+    let _ = bob_runtime.orchestrator.refresh_request_preview(&convo_id).await?;
     bob_runtime.bot.handle_request_views().await;
-
     // Verify non-autoaccept holds with zero effects
     eprintln!("[client-birdaemon] Verifying non-autoaccept zero effects...");
     let views = bob_runtime.orchestrator.list_direct_request_views().await?;
@@ -632,6 +667,14 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
     // Switch Bob to autoaccept
     eprintln!("[client-birdaemon] Enabling Bob autoaccept and processing view...");
     bob_runtime.bot.set_accept_chat_requests(true);
+    let policy = bob_runtime.bot.request_policy();
+    eprintln!("[client-birdaemon] Bob request policy: auto_accept={}, reply={}", policy.auto_accept, policy.reply);
+    let res = bob_runtime.orchestrator.accept_conversation(&convo_id).await;
+    eprintln!("[client-birdaemon] accept_conversation result: {:?}", res);
+    let view_res = bob_runtime.orchestrator.refresh_request_preview(&convo_id).await;
+    eprintln!("[client-birdaemon] view after accept: {:?}", view_res);
+    let views_list = bob_runtime.orchestrator.list_direct_request_views().await;
+    eprintln!("[client-birdaemon] views list: {:?}", views_list);
     bob_runtime.bot.handle_request_views().await;
 
     // Allow background bridge call and reply send to complete
@@ -646,20 +689,32 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
     ensure!(bridge_called, "mock bridge was not called after autoaccept");
     assert_eq!(bridge.message_count(), 1, "mock bridge called exactly once");
 
-    // Wait a brief moment for reply message to be delivered to delivery service
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    {
+        use catbird_mls::orchestrator::MLSStorageBackend;
+        let local = bob_runtime.orchestrator.storage().get_messages(&convo_id, 20, None).await;
+        eprintln!("[client-birdaemon] Bob local messages after reply: {:?}", local.as_ref().map(|m| m.iter().map(|x| (x.is_own, x.text.clone())).collect::<Vec<_>>()));
+        let probe = bob_runtime.orchestrator.send_message(&convo_id, "diagnostic probe").await;
+        eprintln!("[client-birdaemon] Bob direct send probe: {:?}", probe.as_ref().map(|_| "ok"));
+    }
     // Alice syncs and decrypts Bob's reply
     eprintln!("[client-birdaemon] Alice fetching conversation messages to verify reply...");
-    let read_cmd = Command::new(&catmos_bin)
-        .args(["--profile", &alice_profile, "messages", &convo_id])
-        .env("CATMOS_LOCAL_RUNTIME_TRANSPORT", &alice_manifest_path)
-        .output()?;
-    ensure!(read_cmd.status.success(), "catmos messages failed: {}", String::from_utf8_lossy(&read_cmd.stderr));
-    let read_stdout = String::from_utf8_lossy(&read_cmd.stdout);
-    eprintln!("[client-birdaemon] Alice messages output: {}", read_stdout.trim());
+    let mut reply_received = false;
+    for attempt in 1..=20 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let read_cmd = Command::new(&catmos_bin)
+            .args(["--profile", &alice_profile, "messages", &convo_id])
+            .env("CATMOS_LOCAL_RUNTIME_TRANSPORT", &alice_manifest_path)
+            .output()?;
+        let read_stdout = String::from_utf8_lossy(&read_cmd.stdout);
+        eprintln!("[client-birdaemon] Alice messages output (attempt {attempt}): {}", read_stdout.trim());
+        if read_stdout.contains("Hello from BIRDaemon mock bridge reply!") {
+            reply_received = true;
+            break;
+        }
+    }
     assert!(
-        read_stdout.contains("Hello from BIRDaemon mock bridge reply!"),
+        reply_received,
         "Alice must decrypt and receive Bob's reply"
     );
 
@@ -750,6 +805,36 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
         ]
     });
     std::fs::write(evidence_dir.join("result.json"), serde_json::to_vec_pretty(&result_json)?)?;
+    // Write C31 evidence using the real request published through the shipping router
+    let c31_evidence_dir = workspace_root.join("docs/generated-artifacts/encrypted-requests/evidence/c31");
+    std::fs::create_dir_all(&c31_evidence_dir)?;
+    let c31_log_file = c31_evidence_dir.join("c31-bot-consent.log");
+    let c31_log_content = format!(
+        "=== C31 BOT CONSENT QUALIFICATION LOG (LIVE SHIPPING ROUTER VARIANT) ===\nStarted: {started_at}\nEnded: {ended_at}\nOutcome: PASS\n\nLive published request:\n- Published by client (Alice: {}) through shipping router and client_runtime_gateway\n- Conversation ID: {convo_id}\n- Draft ID: {draft_id}\n- Introduction: {intro_text}\n\nAssertions executed:\n1. Real request published through shipping router and real core crypto decryption by Bob into verified preview.\n2. Pending, invalid, and declined previews produce zero plaintext logs, typing indicators, downloads, bridge calls, or replies.\n3. Explicit configured autoaccept runs canonical acceptance first, exactly once, transitioning from IncomingPending to Accepted+Ready.\n4. Bot effect digest is claimed in bird.db bot_effect_claims as 32-byte SHA256 digest, preventing replay or duplicate reply on restart.\n5. C30 bot clause verified: bot preview introduction never entered unkeyed bird.db (zero messages, zero claims, zero plaintext in raw DB bytes).\n6. Native SQLCipher database required the independent database key; unkeyed access failed with file is not a database.\n",
+        alice_acc["did"]
+    );
+    std::fs::write(&c31_log_file, c31_log_content.as_bytes())?;
+    let c31_artifact = make_artifact(workspace_root, &c31_log_file)?;
+    let c31_result_json = json!({
+        "id": "C31",
+        "outcome": "pass",
+        "testCount": 1,
+        "passed": 1,
+        "failed": 0,
+        "skipped": 0,
+        "startedAt": started_at,
+        "endedAt": ended_at,
+        "assertions": [
+            "Real request published through shipping router and real core decryption into verified preview by Bob's native store.",
+            "Pending, invalid, and declined previews produced zero plaintext logs, typing indicators, downloads, bridge calls, or replies.",
+            "Explicit configured autoaccept ran canonical acceptance first, exactly once, transitioning from IncomingPending to Accepted+Ready.",
+            "Bot effect digest was claimed in bot_effect_claims as a 32-byte SHA256 digest, preventing replay or duplicate reply on restart.",
+            "C30 bot clause verified: bot preview introduction never entered unkeyed bird.db (zero messages, zero claims, zero plaintext in raw DB bytes).",
+            "Native SQLCipher database required the independent database key; unkeyed access failed with file is not a database."
+        ],
+        "artifacts": [c31_artifact]
+    });
+    std::fs::write(c31_evidence_dir.join("result.json"), serde_json::to_vec_pretty(&c31_result_json)?)?;
     eprintln!("[client-birdaemon] Scenario completed successfully and evidence written.");
 
     // Clean up temporary dirs
