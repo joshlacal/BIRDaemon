@@ -80,11 +80,6 @@ impl BirdBot {
         self.config.write().unwrap().accept_chat_requests = accept;
     }
 
-    pub fn set_receive_chat_requests(&self, receive: bool) {
-        self.config.write().unwrap().receive_chat_requests = receive;
-    }
-
-
     /// Run the main event loop.
     ///
     /// Subscribes to WebSocket events, decrypts incoming messages via the MLS
@@ -243,32 +238,21 @@ impl BirdBot {
 
     pub(crate) async fn maintain_request_keys(&self) {
         // Delivery is an explicit configuration choice, separate from consent.
-        if let Ok(current) = self
-            .orchestrator
-            .get_direct_request_delivery_enabled()
-            .await
-        {
-            match request_key_action(self.request_delivery_enabled(), current) {
-                RequestKeyAction::Enable => {
-                    let _ = self
-                        .orchestrator
-                        .set_direct_request_delivery_enabled(true)
-                        .await;
-                }
-                RequestKeyAction::Disable => {
-                    let _ = self
-                        .orchestrator
-                        .set_direct_request_delivery_enabled(false)
-                        .await;
-                }
-                RequestKeyAction::Replenish => {
-                    let _ = self
-                        .orchestrator
-                        .replenish_direct_request_keys_if_needed()
-                        .await;
-                }
-                RequestKeyAction::None => {}
+        let current = match self.orchestrator.get_direct_request_delivery_enabled().await {
+            Ok(current) => current,
+            Err(error) => {
+                tracing::warn!(%error, "Request delivery preference read failed");
+                return;
             }
+        };
+        let result = match request_key_action(self.request_delivery_enabled(), current) {
+            RequestKeyAction::Enable => self.orchestrator.set_direct_request_delivery_enabled(true).await,
+            RequestKeyAction::Disable => self.orchestrator.set_direct_request_delivery_enabled(false).await,
+            RequestKeyAction::Replenish => self.orchestrator.replenish_direct_request_keys_if_needed().await,
+            RequestKeyAction::None => Ok(()),
+        };
+        if let Err(error) = result {
+            tracing::warn!(%error, "Request key maintenance failed");
         }
     }
 

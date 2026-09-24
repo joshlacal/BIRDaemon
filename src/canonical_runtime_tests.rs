@@ -221,6 +221,19 @@ fn projection_conversations_json(convo_id: &str) -> String {
     response.to_string()
 }
 
+/// The signing wire carries AAD identifier bytes as bare base64, while the
+/// generated read DTOs (catbird-atproto byte-alias fields) require the
+/// DAG-JSON `{"$bytes"}` presentation the delivery service returns.
+fn present_aad_identifier_bytes(body: &mut serde_json::Value) {
+    for pointer in ["/aad/conversationId", "/aad/messageId", "/aad/prior/conversationId"] {
+        if let Some(value) = body.pointer_mut(pointer) {
+            if let Some(raw) = value.as_str().map(str::to_owned) {
+                *value = json!({ "$bytes": raw });
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn test_canonical_read_through_nest_with_bearer_and_device_header() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -367,6 +380,7 @@ async fn test_canonical_send_message_with_task5_signed_request_through_nest() {
             // while generated `Bytes` output is an array.
             let mut response_body = signed_req["body"].clone();
             response_body["applicationMessage"]["sha256"] = json!(vec![0u8; 32]);
+            present_aad_identifier_bytes(&mut response_body);
             let send_out = json!({
                 "entry": {
                     "$type": "blue.catbird.chat.defs#applicationEntry",
@@ -1579,6 +1593,7 @@ async fn test_simulated_bot_receive_decrypt_reply_flow() {
 
         let mut response_body = signed_req["body"].clone();
         response_body["applicationMessage"]["sha256"] = json!(vec![0u8; 32]);
+        present_aad_identifier_bytes(&mut response_body);
         let reply_out = json!({
             "entry": {
                 "$type": "blue.catbird.chat.defs#applicationEntry",

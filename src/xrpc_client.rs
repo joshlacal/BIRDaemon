@@ -763,7 +763,8 @@ impl BirdApiClient {
     ) -> Result<(Vec<IncomingEnvelope>, Option<String>)> {
         const MAX_ENTRY_PAGES: usize = 32;
         validate_stable_conversation_id(convo_id)?;
-        let mut after_seq = parse_entry_cursor(cursor)?;
+        let initial_after_seq = parse_entry_cursor(cursor)?;
+        let mut after_seq = initial_after_seq;
         if !matches!(message_type, None | Some("app") | Some("commit")) {
             return Err(OrchestratorError::InvalidInput(
                 "getEntries message type must be app, commit, or absent".into(),
@@ -843,8 +844,15 @@ impl BirdApiClient {
                 }
             }
             after_seq = next_after_seq;
-            if !output.has_more || envelopes.len() >= limit as usize {
+            if output.has_more && envelopes.len() >= limit as usize {
                 return Ok((envelopes, Some(after_seq.to_string())));
+            }
+            if !output.has_more {
+                // The core treats `Some(cursor)` as "follow this page" and
+                // `None` as caught up. A terminal page that did not advance
+                // must end the walk rather than echo the caller's cursor.
+                let next = (after_seq > initial_after_seq).then(|| after_seq.to_string());
+                return Ok((envelopes, next));
             }
         }
         Err(OrchestratorError::Api(format!(
@@ -2176,13 +2184,14 @@ mod tests {
             "seq": 1,
             "signedRequest": {
                 "body": {
+                    "$type": "blue.catbird.chat.defs#applicationSendBody",
                     "aad": {
-                        "conversationId": "AA==",
+                        "conversationId": {"$bytes": "AA=="},
                         "generation": 7,
-                        "messageId": "AA==",
+                        "messageId": {"$bytes": "AA=="},
                         "prior": {
                             "confirmationTag": {"$bytes": "AA=="},
-                            "conversationId": "11111111-1111-4111-8111-111111111111",
+                            "conversationId": {"$bytes": "ERERERERQRGBEREREREREQ=="},
                             "epoch": 42,
                             "generation": 7,
                             "groupContextHash": {"$bytes": "AA=="},
@@ -2198,7 +2207,7 @@ mod tests {
                         "bytes": {"$bytes": "AQID"},
                         "contentType": "application/octet-stream",
                         "framing": "mls",
-                        "sha256": "AA=="
+                        "sha256": {"$bytes": "AA=="}
                     },
                     "authGeneration": 7,
                     "blobBindings": [],

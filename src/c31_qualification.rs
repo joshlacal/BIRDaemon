@@ -107,7 +107,7 @@ pub(crate) fn make_view(
 pub(crate) struct MockBridge {
     pub(crate) port: u16,
     pub(crate) received_messages: Arc<Mutex<Vec<Value>>>,
-    shutdown: tokio::sync::oneshot::Sender<()>,
+    _shutdown: tokio::sync::oneshot::Sender<()>,
 }
 
 impl MockBridge {
@@ -155,7 +155,7 @@ impl MockBridge {
         Ok(Self {
             port,
             received_messages: received,
-            shutdown: shutdown_tx,
+            _shutdown: shutdown_tx,
         })
     }
 
@@ -173,7 +173,6 @@ async fn test_c31_zero_effects_and_canonical_acceptance() {
 }
 
 pub(crate) async fn run_c31_test() -> Result<()> {
-    let started_at = Utc::now().to_rfc3339();
     let tmp = std::env::temp_dir().join(format!("c31-contract-test-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&tmp)?;
 
@@ -379,40 +378,8 @@ pub(crate) async fn run_c31_test() -> Result<()> {
         "declined introduction text must never appear in captured logs"
     );
 
-    let ended_at = Utc::now().to_rfc3339();
-
-    // Write evidence for C31
-    let workspace_root = Path::new("/Users/joshlacalamito/Developer/.workspaces/catbird-encrypted-requests-20260919");
-    let evidence_dir = workspace_root.join("docs/generated-artifacts/encrypted-requests/evidence/c31");
-    std::fs::create_dir_all(&evidence_dir)?;
-    let log_file = evidence_dir.join("c31-bot-consent.log");
-    let mut log_content = format!(
-        "=== C31 BOT CONSENT QUALIFICATION LOG ===\nStarted: {started_at}\nEnded: {ended_at}\nOutcome: PASS\n\nAssertions executed:\n1. Pending, invalid, and declined previews produce zero plaintext logs, typing, downloads, bridge calls, or replies.\n2. Explicit configured autoaccept runs canonical acceptance first, exactly once.\n3. Bot effect digest is claimed in bird.db bot_effect_claims as 32-byte SHA256 digest, preventing duplicate replay.\n4. C30 bot clause: bot preview never enters unkeyed bird.db (0 messages, 0 claims, 0 plaintext matches in raw file bytes).\n5. Native SQLCipher database requires independent key; unkeyed access rejected with SQLITE_NOTADB.\n"
-    );
-    log_content.push_str("\nCaptured diagnostic log events:\n");
-    log_content.push_str(&String::from_utf8_lossy(&captured_bytes));
-    std::fs::write(&log_file, log_content.as_bytes())?;
-
-    let artifact = make_artifact(workspace_root, &log_file)?;
-    let result_json = json!({
-        "id": "C31",
-        "outcome": "pass",
-        "testCount": 1,
-        "passed": 1,
-        "failed": 0,
-        "skipped": 0,
-        "startedAt": started_at,
-        "endedAt": ended_at,
-        "assertions": [
-            "Pending, invalid, and declined previews produced zero plaintext logs, typing indicators, downloads, bridge calls, or replies.",
-            "Explicit configured autoaccept ran canonical acceptance first, exactly once, transitioning from IncomingPending to Accepted+Ready.",
-            "Bot effect digest was claimed in bot_effect_claims as a 32-byte SHA256 digest, preventing replay or duplicate reply on restart.",
-            "C30 bot clause verified: bot preview introduction never entered unkeyed bird.db (zero messages, zero claims, zero plaintext in raw DB bytes).",
-            "Native SQLCipher database required the independent database key; unkeyed access failed with file is not a database."
-        ],
-        "artifacts": [artifact]
-    });
-    std::fs::write(evidence_dir.join("result.json"), serde_json::to_vec_pretty(&result_json)?)?;
+    // Evidence for C31 is written only by the live scenario; this in-process
+    // test must not overwrite qualification artifacts.
 
     // Clean up
     let _ = std::fs::remove_dir_all(&tmp);
@@ -484,6 +451,51 @@ fn cli_send_request(
     Ok((draft_id, convo))
 }
 
+struct DedicatedDbGuard {
+    name: String,
+    url: String,
+}
+
+impl DedicatedDbGuard {
+    fn create() -> Result<Self> {
+        let name = format!(
+            "catbird_direct_requests_fault_{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..16]
+        );
+        let url = format!("postgresql://127.0.0.1:5432/{name}");
+        let status = Command::new("psql")
+            .args([
+                "postgresql://127.0.0.1:5432/postgres",
+                "-X",
+                "-q",
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-c",
+            ])
+            .arg(format!("CREATE DATABASE {name}"))
+            .status()
+            .context("create dedicated DB")?;
+        ensure!(status.success(), "failed to create dedicated database {name}");
+        Ok(Self { name, url })
+    }
+}
+
+impl Drop for DedicatedDbGuard {
+    fn drop(&mut self) {
+        let _ = Command::new("psql")
+            .args(["postgresql://127.0.0.1:5432/postgres", "-X", "-q", "-c"])
+            .arg(format!(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='{}' AND pid<>pg_backend_pid()",
+                self.name
+            ))
+            .status();
+        let _ = Command::new("psql")
+            .args(["postgresql://127.0.0.1:5432/postgres", "-X", "-q", "-c"])
+            .arg(format!("DROP DATABASE IF EXISTS {}", self.name))
+            .status();
+    }
+}
+
 /// Owns one client_runtime_gateway process. The gateway only runs its child
 /// cleanup (TLS relay, shipping server fixture) on SIGINT, so shutdown and Drop
 /// send SIGINT to this exact PID, wait, and then confirm the recorded child PIDs
@@ -495,12 +507,12 @@ struct GatewayChild {
 }
 
 impl GatewayChild {
-    fn spawn(gw_bin: &Path, config: &Value, server_fixture_bin: &Path) -> Result<Self> {
+    fn spawn(gw_bin: &Path, config: &Value, server_fixture_bin: &Path, db_url: &str) -> Result<Self> {
         let mut child = Command::new(gw_bin)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .env("REQUEST_TEST_DATABASE_URL", "postgresql://127.0.0.1:5432/catbird_direct_requests_test_20260919")
+            .env("REQUEST_TEST_DATABASE_URL", db_url)
             .env("REQUEST_SERVER_FIXTURE_BINARY", server_fixture_bin)
             .spawn()
             .context("spawn client_runtime_gateway")?;
@@ -568,25 +580,203 @@ impl Drop for GatewayChild {
     }
 }
 
+/// Declined leg: runs on its own gateway instance and dedicated DB.
+/// A real request is published by Alice (catmos-cli), decrypted by Bob into
+/// an IncomingPending preview, then explicitly declined by Bob via close_direct_request.
+/// Verifies consent becomes Closed, and with autoaccept enabled the bot produces
+/// zero bridge calls, zero typing attempts, zero downloads, and zero effect claims.
+async fn run_declined_leg(
+    gw_bin: &Path,
+    server_fixture_bin: &Path,
+    catmos_bin: &Path,
+    seeder_bin: &Path,
+    log_capture: &Arc<Mutex<Vec<u8>>>,
+) -> Result<Value> {
+    eprintln!("[c31-declined] Starting dedicated gateway instance for declined leg...");
+    let dedicated_db = DedicatedDbGuard::create()?;
+    let gw_dir = std::env::temp_dir().join(format!("gw-c31-declined-{}", uuid::Uuid::new_v4()));
+    let mut gateway = GatewayChild::spawn(
+        gw_bin,
+        &json!({"output_dir": gw_dir, "cors_origin": "http://127.0.0.1:5173", "lifetime_seconds": 600}),
+        server_fixture_bin,
+        &dedicated_db.url,
+    )?;
+    let ready = gateway.stdout_line()?;
+    ensure!(!ready.trim().is_empty(), "declined-leg gateway exited: {}", gateway.take_stderr()?);
+    let manifest_path = PathBuf::from(
+        serde_json::from_str::<Value>(&ready)?["manifest"].as_str().context("manifest")?,
+    );
+    let sessions_path = gw_dir.join("sessions.json");
+    let manifest: Value = serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
+    let sessions: Value = serde_json::from_slice(&std::fs::read(&sessions_path)?)?;
+    let pick = |doc: &Value, label: &str| -> Result<Value> {
+        doc["accounts"].as_array().context("accounts")?.iter().find(|a| a["label"] == label).cloned().context("account")
+    };
+    let alice = pick(&manifest, "alice")?;
+    let alice_session = pick(&sessions, "alice")?["session"].as_str().context("session")?.to_owned();
+
+    let bridge = MockBridge::start().await?;
+    let bob_dir = std::env::temp_dir().join(format!("bob-declined-{}", uuid::Uuid::new_v4()));
+    let run_path = std::env::temp_dir().join(format!("bob-declined-run-{}.json", uuid::Uuid::new_v4()));
+    std::fs::write(&run_path, serde_json::to_vec(&DebugFixtureRunConfig {
+        manifest_path: manifest_path.clone(),
+        sessions_path,
+        account_label: "bob".into(),
+        data_dir: bob_dir.clone(),
+        bridge_url: format!("http://127.0.0.1:{}", bridge.port),
+        receive_chat_requests: true,
+        accept_chat_requests: true, // autoaccept enabled, but closed request must not be accepted!
+        reply_to_all_messages: true,
+        max_reply_characters: 1000,
+    })?)?;
+    let bob = assemble_runtime(DebugFixtureContext::load(&run_path)?).await?;
+    bob.bot.maintain_request_keys().await;
+    bob.orchestrator.replenish_direct_request_keys_if_needed().await?;
+
+    let alice_profile = format!("t17-cli-{}", uuid::Uuid::new_v4());
+    let alice_manifest_path = std::env::temp_dir().join(format!("{alice_profile}.transport.json"));
+    let transport_cfg = json!({
+        "profile": alice_profile,
+        "ca_pem": manifest["caPem"],
+        "hosts": manifest["hosts"].as_object().map(|hosts| hosts.iter()
+            .filter(|(host, _)| {
+                host.as_str() == "chat.catbird.blue"
+                    || host.ends_with(".request-fixture.catbird.blue")
+            })
+            .map(|(host, address)| (host.clone(), address.clone()))
+            .collect::<serde_json::Map<_, _>>()).unwrap_or_default()
+    });
+    std::fs::write(&alice_manifest_path, serde_json::to_vec_pretty(&transport_cfg)?)?;
+    let alice_seed = json!({
+        "profile": alice_profile,
+        "did": alice["did"],
+        "deviceId": alice["deviceId"],
+        "proxyUrl": manifest["origin"],
+        "serviceUrl": manifest["origin"],
+        "sessionCookie": alice_session
+    });
+    let mut seeder_cmd = Command::new(seeder_bin)
+        .env("CATMOS_LOCAL_RUNTIME_TRANSPORT", &alice_manifest_path)
+        .env_remove("CATMOS_TEST_KEYCHAIN_FALLBACK")
+        .env_remove("CATMOS_TEST_SHARED_KEYCHAIN_FALLBACK")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    {
+        let mut stdin = seeder_cmd.stdin.take().context("seeder stdin")?;
+        stdin.write_all(&serde_json::to_vec(&alice_seed)?)?;
+    }
+    let seeder_out = seeder_cmd.wait_with_output()?;
+    ensure!(seeder_out.status.success(), "seeder failed: {}", String::from_utf8_lossy(&seeder_out.stderr));
+    let seed_res: Value = serde_json::from_slice(&seeder_out.stdout)?;
+    let alice_public_key = seed_res["signaturePublicKey"].as_str().context("alice public key")?;
+    let preseed = bob.context.http
+        .post(format!("{}/fixture/enroll", manifest["origin"].as_str().unwrap()))
+        .bearer_auth(&alice_session)
+        .json(&json!({"device_id": alice["deviceId"], "signature_public_key": alice_public_key}))
+        .send().await?;
+    ensure!(preseed.status().is_success(), "preseed failed: {}", preseed.status());
+
+    let delivery_out = Command::new(catmos_bin)
+        .args(["--profile", &alice_profile, "--no-startup-sync", "request", "delivery", "--enable"])
+        .env("CATMOS_LOCAL_RUNTIME_TRANSPORT", &alice_manifest_path)
+        .output()?;
+    ensure!(delivery_out.status.success(), "delivery enable failed");
+
+    let declined_text = "C31 real published introduction that will be declined.";
+    let (draft_id, convo_id) = cli_send_request(catmos_bin, &alice_profile, &alice_manifest_path, &bob.context.did, declined_text)?;
+    eprintln!("[c31-declined] Request published: {convo_id}");
+
+    bob.orchestrator.sync_with_server(true).await?;
+    let pending = bob.orchestrator.refresh_request_preview(&convo_id).await?;
+    ensure!(pending.consent == RequestConsent::IncomingPending, "must be pending before decline");
+
+    // Decline via real close RPC
+    let closed = bob.orchestrator.close_direct_request(&convo_id).await?;
+    ensure!(closed.consent == RequestConsent::Closed, "close RPC must yield Closed");
+    bob.bot.handle_request_views().await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    ensure!(bridge.message_count() == 0, "declined: zero bridge calls");
+    let probe = bob.api_client.effect_probe();
+    ensure!(probe.typing_attempts.load(std::sync::atomic::Ordering::SeqCst) == 0, "declined: zero typing");
+    ensure!(probe.blob_downloads.load(std::sync::atomic::Ordering::SeqCst) == 0, "declined: zero downloads");
+    let bird = rusqlite::Connection::open(bob_dir.join("bird.db"))?;
+    let claims: i64 = bird.query_row("SELECT count(*) FROM bot_effect_claims", [], |r| r.get(0))?;
+    ensure!(claims == 0, "declined: zero effect claims (found {claims})");
+    // Closing a request appends the core's own `conversation.closed` system
+    // marker; nothing else — above all the preview — may reach unkeyed bird.db.
+    let rows: Vec<(i64, String, String)> = bird
+        .prepare("SELECT is_own, text, coalesce(payload_json, '') FROM messages")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<std::result::Result<_, _>>()?;
+    let non_marker = rows
+        .iter()
+        .filter(|(own, text, payload)| {
+            let marker = serde_json::from_str::<Value>(payload).ok().is_some_and(|p| {
+                p["messageType"] == "system" && p["text"] == "conversation.closed"
+            });
+            !(*own == 1 && marker && !text.contains(declined_text))
+        })
+        .count();
+    ensure!(
+        non_marker == 0,
+        "declined: unkeyed bird.db holds {non_marker} row(s) besides the own close marker"
+    );
+    let close_markers = rows.len();
+    for file in std::fs::read_dir(&bob_dir)?.chain(std::fs::read_dir(bob_dir.join("mls-state"))?) {
+        let path = file?.path();
+        if path.is_file() {
+            let bytes = std::fs::read(&path)?;
+            ensure!(
+                !bytes.windows(declined_text.len()).any(|w| w == declined_text.as_bytes()),
+                "declined: plaintext introduction found on disk in {}",
+                path.display()
+            );
+        }
+    }
+    ensure!(
+        !log_capture.lock().unwrap().windows(declined_text.len()).any(|w| w == declined_text.as_bytes()),
+        "declined text must not appear in logs"
+    );
+
+    drop(bob);
+    gateway.shutdown()?;
+    let _ = std::fs::remove_dir_all(&gw_dir);
+    let _ = std::fs::remove_dir_all(&bob_dir);
+    let _ = std::fs::remove_file(&run_path);
+    let _ = std::fs::remove_file(&alice_manifest_path);
+
+    Ok(json!({
+        "conversationId": convo_id,
+        "draftId": draft_id,
+        "finalConsent": "Closed",
+        "bridgeCalls": 0, "typingAttempts": 0, "blobDownloads": 0, "effectClaims": 0,
+        "birdDbRows": {"ownCloseMarkers": close_markers, "other": 0}, "plaintextOnDisk": false, "plaintextInLogs": false,
+        "botPolicy": {"autoAccept": true, "reply": true}
+    }))
+}
+
 /// Invalid leg: runs on its own gateway instance, because each synthetic
 /// account reserves exactly one device and the CLI owns the main run's Alice.
 /// A malicious-but-authentic sender publishes a re-signed, tampered
 /// introduction through the real router. The recipient is a real BIRDaemon
 /// runtime configured for the strongest case: autoaccept and reply enabled.
 async fn run_invalid_introduction_leg(
-    workspace_root: &Path,
     gw_bin: &Path,
     server_fixture_bin: &Path,
     log_capture: &Arc<Mutex<Vec<u8>>>,
 ) -> Result<Value> {
-    use catbird_mls::orchestrator::MlsCryptoContext;
     use mls_e2e_tests::gateway_tampered_request::GatewaySender;
     eprintln!("[c31-invalid] Starting a second, independent gateway instance...");
     let gw_dir = std::env::temp_dir().join(format!("gw-c31-invalid-{}", uuid::Uuid::new_v4()));
+    let dedicated_db = DedicatedDbGuard::create()?;
     let mut gateway = GatewayChild::spawn(
         gw_bin,
         &json!({"output_dir": gw_dir, "cors_origin": "http://127.0.0.1:5173", "lifetime_seconds": 600}),
         server_fixture_bin,
+        &dedicated_db.url,
     )?;
     let ready = gateway.stdout_line()?;
     ensure!(!ready.trim().is_empty(), "invalid-leg gateway exited: {}", gateway.take_stderr()?);
@@ -662,18 +852,18 @@ async fn run_invalid_introduction_leg(
     bob.bot.handle_request_views().await;
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    let view = bob.orchestrator.refresh_request_preview(&cid).await;
-    let (consent, preview) = match &view {
-        Ok(v) => (format!("{:?}", v.consent), format!("{:?}", v.preview)),
-        Err(e) => ("unavailable".to_owned(), format!("refresh error: {e}")),
-    };
-    if let Ok(v) = &view {
-        ensure!(
-            !matches!(v.preview, Some(RequestPreview::Ready { .. })),
-            "tampered introduction must never become a Ready preview"
-        );
-        ensure!(v.consent != RequestConsent::Accepted, "bot must never accept an invalid introduction");
-    }
+    let view = bob.orchestrator.refresh_request_preview(&cid).await?;
+    ensure!(
+        matches!(&view.preview, Some(RequestPreview::Unavailable { code }) if code == "InvalidIntroduction"),
+        "tampered introduction must project Unavailable(InvalidIntroduction), got {:?}",
+        view.preview
+    );
+    ensure!(
+        view.consent == RequestConsent::IncomingPending,
+        "bot must leave an invalid introduction pending, got {:?}",
+        view.consent
+    );
+    let (consent, preview) = (format!("{:?}", view.consent), format!("{:?}", view.preview));
     let probe = bob.api_client.effect_probe();
     let claims: i64 = rusqlite::Connection::open(bob_dir.join("bird.db"))?
         .query_row("SELECT count(*) FROM bot_effect_claims", [], |r| r.get(0))?;
@@ -694,13 +884,13 @@ async fn run_invalid_introduction_leg(
     let _ = std::fs::remove_dir_all(&gw_dir);
     let _ = std::fs::remove_dir_all(&bob_dir);
     let _ = std::fs::remove_file(&run_path);
-    let _ = workspace_root;
     Ok(json!({
         "conversationId": cid,
         "requestId": published.request_id,
         "finalConsent": consent,
         "finalPreview": preview,
-        "bridgeCalls": 0, "typingAttempts": 0, "blobDownloads": 0, "effectClaims": 0, "birdDbMessages": 0,
+        "bridgeCalls": 0, "typingAttempts": 0, "blobDownloads": 0, "effectClaims": 0,
+        "birdDbMessages": 0,
         "botPolicy": {"autoAccept": true, "reply": true}
     }))
 }
@@ -744,8 +934,9 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
         ensure!(bin.is_file(), "missing binary for {label}: {}", bin.display());
     }
 
-    eprintln!("[client-birdaemon] Launching client_runtime_gateway...");
-    let mut gw_child = GatewayChild::spawn(&gw_bin, &gw_config, &server_fixture_bin)?;
+    eprintln!("[client-birdaemon] Creating dedicated DB and launching client_runtime_gateway...");
+    let dedicated_db = DedicatedDbGuard::create()?;
+    let mut gw_child = GatewayChild::spawn(&gw_bin, &gw_config, &server_fixture_bin, &dedicated_db.url)?;
     let ready_line = gw_child.stdout_line()?;
     eprintln!("[client-birdaemon] Gateway stdout: {}", ready_line.trim());
     ensure!(
@@ -764,7 +955,6 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
     let sessions = sessions_data["accounts"].as_array().context("sessions accounts array")?;
 
     let alice_acc = accounts.iter().find(|a| a["label"] == "alice").context("alice manifest account")?;
-    let bob_acc = accounts.iter().find(|a| a["label"] == "bob").context("bob manifest account")?;
     let alice_sess = sessions.iter().find(|s| s["label"] == "alice").context("alice session")?;
 
     let gateway_origin = manifest_data["origin"].as_str().context("gateway origin")?;
@@ -794,14 +984,13 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
 
     eprintln!("[client-birdaemon] Enabling Bob direct request delivery on delivery service...");
     bob_runtime.bot.maintain_request_keys().await;
-    ensure!(
-        bob_runtime
-            .orchestrator
-            .get_direct_request_delivery_enabled()
-            .await?
-            == Some(true),
-        "Bob request delivery preference was not acknowledged"
-    );
+    let bob_delivery = bob_runtime.orchestrator.get_direct_request_delivery_enabled().await?;
+    if bob_delivery != Some(true) {
+        let captured = String::from_utf8_lossy(&log_capture.lock().unwrap()).into_owned();
+        let warnings: Vec<&str> = captured.lines().filter(|l| l.contains("Request ")).collect();
+        eprintln!("[client-birdaemon] Bob delivery={bob_delivery:?}; bot warnings: {warnings:#?}");
+    }
+    ensure!(bob_delivery == Some(true), "Bob request delivery preference was not acknowledged");
     bob_runtime.orchestrator.replenish_direct_request_keys_if_needed().await?;
     eprintln!("[client-birdaemon] Bob request key package pool replenished.");
 
@@ -868,20 +1057,14 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
     ensure!(delivery_out.status.success(), "alice delivery enable failed: {}", String::from_utf8_lossy(&delivery_out.stderr));
 
     let intro_text = "Hello Bob, this is Alice qualifying client-birdaemon.";
-    let declined_text = "Hello Bob, this second introduction will be declined.";
-    eprintln!("[client-birdaemon] Alice sending two encrypted direct requests to Bob ({}) ...", bob_runtime.context.did);
-    let (declined_draft, declined_convo) = cli_send_request(
-        &catmos_bin, &alice_profile, &alice_manifest_path, &bob_runtime.context.did, declined_text,
-    )?;
+    eprintln!("[client-birdaemon] Alice sending encrypted direct request to Bob ({}) ...", bob_runtime.context.did);
     let (draft_id, convo_id) = cli_send_request(
         &catmos_bin, &alice_profile, &alice_manifest_path, &bob_runtime.context.did, intro_text,
     )?;
 
-    eprintln!("[client-birdaemon] Bob syncing with server and refreshing request previews...");
+    eprintln!("[client-birdaemon] Bob syncing with server and refreshing request preview...");
     bob_runtime.orchestrator.sync_with_server(true).await?;
-    for cid in [&convo_id, &declined_convo] {
-        let _ = bob_runtime.orchestrator.refresh_request_preview(cid).await?;
-    }
+    let _ = bob_runtime.orchestrator.refresh_request_preview(&convo_id).await?;
     bob_runtime.bot.handle_request_views().await;
     let probe = bob_runtime.api_client.effect_probe();
     let typing = || probe.typing_attempts.load(std::sync::atomic::Ordering::SeqCst);
@@ -904,17 +1087,12 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
         matches!(&pending.preview, Some(RequestPreview::Ready { text, .. }) if text == intro_text),
         "decrypted preview must equal the published introduction"
     );
-    let declined_pending = bob_runtime.orchestrator.refresh_request_preview(&declined_convo).await?;
-    ensure!(
-        declined_pending.consent == RequestConsent::IncomingPending
-            && matches!(&declined_pending.preview, Some(RequestPreview::Ready { text, .. }) if text == declined_text),
-        "second request must decrypt as an ordinary pending preview before decline"
-    );
+
     ensure!(bridge.message_count() == 0, "pending: zero bridge/LLM calls");
     ensure!(typing() == 0, "pending: zero typing attempts at the transport boundary");
     ensure!(downloads() == 0, "pending: zero blob downloads at the transport boundary");
     ensure!(
-        !captured_has(intro_text) && !captured_has(declined_text),
+        !captured_has(intro_text),
         "pending: zero plaintext in captured process logs"
     );
     ensure!(claim_count(&bob_dir)? == 0, "pending: zero effect claims");
@@ -925,13 +1103,11 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
         let path = file?.path();
         if path.is_file() {
             let bytes = std::fs::read(&path)?;
-            for secret in [intro_text, declined_text] {
-                ensure!(
-                    !bytes.windows(secret.len()).any(|w| w == secret.as_bytes()),
-                    "plaintext introduction found on disk in {}",
-                    path.display()
-                );
-            }
+            ensure!(
+                !bytes.windows(intro_text.len()).any(|w| w == intro_text.as_bytes()),
+                "plaintext introduction found on disk in {}",
+                path.display()
+            );
         }
     }
     let native_db = std::fs::read_dir(bob_dir.join("mls-state"))?
@@ -945,16 +1121,6 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
         "native SQLCipher store must reject unkeyed access"
     );
 
-    // Declined: the operator declines through the real close RPC; the bot must
-    // treat the closed request as inert even once autoaccept is enabled below.
-    eprintln!("[client-birdaemon] Declining the second request via the real close RPC...");
-    let declined = bob_runtime.orchestrator.close_direct_request(&declined_convo).await?;
-    ensure!(declined.consent == RequestConsent::Closed, "close RPC must yield a Closed projection");
-    bob_runtime.bot.handle_request_views().await;
-    ensure!(
-        bridge.message_count() == 0 && typing() == 0 && downloads() == 0 && claim_count(&bob_dir)? == 0,
-        "declined: zero bridge, typing, download or claim effects"
-    );
 
     // Autoaccept: the bot itself must call the real acceptance RPC first.
     eprintln!("[client-birdaemon] Enabling Bob autoaccept; bot handles the verified view...");
@@ -965,10 +1131,7 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
         accepted.consent == RequestConsent::Accepted && accepted.capabilities.can_send,
         "bot autoaccept must reach a server-acknowledged Accepted projection"
     );
-    ensure!(
-        bob_runtime.orchestrator.refresh_request_preview(&declined_convo).await?.consent == RequestConsent::Closed,
-        "autoaccept must never reopen or accept the declined request"
-    );
+
     let mut bridge_called = false;
     for _ in 0..20 {
         if bridge.message_count() >= 1 {
@@ -979,25 +1142,30 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
     }
     ensure!(bridge_called, "bridge was not called after autoaccept");
     ensure!(bridge.message_count() == 1, "bridge called exactly once");
-    ensure!(
-        bridge.received_messages.lock().unwrap()[0]["conversation_id"] == convo_id.as_str(),
-        "the only bridge call must belong to the accepted request, never the declined one"
-    );
+
     ensure!(claim_count(&bob_dir)? == 1, "exactly one durable effect claim");
 
     eprintln!("[client-birdaemon] Alice fetching conversation messages to verify reply...");
     let reply_text = "Hello from BIRDaemon mock bridge reply!";
     let mut reply_received = false;
+    let mut last_stdout = String::new();
+    let mut last_stderr = String::new();
     for _ in 0..20 {
         tokio::time::sleep(Duration::from_millis(500)).await;
         let read_cmd = Command::new(&catmos_bin)
             .args(["--profile", &alice_profile, "messages", &convo_id])
             .env("CATMOS_LOCAL_RUNTIME_TRANSPORT", &alice_manifest_path)
             .output()?;
-        if String::from_utf8_lossy(&read_cmd.stdout).contains(reply_text) {
+        last_stdout = String::from_utf8_lossy(&read_cmd.stdout).to_string();
+        last_stderr = String::from_utf8_lossy(&read_cmd.stderr).to_string();
+        if last_stdout.contains(reply_text) {
             reply_received = true;
             break;
         }
+    }
+    if !reply_received {
+        eprintln!("[client-birdaemon] Alice CLI stdout: {last_stdout}");
+        eprintln!("[client-birdaemon] Alice CLI stderr: {last_stderr}");
     }
     ensure!(reply_received, "Alice must decrypt Bob's reply");
 
@@ -1019,12 +1187,13 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
     );
     ensure!(typing() == 0 && downloads() == 0, "request path produced typing or downloads");
     ensure!(
-        !captured_has(intro_text) && !captured_has(declined_text),
+        !captured_has(intro_text),
         "introduction plaintext appeared in captured process logs"
     );
 
     gw_child.shutdown()?;
-    let invalid = run_invalid_introduction_leg(workspace_root, &gw_bin, &server_fixture_bin, &log_capture).await?;
+    let declined = run_declined_leg(&gw_bin, &server_fixture_bin, &catmos_bin, &seeder_bin, &log_capture).await?;
+    let invalid = run_invalid_introduction_leg(&gw_bin, &server_fixture_bin, &log_capture).await?;
     let ended_at = Utc::now().to_rfc3339();
 
     // C35 bot parity: exact binaries and shared-source revision this run used.
@@ -1061,7 +1230,8 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
         "sender": {"client": "catmos-cli (signed fixture pair)", "did": alice_acc["did"], "deviceId": alice_acc["deviceId"]},
         "recipient": {"client": "BIRDaemon", "did": restarted.context.did, "deviceId": restarted.context.reserved_device_id},
         "conversationId": convo_id, "draftId": draft_id,
-        "declinedConversationId": declined_convo, "declinedDraftId": declined_draft,
+        "declinedLeg": declined,
+        "invalidLeg": invalid,
         "bridgeCalls": bridge.message_count(), "typingAttempts": typing(), "blobDownloads": downloads(),
         "effectClaims": claim_count(&bob_dir)?,
         "startedAt": started_at, "endedAt": ended_at, "outcome": "pass"
@@ -1090,11 +1260,12 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
             "A global tracing subscriber plus the core MLS logger captured all bot-process logs; the introduction plaintext never appeared in them.",
             "No plaintext introduction bytes in any file under the bot data dir (bird.db, credentials, keychain, native store); the native SQLCipher store rejected unkeyed access.",
             "With autoaccept configured, the bot's own request path called the real acceptConversation RPC; the server-acknowledged projection became Accepted/can_send before exactly one bridge call and exactly one durable effect claim; the reply was decrypted by the CLI.",
-            "A second real published request was declined through the real close RPC; with autoaccept then enabled the bot never reopened or accepted it, and it produced zero bridge, typing, download or claim effects (the single bridge call carried the accepted conversation id).",
+            "Declined leg: a real published request on an independent dedicated DB was declined via the real close RPC; with autoaccept enabled the bot never reopened or accepted it, and produced zero bridge, typing, download or claim effects.",
             "Replaying the same verified request event in-process and again after a process-level runtime restart on the same data dir produced no second bridge call, claim, download or typing attempt.",
             "Invalid leg: a malicious-but-authentic sender published a re-signed request with a tampered introduction through the real router to a separate BIRDaemon device configured to autoaccept and reply. Bob's real core rejected the introduction (preview never Ready), the bot never accepted it, and bridge, typing, download and claim effects were all zero.",
         ],
         "artifacts": [make_artifact(workspace_root, &captured_file)?, make_artifact(workspace_root, &receipt_file)?, make_artifact(workspace_root, &parity_file)?],
+        "declinedLeg": declined,
         "invalidLeg": invalid,
     }))?)?;
     eprintln!("[client-birdaemon] Scenario completed successfully and evidence written.");
@@ -1121,7 +1292,6 @@ async fn test_c31_invalid_introduction_leg_live() {
     let result = async {
         let capture = install_process_log_capture()?;
         run_invalid_introduction_leg(
-            root,
             &root.join("mls-ds/e2e-tests/target/debug/examples/client_runtime_gateway"),
             &root.join("mls-ds/target/debug/encrypted_request_server_fixture"),
             &capture,
@@ -1132,5 +1302,30 @@ async fn test_c31_invalid_introduction_leg_live() {
     match result {
         Ok(summary) => eprintln!("[c31-invalid] PASS {summary}"),
         Err(e) => panic!("invalid leg failed: {e:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the local client runtime gateway fixture and signed CLI pair"]
+async fn test_c31_declined_leg_live() {
+    let root = Path::new("/Users/joshlacalamito/Developer/.workspaces/catbird-encrypted-requests-20260919");
+    let signed_pair = PathBuf::from(std::env::var("BIRD_RUNTIME_CLI_FIXTURE_DIR").unwrap_or_else(|_| {
+        "/tmp/catbird-t17-cli-scoped-artifacts-5dd295d5-183b-44ad-949f-714e03679685".into()
+    }));
+    let result = async {
+        let capture = install_process_log_capture()?;
+        run_declined_leg(
+            &root.join("mls-ds/e2e-tests/target/debug/examples/client_runtime_gateway"),
+            &root.join("mls-ds/target/debug/encrypted_request_server_fixture"),
+            &signed_pair.join("catmos"),
+            &signed_pair.join("seed_local_request_profile"),
+            &capture,
+        )
+        .await
+    }
+    .await;
+    match result {
+        Ok(summary) => eprintln!("[c31-declined] PASS {summary}"),
+        Err(e) => panic!("declined leg failed: {e:?}"),
     }
 }
