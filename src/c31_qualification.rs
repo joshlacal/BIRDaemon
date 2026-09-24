@@ -1169,6 +1169,45 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
     }
     ensure!(reply_received, "Alice must decrypt Bob's reply");
 
+    // F37: the peer decrypting the reply does not prove the bot's local send
+    // state. The core stores the own row only after the server-accepted request
+    // matched and the own-echo proof was persisted; the core's own-echo intake
+    // then accepts the server echo only against that durable proof.
+    use catbird_mls::orchestrator::MLSStorageBackend;
+    const ECHO_REFUSAL: &str = "OwnPrivateMessage without durable echo proof";
+    let own_reply_rows = |messages: &[catbird_mls::orchestrator::Message]| {
+        messages.iter().filter(|m| m.is_own && m.text == reply_text).count()
+    };
+    // Debug lines the core emits only when an own echo is accepted as proven.
+    let proven_echo_hits = || {
+        let captured = String::from_utf8_lossy(&log_capture.lock().unwrap()).into_owned();
+        captured.matches("Skipping durably proven own private message").count()
+            + captured.matches("Skipping already-ratcheted SecretReuse message").count()
+    };
+    ensure!(!captured_has("Request reply send failed"), "bot reply send returned an error locally");
+    let local = bob_runtime.orchestrator.storage().get_messages(&convo_id, 50, None).await?;
+    ensure!(
+        own_reply_rows(&local) == 1,
+        "reply must be stored as sent exactly once after a locally successful send (found {})",
+        own_reply_rows(&local)
+    );
+    let reply_delivery_status = local
+        .iter()
+        .find(|m| m.is_own && m.text == reply_text)
+        .map(|m| format!("{:?}", m.delivery_status))
+        .unwrap_or_default();
+    let hits_before = proven_echo_hits();
+    bob_runtime.orchestrator.fetch_messages(&convo_id, None, 50, None, None, None).await?;
+    let in_process_echo_hits = proven_echo_hits() - hits_before;
+    ensure!(in_process_echo_hits >= 1, "core did not accept the reply echo as a proven own message");
+    ensure!(!captured_has(ECHO_REFUSAL), "core refused the reply echo: no durable own-echo proof");
+    ensure!(
+        !bob_runtime.orchestrator.storage().needs_rejoin(&convo_id).await?,
+        "own reply echo forced a rejoin"
+    );
+    let after_echo = bob_runtime.orchestrator.storage().get_messages(&convo_id, 50, None).await?;
+    ensure!(own_reply_rows(&after_echo) == 1, "own echo must not duplicate or drop the sent reply");
+
     // Replay the same verified request event in-process, then after a restart.
     bob_runtime.bot.handle_request_views().await;
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -1180,6 +1219,28 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
     tokio::time::sleep(Duration::from_secs(2)).await;
     ensure!(bridge.message_count() == 1, "restart replay caused a second bridge call");
     ensure!(claim_count(&bob_dir)? == 1, "restart replay created a second effect claim");
+    let restarted_rows = restarted.orchestrator.storage().get_messages(&convo_id, 50, None).await?;
+    ensure!(
+        own_reply_rows(&restarted_rows) == 1,
+        "after restart the reply must be present as sent exactly once (found {})",
+        own_reply_rows(&restarted_rows)
+    );
+    let hits_before = proven_echo_hits();
+    restarted.orchestrator.fetch_messages(&convo_id, None, 50, None, None, None).await?;
+    let restart_echo_hits = proven_echo_hits() - hits_before;
+    ensure!(
+        restart_echo_hits >= 1,
+        "after restart (no in-memory pending state) the core did not accept the reply echo against the durable proof"
+    );
+    ensure!(!captured_has(ECHO_REFUSAL), "restarted core refused the reply echo");
+    ensure!(
+        !restarted.orchestrator.storage().needs_rejoin(&convo_id).await?,
+        "restarted reply echo forced a rejoin"
+    );
+    ensure!(
+        own_reply_rows(&restarted.orchestrator.storage().get_messages(&convo_id, 50, None).await?) == 1,
+        "restarted echo intake duplicated or dropped the reply"
+    );
     ensure!(
         restarted.api_client.effect_probe().blob_downloads.load(std::sync::atomic::Ordering::SeqCst) == 0
             && restarted.api_client.effect_probe().typing_attempts.load(std::sync::atomic::Ordering::SeqCst) == 0,
@@ -1192,8 +1253,9 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
     );
 
     gw_child.shutdown()?;
-    let declined = run_declined_leg(&gw_bin, &server_fixture_bin, &catmos_bin, &seeder_bin, &log_capture).await?;
-    let invalid = run_invalid_introduction_leg(&gw_bin, &server_fixture_bin, &log_capture).await?;
+    // Box the legs: their deep core futures otherwise overflow the test thread stack.
+    let declined = Box::pin(run_declined_leg(&gw_bin, &server_fixture_bin, &catmos_bin, &seeder_bin, &log_capture)).await?;
+    let invalid = Box::pin(run_invalid_introduction_leg(&gw_bin, &server_fixture_bin, &log_capture)).await?;
     let ended_at = Utc::now().to_rfc3339();
 
     // C35 bot parity: exact binaries and shared-source revision this run used.
@@ -1234,11 +1296,20 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
         "invalidLeg": invalid,
         "bridgeCalls": bridge.message_count(), "typingAttempts": typing(), "blobDownloads": downloads(),
         "effectClaims": claim_count(&bob_dir)?,
+        "replyLocalSend": {
+            "sendResult": "ok",
+            "ownRowsAfterSend": 1,
+            "deliveryStatus": reply_delivery_status,
+            "ownEchoAcceptedInProcess": in_process_echo_hits,
+            "ownEchoAcceptedAfterRestartByDurableProof": restart_echo_hits,
+            "ownRowsAfterRestart": 1,
+            "needsRejoin": false
+        },
         "startedAt": started_at, "endedAt": ended_at, "outcome": "pass"
     }))?)?;
     let terminal_file = evidence_dir.join("client-birdaemon-terminal-transcript.txt");
     std::fs::write(&terminal_file, format!(
-        "Headless runtime: no UI surface exists for the bot or CLI; this terminal transcript stands in for a screenshot.\nconversation {convo_id}: request published by CLI, pending preview decrypted by BIRDaemon with zero effects, bot autoaccepted via acceptConversation, one bridge call, reply decrypted by CLI, in-process and restart replays suppressed.\n"
+        "Headless runtime: no UI surface exists for the bot or CLI; this terminal transcript stands in for a screenshot.\nconversation {convo_id}: request published by CLI, pending preview decrypted by BIRDaemon with zero effects, bot autoaccepted via acceptConversation, one bridge call, reply sent Ok locally (one own row), own echo accepted in-process and after restart against the durable own-echo proof, reply decrypted by CLI, in-process and restart replays suppressed.\n"
     ))?;
     std::fs::write(evidence_dir.join("result.json"), serde_json::to_vec_pretty(&json!({
         "id": "client-birdaemon", "outcome": "pass", "testCount": 1, "passed": 1, "failed": 0, "skipped": 0,
@@ -1260,6 +1331,7 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
             "A global tracing subscriber plus the core MLS logger captured all bot-process logs; the introduction plaintext never appeared in them.",
             "No plaintext introduction bytes in any file under the bot data dir (bird.db, credentials, keychain, native store); the native SQLCipher store rejected unkeyed access.",
             "With autoaccept configured, the bot's own request path called the real acceptConversation RPC; the server-acknowledged projection became Accepted/can_send before exactly one bridge call and exactly one durable effect claim; the reply was decrypted by the CLI.",
+            "F37 local send state: the bot's reply send returned Ok (no send-failure log; exactly one own reply row, which the core writes only after the server-accepted request matched and the own-echo proof was persisted). The core's own-echo intake accepted the server echo in-process and, after a runtime restart with no in-memory pending state, via the durable own-echo proof alone, without refusal or rejoin. After restart the reply is present exactly once.",
             "Declined leg: a real published request on an independent dedicated DB was declined via the real close RPC; with autoaccept enabled the bot never reopened or accepted it, and produced zero bridge, typing, download or claim effects.",
             "Replaying the same verified request event in-process and again after a process-level runtime restart on the same data dir produced no second bridge call, claim, download or typing attempt.",
             "Invalid leg: a malicious-but-authentic sender published a re-signed request with a tampered introduction through the real router to a separate BIRDaemon device configured to autoaccept and reply. Bob's real core rejected the introduction (preview never Ready), the bot never accepted it, and bridge, typing, download and claim effects were all zero.",
@@ -1280,7 +1352,7 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires the local client runtime gateway fixture"]
 async fn test_client_birdaemon_live_scenario() {
-    if let Err(e) = run_client_birdaemon_live_scenario().await {
+    if let Err(e) = Box::pin(run_client_birdaemon_live_scenario()).await {
         panic!("test_client_birdaemon_live_scenario failed: {e:?}");
     }
 }

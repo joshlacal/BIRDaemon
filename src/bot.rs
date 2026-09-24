@@ -347,7 +347,9 @@ impl BirdBot {
                         && ordinary_effects_allowed(&orchestrator, &did, &cid, policy).await
                     {
                         let response: String = response.chars().take(max_chars as usize).collect();
-                        let _ = orchestrator.send_message(&cid, &response).await;
+                        if let Err(error) = orchestrator.send_message(&cid, &response).await {
+                            tracing::warn!(%error, "Request reply send failed");
+                        }
                     }
                 }
             });
