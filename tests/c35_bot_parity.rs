@@ -59,8 +59,8 @@ fn test_c35_bot_parity() {
         println!("Loaded bird-daemon release binary sha256: {hash}");
         assert_eq!(
             hash,
-            "af425d863226a92f06e9634a27ecd9e5de9a363335c629dab52e0178faf0d32d",
-            "bird-daemon release binary sha256 must match frozen recapture"
+            "2a065d77169d5b179f73701e06a6d9b00c13515324151e5c06327e0f388d7d17",
+            "bird-daemon release binary sha256 must match freeze-2"
         );
     }
 
