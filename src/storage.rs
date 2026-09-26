@@ -802,7 +802,8 @@ impl MLSStorageBackend for SqliteStorage {
                 None,
             ),
             _ => {
-                return Ok(ConversationProjectionCommitOutcome::FenceMismatch { affected_rows: 0 })
+                eprintln!("[FenceMismatch] invalid mode/view: mode={:?} has_canonical={} has_aliases={}", request.mode, request.canonical.is_some(), !request.aliases.is_empty());
+                return Ok(ConversationProjectionCommitOutcome::FenceMismatch { affected_rows: 0 });
             }
         };
 
@@ -814,6 +815,15 @@ impl MLSStorageBackend for SqliteStorage {
                 .reset_pending_target_group_id
                 .is_some()
         {
+            eprintln!(
+                "[FenceMismatch] strict_uuid/nonempty_group/valid_lifecycle failed: canonical_id={} canonical_group={} strict_uuid={} nonempty_group={} valid_lifecycle={} has_reset_target={}",
+                canonical_id,
+                canonical_group,
+                Self::strict_canonical_uuid(&canonical_id),
+                Self::nonempty_group_hex(&canonical_group),
+                Self::valid_lifecycle(&request.canonical_lifecycle),
+                request.canonical_lifecycle.reset_pending_target_group_id.is_some()
+            );
             return Ok(ConversationProjectionCommitOutcome::FenceMismatch { affected_rows: 0 });
         }
         if live_view.is_some_and(|view| {
@@ -821,6 +831,7 @@ impl MLSStorageBackend for SqliteStorage {
         }) || (request.mode == ConversationProjectionCommitMode::Replay
             && request.aliases.is_empty())
         {
+            eprintln!("[FenceMismatch] live_view mismatch or replay with no aliases: canonical_id={}", canonical_id);
             return Ok(ConversationProjectionCommitOutcome::FenceMismatch { affected_rows: 0 });
         }
 
@@ -916,18 +927,42 @@ impl MLSStorageBackend for SqliteStorage {
         let canonical_row =
             Self::stored_projection_fence(&tx, &request.owner_user_did, &canonical_id)
                 .map_err(Self::map_err)?;
-        if canonical_row.as_ref().is_some_and(|row| {
-            row.user_did != request.owner_user_did
-                || row.group_id != canonical_group
-                || match request.mode {
-                    ConversationProjectionCommitMode::Live => row.epoch > canonical_incarnation,
-                    ConversationProjectionCommitMode::Replay => row.epoch != canonical_incarnation,
+        if let Some(row) = &canonical_row {
+            let user_did_mismatch = row.user_did != request.owner_user_did;
+            let group_mismatch = row.group_id != canonical_group;
+            let epoch_mismatch = match request.mode {
+                ConversationProjectionCommitMode::Live => row.epoch > canonical_incarnation,
+                ConversationProjectionCommitMode::Replay => row.epoch != canonical_incarnation,
+            };
+            let pending = row.reset_pending;
+            let reset_authorized = pending
+                && request.canonical_lifecycle.reset_generation == row.lifecycle.reset_generation
+                && request.canonical_lifecycle.reset_generation.is_some()
+                && request.canonical_lifecycle.reset_pending_target_group_id == row.lifecycle.reset_pending_target_group_id
+                && row.lifecycle.reset_pending_target_group_id.as_deref() == Some(canonical_group.as_str());
+
+            let lifecycle_mismatch = match request.mode {
+                ConversationProjectionCommitMode::Live => {
+                    let old_gen = row.lifecycle.generation.unwrap_or(0);
+                    let old_sv = row.lifecycle.state_version.unwrap_or(0);
+                    let new_gen = request.canonical_lifecycle.generation.unwrap_or(0);
+                    let new_sv = request.canonical_lifecycle.state_version.unwrap_or(0);
+                    (old_gen, old_sv) > (new_gen, new_sv)
                 }
-                || row.reset_pending
-                || !Self::lifecycle_matches(&row.lifecycle, &request.canonical_lifecycle)
-        }) || (canonical_row.is_none()
-            && request.mode == ConversationProjectionCommitMode::Replay)
-        {
+                ConversationProjectionCommitMode::Replay => {
+                    !Self::lifecycle_matches(&row.lifecycle, &request.canonical_lifecycle)
+                }
+            };
+
+            if user_did_mismatch
+                || group_mismatch
+                || epoch_mismatch
+                || (pending && !reset_authorized)
+                || lifecycle_mismatch
+            {
+                return Ok(ConversationProjectionCommitOutcome::FenceMismatch { affected_rows: 0 });
+            }
+        } else if request.mode == ConversationProjectionCommitMode::Replay {
             return Ok(ConversationProjectionCommitOutcome::FenceMismatch { affected_rows: 0 });
         }
 
@@ -988,7 +1023,10 @@ impl MLSStorageBackend for SqliteStorage {
                          metadata_json = ?3,
                          created_at = COALESCE(?4, created_at),
                          updated_at = COALESCE(?5, updated_at),
-                         sequencer_did = ?6
+                         sequencer_did = ?6,
+                         lifecycle_generation = ?10,
+                         lifecycle_state_version = ?11,
+                         reset_generation_high_water = COALESCE(?12, reset_generation_high_water)
                      WHERE conversation_id = ?7 AND user_did = ?8 AND group_id = ?9",
                     rusqlite::params![
                         view.epoch,
@@ -1000,6 +1038,9 @@ impl MLSStorageBackend for SqliteStorage {
                         canonical_id,
                         request.owner_user_did,
                         canonical_group,
+                        request.canonical_lifecycle.generation,
+                        request.canonical_lifecycle.state_version,
+                        request.canonical_lifecycle.reset_generation,
                     ],
                 )
             } else {

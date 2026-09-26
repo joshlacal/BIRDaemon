@@ -1085,6 +1085,7 @@ async fn run_birdaemon_process_leg(
         ensure!(pid2 != pid1, "relaunch reused pid {pid1}");
         eprintln!("[client-birdaemon-process] relaunched bird-daemon pid {pid2}: {command2}");
         wait_for_log(&log2, "Bot event loop running", 1, Duration::from_secs(120))?;
+        wait_for_log(&log2, "Server sync complete", 1, Duration::from_secs(120))?;
         // One full periodic sync cycle (30 s) plus margin after the relaunch.
         tokio::time::sleep(Duration::from_secs(40)).await;
         let bridge_after_restart = bridge.message_count();
@@ -1453,6 +1454,11 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
     ensure!(bridge.message_count() == 1, "in-process replay caused a second bridge call");
     drop(bob_runtime);
     let restarted = assemble_runtime(DebugFixtureContext::load(&bob_run_json_path)?).await?;
+    eprintln!("[client-birdaemon] Calling sync_with_server after in-process restart...");
+    if let Err(e) = restarted.orchestrator.sync_with_server(true).await {
+        eprintln!("[client-birdaemon] sync_with_server after restart failed: {e:?}");
+        panic!("sync_with_server after restart failed: {e:?}");
+    }
     restarted.bot.set_accept_chat_requests(true);
     restarted.bot.handle_request_views().await;
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -1653,6 +1659,96 @@ async fn test_client_birdaemon_live_scenario() {
     if let Err(e) = Box::pin(run_client_birdaemon_live_scenario()).await {
         panic!("test_client_birdaemon_live_scenario failed: {e:?}");
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the local client runtime gateway fixture"]
+async fn test_relaunch_sync_succeeds() {
+    let _capture = install_process_log_capture().expect("log capture");
+    let freeze5 = Path::new("/Users/joshlacalamito/Developer/.workspaces/freeze5-artifacts");
+    let catmos_bin = freeze5.join("cli/catmos");
+    let seeder_bin = freeze5.join("cli/seed_local_request_profile");
+    let gw_bin = freeze5.join("servers/client_runtime_gateway");
+    let server_fixture_bin = freeze5.join("servers/encrypted_request_server_fixture");
+    let dedicated_db = DedicatedDbGuard::create().expect("db create");
+    let gw_dir = std::env::temp_dir().join(format!("gw-relaunch-{}", uuid::Uuid::new_v4()));
+    let gw_config = json!({"output_dir": gw_dir, "cors_origin": "http://127.0.0.1:5173", "lifetime_seconds": 600});
+    let mut gw_child = GatewayChild::spawn(&gw_bin, &gw_config, &server_fixture_bin, &dedicated_db.url).expect("spawn gateway");
+    let ready_line = gw_child.stdout_line().expect("ready");
+    let ready_val: Value = serde_json::from_str(&ready_line).unwrap();
+    let manifest_path = PathBuf::from(ready_val["manifest"].as_str().unwrap());
+    let sessions_path = gw_dir.join("sessions.json");
+    let manifest_data: Value = serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    let accounts = manifest_data["accounts"].as_array().unwrap();
+    let bob_acc = accounts.iter().find(|a| a["label"] == "bob").unwrap();
+    let alice_acc = accounts.iter().find(|a| a["label"] == "alice").unwrap();
+
+    let bridge = MockBridge::start().await.unwrap();
+    let bob_dir = std::env::temp_dir().join(format!("bob-relaunch-{}", uuid::Uuid::new_v4()));
+    let bob_run_config = DebugFixtureRunConfig {
+        manifest_path: manifest_path.clone(),
+        sessions_path: sessions_path.clone(),
+        account_label: "bob".into(),
+        data_dir: bob_dir.clone(),
+        bridge_url: format!("http://127.0.0.1:{}", bridge.port),
+        receive_chat_requests: true,
+        accept_chat_requests: true,
+        reply_to_all_messages: true,
+        max_reply_characters: 1000,
+    };
+    let bob_run_json = serde_json::to_vec_pretty(&bob_run_config).unwrap();
+    let bob_run_path = std::env::temp_dir().join(format!("bob-relaunch-config-{}.json", uuid::Uuid::new_v4()));
+    std::fs::write(&bob_run_path, &bob_run_json).unwrap();
+
+    let bob_ctx = DebugFixtureContext::load(&bob_run_path).unwrap();
+    let bob = assemble_runtime(bob_ctx).await.unwrap();
+    bob.orchestrator.sync_with_server(true).await.unwrap();
+    bob.orchestrator.set_direct_request_delivery_enabled(true).await.unwrap();
+    bob.bot.maintain_request_keys().await;
+
+    let alice_profile = format!("t17-cli-{}", uuid::Uuid::new_v4());
+    let hosts: std::collections::BTreeMap<String, String> = manifest_data["hosts"].as_object().unwrap().iter().filter(|(h, _)| h.as_str() != "public.api.bsky.app").map(|(k, v)| (k.clone(), v.as_str().unwrap().to_string())).collect();
+    let transport = std::env::temp_dir().join(format!("alice-transport-{}.json", uuid::Uuid::new_v4()));
+    std::fs::write(&transport, serde_json::to_vec_pretty(&json!({"profile": alice_profile, "ca_pem": manifest_data["caPem"], "hosts": hosts})).unwrap()).unwrap();
+    let sessions_data: Value = serde_json::from_slice(&std::fs::read(&sessions_path).unwrap()).unwrap();
+    let sessions = sessions_data["accounts"].as_array().unwrap();
+    let alice_sess = sessions.iter().find(|s| s["label"] == "alice").unwrap();
+    let mut seeder_cmd = Command::new(&seeder_bin)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .env("CATMOS_LOCAL_RUNTIME_TRANSPORT", &transport)
+        .spawn().unwrap();
+    let mut stdin = seeder_cmd.stdin.take().unwrap();
+    stdin.write_all(&serde_json::to_vec(&json!({
+        "profile": alice_profile, "did": alice_acc["did"], "deviceId": alice_acc["deviceId"],
+        "proxyUrl": manifest_data["origin"], "serviceUrl": "https://chat.catbird.blue",
+        "sessionCookie": alice_sess["session"]
+    })).unwrap()).unwrap();
+    drop(stdin);
+    let seeder_out = seeder_cmd.wait_with_output().unwrap();
+    let seed_res: Value = serde_json::from_slice(&seeder_out.stdout).unwrap();
+    let _ = bob.context.http.post(format!("{}/fixture/enroll", manifest_data["origin"].as_str().unwrap()))
+        .bearer_auth(alice_sess["session"].as_str().unwrap())
+        .json(&json!({"device_id": alice_acc["deviceId"], "signature_public_key": seed_res["signaturePublicKey"]}))
+        .send().await.unwrap();
+    let _ = Command::new(&catmos_bin)
+        .args(["--profile", &alice_profile, "--no-startup-sync", "request", "delivery", "--enable"])
+        .env("CATMOS_LOCAL_RUNTIME_TRANSPORT", &transport).output().unwrap();
+    let (_draft, _convo_id) = cli_send_request(&catmos_bin, &alice_profile, &transport, bob_acc["did"].as_str().unwrap(), "Hello relaunch sync test").unwrap();
+
+    bob.orchestrator.sync_with_server(true).await.unwrap();
+    bob.bot.handle_request_views().await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    drop(bob);
+    let restarted = assemble_runtime(DebugFixtureContext::load(&bob_run_path).unwrap()).await.unwrap();
+    let sync_result = restarted.orchestrator.sync_with_server(true).await;
+    let _ = std::fs::remove_dir_all(&gw_dir);
+    let _ = std::fs::remove_dir_all(&bob_dir);
+    let _ = std::fs::remove_file(&bob_run_path);
+    let _ = std::fs::remove_file(&transport);
+    gw_child.shutdown().unwrap();
+    assert!(sync_result.is_ok(), "relaunch sync must succeed: {:?}", sync_result.err());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
