@@ -1128,21 +1128,22 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
     // CliLive's retained code-signed fixture pair. macOS binds keychain ACLs to the
     // code signature, so an unsigned build cannot read the protected MLS DB key
     // headlessly. Reuse the exact sealed pair rather than an unsigned rebuild.
-    let signed_pair = PathBuf::from(
-        std::env::var("BIRD_RUNTIME_CLI_FIXTURE_DIR").unwrap_or_else(|_| {
-            "/tmp/catbird-t17-cli-scoped-artifacts-5dd295d5-183b-44ad-949f-714e03679685".into()
-        }),
-    );
-    // The pair dir may hold symlinks; record and execute the real files they point at.
-    let catmos_bin = signed_pair.join("catmos").canonicalize().context("catmos CLI")?;
-    let seeder_bin = signed_pair.join("seed_local_request_profile").canonicalize().context("seeder")?;
-
-    let gw_bin = workspace_root.join("mls-ds/e2e-tests/target/debug/examples/client_runtime_gateway");
-    let server_fixture_bin = workspace_root.join("mls-ds/target/debug/encrypted_request_server_fixture");
-    // The bot executable the process leg launches; the row passes the frozen artifact here.
+    let freeze4 = Path::new("/Users/joshlacalamito/Developer/.workspaces/freeze4-artifacts");
+    let catmos_bin = std::env::var_os("CATMOS_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| freeze4.join("cli/catmos"));
+    let seeder_bin = std::env::var_os("SEEDER_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| freeze4.join("cli/seed_local_request_profile"));
+    let gw_bin = std::env::var_os("GATEWAY_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| freeze4.join("servers/client_runtime_gateway"));
+    let server_fixture_bin = std::env::var_os("SERVER_FIXTURE_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| freeze4.join("servers/encrypted_request_server_fixture"));
     let bir_daemon_bin = std::env::var_os("BIRD_DAEMON_BIN")
         .map(PathBuf::from)
-        .unwrap_or_else(|| workspace_root.join("BIRDaemon/target/debug/bird-daemon"));
+        .unwrap_or_else(|| freeze4.join("cli/bird-daemon"));
 
     for (label, bin) in [
         ("gateway", &gw_bin),
