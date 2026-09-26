@@ -1128,22 +1128,22 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
     // CliLive's retained code-signed fixture pair. macOS binds keychain ACLs to the
     // code signature, so an unsigned build cannot read the protected MLS DB key
     // headlessly. Reuse the exact sealed pair rather than an unsigned rebuild.
-    let freeze4 = Path::new("/Users/joshlacalamito/Developer/.workspaces/freeze4-artifacts");
+    let freeze5 = Path::new("/Users/joshlacalamito/Developer/.workspaces/freeze5-artifacts");
     let catmos_bin = std::env::var_os("CATMOS_BIN")
         .map(PathBuf::from)
-        .unwrap_or_else(|| freeze4.join("cli/catmos"));
+        .unwrap_or_else(|| freeze5.join("cli/catmos"));
     let seeder_bin = std::env::var_os("SEEDER_BIN")
         .map(PathBuf::from)
-        .unwrap_or_else(|| freeze4.join("cli/seed_local_request_profile"));
+        .unwrap_or_else(|| freeze5.join("cli/seed_local_request_profile"));
     let gw_bin = std::env::var_os("GATEWAY_BIN")
         .map(PathBuf::from)
-        .unwrap_or_else(|| freeze4.join("servers/client_runtime_gateway"));
+        .unwrap_or_else(|| freeze5.join("servers/client_runtime_gateway"));
     let server_fixture_bin = std::env::var_os("SERVER_FIXTURE_BIN")
         .map(PathBuf::from)
-        .unwrap_or_else(|| freeze4.join("servers/encrypted_request_server_fixture"));
+        .unwrap_or_else(|| freeze5.join("servers/encrypted_request_server_fixture"));
     let bir_daemon_bin = std::env::var_os("BIRD_DAEMON_BIN")
         .map(PathBuf::from)
-        .unwrap_or_else(|| freeze4.join("cli/bird-daemon"));
+        .unwrap_or_else(|| freeze5.join("cli/bird-daemon"));
 
     for (label, bin) in [
         ("gateway", &gw_bin),
