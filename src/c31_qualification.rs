@@ -509,6 +509,7 @@ struct GatewayChild {
 impl GatewayChild {
     fn spawn(gw_bin: &Path, config: &Value, server_fixture_bin: &Path, db_url: &str) -> Result<Self> {
         let mut child = Command::new(gw_bin)
+            .current_dir("/Users/joshlacalamito/Developer/.workspaces/catbird-encrypted-requests-20260919/mls-ds")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -967,6 +968,14 @@ async fn run_birdaemon_process_leg(
     )?;
     let ready = gateway.stdout_line()?;
     ensure!(!ready.trim().is_empty(), "process-leg gateway exited: {}", gateway.take_stderr()?);
+    let gw_ps = Command::new("ps")
+        .args(["-o", "command=", "-p", &gateway.child.id().to_string()])
+        .output()?;
+    let gw_command = String::from_utf8_lossy(&gw_ps.stdout).trim().to_string();
+    ensure!(!gw_command.is_empty(), "gateway process {} not running", gateway.child.id());
+    let gw_exe = PathBuf::from(gw_command.split_whitespace().next().context("ps command")?);
+    let gw_running_sha = file_sha256(&gw_exe)?;
+    eprintln!("[client-birdaemon-process] Running gateway PID {} ({}) SHA-256: {}", gateway.child.id(), gw_command, gw_running_sha);
     let manifest_path = PathBuf::from(serde_json::from_str::<Value>(&ready)?["manifest"].as_str().context("manifest")?);
     let sessions_path = gw_dir.join("sessions.json");
     let manifest: Value = serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
@@ -1093,6 +1102,7 @@ async fn run_birdaemon_process_leg(
         let exit2 = stop_bot_process(&mut bot)?;
         Ok(json!({
             "database": dedicated_db.name, "conversationId": convo_id, "recipientDid": bob_did,
+            "gateway": {"pid": gateway.child.id(), "psCommand": gw_command, "executableSha256": gw_running_sha},
             "run1": {"pid": pid1, "psCommand": command1, "executableSha256": exe_sha1, "exitCode": exit1},
             "run2": {"pid": pid2, "psCommand": command2, "executableSha256": exe_sha2, "exitCode": exit2},
             "bridgeCallsAfterReply": bridge_after_reply, "bridgeCallsAfterRestart": bridge_after_restart,
@@ -1165,6 +1175,14 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
         "Gateway exited before readiness: {}",
         gw_child.take_stderr()?
     );
+    let gw_ps = Command::new("ps")
+        .args(["-o", "command=", "-p", &gw_child.child.id().to_string()])
+        .output()?;
+    let gw_command = String::from_utf8_lossy(&gw_ps.stdout).trim().to_string();
+    ensure!(!gw_command.is_empty(), "gateway process {} not running", gw_child.child.id());
+    let gw_exe = PathBuf::from(gw_command.split_whitespace().next().context("ps command")?);
+    let gw_running_sha = file_sha256(&gw_exe)?;
+    eprintln!("[client-birdaemon] Running gateway PID {} ({}) SHA-256: {}", gw_child.child.id(), gw_command, gw_running_sha);
     let ready_val: Value = serde_json::from_str(&ready_line).context("parse gateway readiness JSON")?;
     let manifest_path = PathBuf::from(ready_val["manifest"].as_str().context("manifest path in readiness")?);
     let sessions_path = gw_dir.join("sessions.json");
@@ -1520,6 +1538,11 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
     let receipt_file = evidence_dir.join("runtime-receipt.json");
     std::fs::write(&receipt_file, serde_json::to_vec_pretty(&json!({
         "runtimeRow": "client-birdaemon",
+        "gateway": {
+            "path": make_artifact(workspace_root, &gw_bin)?,
+            "runningSha256": gw_running_sha,
+            "runningPsCommand": gw_command,
+        },
         "sender": {"client": "catmos-cli (signed fixture pair)", "did": alice_acc["did"], "deviceId": alice_acc["deviceId"]},
         "recipient": {"client": "BIRDaemon", "did": restarted.context.did, "deviceId": restarted.context.reserved_device_id},
         "conversationId": convo_id, "draftId": draft_id,
@@ -1552,6 +1575,8 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
             "botBinary": make_artifact(workspace_root, &bir_daemon_bin)?,
             "cliBinary": make_artifact(workspace_root, &catmos_bin)?,
             "seederBinary": make_artifact(workspace_root, &seeder_bin)?,
+            "gatewayBinary": make_artifact(workspace_root, &gw_bin)?,
+            "serverFixtureBinary": make_artifact(workspace_root, &server_fixture_bin)?,
             "testRunner": make_artifact(workspace_root, &test_runner)?,
             "note": "Test runner binary is test-only harness; the bot under test is the frozen bird-daemon executable executed in fixture mode via spawn_bot_process"
         },
@@ -1573,7 +1598,14 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
             "Real FCM delivery was not exercised; the local test fixture has no Firebase server.",
             "The policy-off, decline, and invalid legs were qualified using the in-process test harness against the real delivery service and storage rather than a separate daemon process invocation."
         ],
-        "binaryHashes": [make_artifact(workspace_root, &bir_daemon_bin)?, make_artifact(workspace_root, &catmos_bin)?, make_artifact(workspace_root, &seeder_bin)?, make_artifact(workspace_root, &test_runner)?],
+        "binaryHashes": [
+            make_artifact(workspace_root, &bir_daemon_bin)?,
+            make_artifact(workspace_root, &catmos_bin)?,
+            make_artifact(workspace_root, &seeder_bin)?,
+            make_artifact(workspace_root, &gw_bin)?,
+            make_artifact(workspace_root, &server_fixture_bin)?,
+            make_artifact(workspace_root, &test_runner)?,
+        ],
         "runtimeReceipt": make_artifact(workspace_root, &receipt_file)?,
         "screenshots": [make_artifact(workspace_root, &terminal_file)?],
         "artifacts": [
