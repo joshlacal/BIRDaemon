@@ -1548,6 +1548,31 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
     std::fs::write(evidence_dir.join("result.json"), serde_json::to_vec_pretty(&json!({
         "id": "client-birdaemon", "outcome": "pass", "testCount": 1, "passed": 1, "failed": 0, "skipped": 0,
         "startedAt": started_at, "endedAt": ended_at,
+        "environment": {
+            "botBinary": make_artifact(workspace_root, &bir_daemon_bin)?,
+            "cliBinary": make_artifact(workspace_root, &catmos_bin)?,
+            "seederBinary": make_artifact(workspace_root, &seeder_bin)?,
+            "testRunner": make_artifact(workspace_root, &test_runner)?,
+            "note": "Test runner binary is test-only harness; the bot under test is the frozen bird-daemon executable executed in fixture mode via spawn_bot_process"
+        },
+        "assertions": [
+            "A real encrypted request was published by the signed CLI through the shipping router and decrypted by BIRDaemon's real core into a Ready preview equal to the sent text.",
+            "While pending (no autoaccept) after the bot processed the verified view: 0 bridge/LLM calls (counted at a real HTTP bridge), 0 typing attempts and 0 blob downloads (counted at BirdApiClient's real transport methods), 0 effect claims, 0 bird.db message rows.",
+            "A global tracing subscriber plus the core MLS logger captured all bot-process logs; the introduction plaintext never appeared in them.",
+            "No plaintext introduction bytes in any file under the bot data dir (bird.db, credentials, keychain, native store); the native SQLCipher store rejected unkeyed access.",
+            "With autoaccept configured, the bot's own request path called the real acceptConversation RPC; the server-acknowledged projection became Accepted/can_send before exactly one bridge call and exactly one durable effect claim; the reply was decrypted by the CLI.",
+            "F37 local send state: the bot's reply send returned Ok (no send-failure log; exactly one own reply row, which the core writes only after the server-accepted request matched and the own-echo proof was persisted). The core's own-echo intake accepted the server echo in-process and, after a runtime restart with no in-memory pending state, via the durable own-echo proof alone, without refusal or rejoin. After restart the reply is present exactly once.",
+            "Declined leg: a real published request on an independent dedicated DB was declined via the real close RPC; with autoaccept enabled the bot never reopened or accepted it, and produced zero bridge, typing, download or claim effects.",
+            "Replaying the same verified request event in-process and again after a process-level runtime restart on the same data dir produced no second bridge call, claim, download or typing attempt.",
+            "Invalid leg: a malicious-but-authentic sender published a re-signed request with a tampered introduction through the real router to a separate BIRDaemon device configured to autoaccept and reply. Bob's real core rejected the introduction (preview never Ready), the bot never accepted it, and bridge, typing, download and claim effects were all zero.",
+            "Process leg: the actual frozen bird-daemon executable was spawned as a live OS process (recorded via ps while running); it received the request, autoaccepted, called the mock bridge once, and replied; the CLI decrypted the reply; the bot was cleanly stopped with SIGINT and relaunched with a new PID on the same data dir; a subsequent sync produced zero duplicate bridge calls and zero duplicate claims."
+        ],
+        "notExercised": [
+            "Local draft cancellation via DirectRequestRepository.cancel() was not exercised on this row; the bot is a headless service and only the CLI sender creates drafts.",
+            "Unavailable-device behavior (a recipient device not addressed by the published introduction) was not exercised on this row; the bot recipient has a single device.",
+            "Real FCM delivery was not exercised; the local test fixture has no Firebase server.",
+            "The policy-off, decline, and invalid legs were qualified using the in-process test harness against the real delivery service and storage rather than a separate daemon process invocation."
+        ],
         "binaryHashes": [make_artifact(workspace_root, &bir_daemon_bin)?, make_artifact(workspace_root, &catmos_bin)?, make_artifact(workspace_root, &seeder_bin)?, make_artifact(workspace_root, &test_runner)?],
         "runtimeReceipt": make_artifact(workspace_root, &receipt_file)?,
         "screenshots": [make_artifact(workspace_root, &terminal_file)?],
