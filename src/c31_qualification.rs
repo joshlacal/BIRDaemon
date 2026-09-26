@@ -895,6 +895,222 @@ async fn run_invalid_introduction_leg(
     }))
 }
 
+/// Spawns the bot binary under test as a real OS process in fixture mode and
+/// returns `(child, ps command line, sha256 of the executable the process runs)`.
+/// The command line is read from the live process, not from our argv.
+fn spawn_bot_process(bot_bin: &Path, run_config: &Path, log_path: &Path) -> Result<(std::process::Child, String, String)> {
+    let log = std::fs::File::create(log_path)?;
+    let child = Command::new(bot_bin)
+        .env("BIRD_RUNTIME_FIXTURE_CONFIG", run_config)
+        .env("RUST_LOG", "info")
+        .stdin(Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log)
+        .spawn()
+        .context("spawn bird-daemon process")?;
+    std::thread::sleep(Duration::from_millis(300));
+    let ps = Command::new("ps").args(["-o", "command=", "-p", &child.id().to_string()]).output()?;
+    let command = String::from_utf8_lossy(&ps.stdout).trim().to_owned();
+    ensure!(!command.is_empty(), "bird-daemon process {} exited immediately; see {}", child.id(), log_path.display());
+    let exe = PathBuf::from(command.split_whitespace().next().context("ps command")?);
+    Ok((child, command, file_sha256(&exe)?))
+}
+
+fn wait_for_log(path: &Path, needle: &str, occurrences: usize, timeout: Duration) -> Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        if text.matches(needle).count() >= occurrences {
+            return Ok(());
+        }
+        ensure!(std::time::Instant::now() < deadline, "timed out waiting for {needle:?} in {}", path.display());
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+fn stop_bot_process(child: &mut std::process::Child) -> Result<Option<i32>> {
+    let _ = Command::new("kill").args(["-INT", &child.id().to_string()]).status();
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while std::time::Instant::now() < deadline {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status.code());
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    child.kill()?;
+    child.wait()?;
+    ensure!(child.try_wait()?.is_some(), "bird-daemon {} still running", child.id());
+    Ok(None)
+}
+
+/// Process leg: the actual bird-daemon executable (not the in-process runtime
+/// assembled by this test runner) is the recipient. The CLI publishes a real
+/// request; the running bot autoaccepts, calls the bridge once and replies; the
+/// CLI decrypts the reply. The bot is then quit and relaunched as a new OS
+/// process on the same data dir and must not produce a second bridge call.
+async fn run_birdaemon_process_leg(
+    gw_bin: &Path,
+    server_fixture_bin: &Path,
+    catmos_bin: &Path,
+    seeder_bin: &Path,
+    bot_bin: &Path,
+    evidence_dir: &Path,
+) -> Result<Value> {
+    eprintln!("[client-birdaemon-process] Starting dedicated gateway for the bot-process leg...");
+    let dedicated_db = DedicatedDbGuard::create()?;
+    let gw_dir = std::env::temp_dir().join(format!("gw-birdaemon-process-{}", uuid::Uuid::new_v4()));
+    let mut gateway = GatewayChild::spawn(
+        gw_bin,
+        &json!({"output_dir": gw_dir, "cors_origin": "http://127.0.0.1:5173", "lifetime_seconds": 900}),
+        server_fixture_bin,
+        &dedicated_db.url,
+    )?;
+    let ready = gateway.stdout_line()?;
+    ensure!(!ready.trim().is_empty(), "process-leg gateway exited: {}", gateway.take_stderr()?);
+    let manifest_path = PathBuf::from(serde_json::from_str::<Value>(&ready)?["manifest"].as_str().context("manifest")?);
+    let sessions_path = gw_dir.join("sessions.json");
+    let manifest: Value = serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
+    let sessions: Value = serde_json::from_slice(&std::fs::read(&sessions_path)?)?;
+    let pick = |doc: &Value, label: &str| -> Result<Value> {
+        doc["accounts"].as_array().context("accounts")?.iter().find(|a| a["label"] == label).cloned().context("account")
+    };
+    let alice = pick(&manifest, "alice")?;
+    let bob = pick(&manifest, "bob")?;
+    let alice_session = pick(&sessions, "alice")?["session"].as_str().context("session")?.to_owned();
+    let bob_did = bob["did"].as_str().context("bob did")?.to_owned();
+
+    let bridge = MockBridge::start().await?;
+    let bob_dir = std::env::temp_dir().join(format!("bob-process-{}", uuid::Uuid::new_v4()));
+    let run_config = |label: &str, dir: &Path| DebugFixtureRunConfig {
+        manifest_path: manifest_path.clone(),
+        sessions_path: sessions_path.clone(),
+        account_label: label.into(),
+        data_dir: dir.to_path_buf(),
+        bridge_url: format!("http://127.0.0.1:{}", bridge.port),
+        receive_chat_requests: true,
+        accept_chat_requests: true,
+        reply_to_all_messages: true,
+        max_reply_characters: 1000,
+    };
+    let bob_run = std::env::temp_dir().join(format!("bob-process-run-{}.json", uuid::Uuid::new_v4()));
+    std::fs::write(&bob_run, serde_json::to_vec(&run_config("bob", &bob_dir))?)?;
+    // Only used for its fixture-pinned HTTP client (alice preseed); never assembled.
+    let alice_run = std::env::temp_dir().join(format!("alice-http-{}.json", uuid::Uuid::new_v4()));
+    std::fs::write(&alice_run, serde_json::to_vec(&run_config("alice", &std::env::temp_dir().join(format!("alice-unused-{}", uuid::Uuid::new_v4()))))?)?;
+    let alice_http = DebugFixtureContext::load(&alice_run)?.http;
+
+    let log1 = evidence_dir.join("bird-daemon-process-run1.log");
+    let log2 = evidence_dir.join("bird-daemon-process-run2.log");
+    let (mut bot, command1, exe_sha1) = spawn_bot_process(bot_bin, &bob_run, &log1)?;
+    let pid1 = bot.id();
+    eprintln!("[client-birdaemon-process] bird-daemon pid {pid1}: {command1} ({exe_sha1})");
+    let outcome = async {
+        wait_for_log(&log1, "Bot event loop running", 1, Duration::from_secs(120))?;
+
+        let alice_profile = format!("t17-cli-{}", uuid::Uuid::new_v4());
+        let transport = std::env::temp_dir().join(format!("{alice_profile}.transport.json"));
+        std::fs::write(&transport, serde_json::to_vec_pretty(&json!({
+            "profile": alice_profile,
+            "ca_pem": manifest["caPem"],
+            "hosts": manifest["hosts"].as_object().map(|hosts| hosts.iter()
+                .filter(|(host, _)| host.as_str() == "chat.catbird.blue" || host.ends_with(".request-fixture.catbird.blue"))
+                .map(|(host, address)| (host.clone(), address.clone()))
+                .collect::<serde_json::Map<_, _>>()).unwrap_or_default()
+        }))?)?;
+        let mut seeder = Command::new(seeder_bin)
+            .env("CATMOS_LOCAL_RUNTIME_TRANSPORT", &transport)
+            .env_remove("CATMOS_TEST_KEYCHAIN_FALLBACK")
+            .env_remove("CATMOS_TEST_SHARED_KEYCHAIN_FALLBACK")
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+            .spawn()?;
+        seeder.stdin.take().context("seeder stdin")?.write_all(&serde_json::to_vec(&json!({
+            "profile": alice_profile, "did": alice["did"], "deviceId": alice["deviceId"],
+            "proxyUrl": manifest["origin"], "serviceUrl": manifest["origin"], "sessionCookie": alice_session
+        }))?)?;
+        let seeded = seeder.wait_with_output()?;
+        ensure!(seeded.status.success(), "seeder failed: {}", String::from_utf8_lossy(&seeded.stderr));
+        let seeded: Value = serde_json::from_slice(&seeded.stdout)?;
+        let preseed = alice_http
+            .post(format!("{}/fixture/enroll", manifest["origin"].as_str().context("origin")?))
+            .bearer_auth(&alice_session)
+            .json(&json!({"device_id": alice["deviceId"], "signature_public_key": seeded["signaturePublicKey"]}))
+            .send().await?;
+        ensure!(preseed.status().is_success(), "alice preseed failed: {}", preseed.status());
+        let delivery = Command::new(catmos_bin)
+            .args(["--profile", &alice_profile, "--no-startup-sync", "request", "delivery", "--enable"])
+            .env("CATMOS_LOCAL_RUNTIME_TRANSPORT", &transport)
+            .output()?;
+        ensure!(delivery.status.success(), "alice delivery enable failed: {}", String::from_utf8_lossy(&delivery.stderr));
+
+        let intro = format!("client-birdaemon process-leg introduction {}", uuid::Uuid::new_v4());
+        let (_draft, convo_id) = cli_send_request(catmos_bin, &alice_profile, &transport, &bob_did, &intro)?;
+        eprintln!("[client-birdaemon-process] Request published {convo_id}; waiting for the running bot...");
+
+        let reply_text = "Hello from BIRDaemon mock bridge reply!";
+        let alice_messages = || -> Result<String> {
+            let out = Command::new(catmos_bin)
+                .args(["--profile", &alice_profile, "messages", &convo_id])
+                .env("CATMOS_LOCAL_RUNTIME_TRANSPORT", &transport)
+                .output()?;
+            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(150);
+        let mut history = String::new();
+        while std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            history = alice_messages()?;
+            if history.contains(reply_text) {
+                break;
+            }
+        }
+        std::fs::write(evidence_dir.join("process-leg-cli-messages-after-reply.txt"), &history)?;
+        ensure!(history.contains(reply_text), "CLI never decrypted a reply from the running bird-daemon process");
+        ensure!(history.matches(reply_text).count() == 1, "reply rendered more than once for the CLI");
+        let bridge_after_reply = bridge.message_count();
+        ensure!(bridge_after_reply == 1, "running bot called the bridge {bridge_after_reply} times, expected 1");
+
+        let exit1 = stop_bot_process(&mut bot)?;
+        let (bot2, command2, exe_sha2) = spawn_bot_process(bot_bin, &bob_run, &log2)?;
+        bot = bot2;
+        let pid2 = bot.id();
+        ensure!(pid2 != pid1, "relaunch reused pid {pid1}");
+        eprintln!("[client-birdaemon-process] relaunched bird-daemon pid {pid2}: {command2}");
+        wait_for_log(&log2, "Bot event loop running", 1, Duration::from_secs(120))?;
+        // One full periodic sync cycle (30 s) plus margin after the relaunch.
+        tokio::time::sleep(Duration::from_secs(40)).await;
+        let bridge_after_restart = bridge.message_count();
+        ensure!(bridge_after_restart == 1, "relaunched bot produced another bridge call ({bridge_after_restart})");
+        let claims: i64 = rusqlite::Connection::open(bob_dir.join("bird.db"))?
+            .query_row("SELECT count(*) FROM bot_effect_claims", [], |r| r.get(0))?;
+        ensure!(claims == 1, "expected exactly one durable effect claim, found {claims}");
+        let history_after_restart = alice_messages()?;
+        std::fs::write(evidence_dir.join("process-leg-cli-messages-after-bot-restart.txt"), &history_after_restart)?;
+        ensure!(history_after_restart.matches(reply_text).count() == 1, "reply duplicated after bot restart");
+        ensure!(history_after_restart.contains(&intro), "introduction missing from CLI history");
+        for log in [&log1, &log2] {
+            ensure!(!std::fs::read_to_string(log)?.contains(&intro), "introduction plaintext in bot process log");
+        }
+        let exit2 = stop_bot_process(&mut bot)?;
+        Ok(json!({
+            "database": dedicated_db.name, "conversationId": convo_id, "recipientDid": bob_did,
+            "run1": {"pid": pid1, "psCommand": command1, "executableSha256": exe_sha1, "exitCode": exit1},
+            "run2": {"pid": pid2, "psCommand": command2, "executableSha256": exe_sha2, "exitCode": exit2},
+            "bridgeCallsAfterReply": bridge_after_reply, "bridgeCallsAfterRestart": bridge_after_restart,
+            "effectClaims": claims,
+            "replyOccurrencesAfterReply": history.matches(reply_text).count(),
+            "replyOccurrencesAfterRestart": history_after_restart.matches(reply_text).count(),
+        }))
+    }
+    .await;
+    if outcome.is_err() {
+        let _ = stop_bot_process(&mut bot);
+    }
+    gateway.shutdown()?;
+    let _ = std::fs::remove_dir_all(&gw_dir);
+    let _ = std::fs::remove_dir_all(&bob_dir);
+    outcome
+}
+
 /// Verification of client-birdaemon runtime row (live against client_runtime_gateway).
 pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
     let started_at = Utc::now().to_rfc3339();
@@ -917,12 +1133,16 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
             "/tmp/catbird-t17-cli-scoped-artifacts-5dd295d5-183b-44ad-949f-714e03679685".into()
         }),
     );
-    let catmos_bin = signed_pair.join("catmos");
-    let seeder_bin = signed_pair.join("seed_local_request_profile");
+    // The pair dir may hold symlinks; record and execute the real files they point at.
+    let catmos_bin = signed_pair.join("catmos").canonicalize().context("catmos CLI")?;
+    let seeder_bin = signed_pair.join("seed_local_request_profile").canonicalize().context("seeder")?;
 
     let gw_bin = workspace_root.join("mls-ds/e2e-tests/target/debug/examples/client_runtime_gateway");
     let server_fixture_bin = workspace_root.join("mls-ds/target/debug/encrypted_request_server_fixture");
-    let bir_daemon_bin = workspace_root.join("BIRDaemon/target/debug/bird-daemon");
+    // The bot executable the process leg launches; the row passes the frozen artifact here.
+    let bir_daemon_bin = std::env::var_os("BIRD_DAEMON_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workspace_root.join("BIRDaemon/target/debug/bird-daemon"));
 
     for (label, bin) in [
         ("gateway", &gw_bin),
@@ -1256,6 +1476,17 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
     // Box the legs: their deep core futures otherwise overflow the test thread stack.
     let declined = Box::pin(run_declined_leg(&gw_bin, &server_fixture_bin, &catmos_bin, &seeder_bin, &log_capture)).await?;
     let invalid = Box::pin(run_invalid_introduction_leg(&gw_bin, &server_fixture_bin, &log_capture)).await?;
+    let evidence_dir = workspace_root.join("docs/generated-artifacts/encrypted-requests/evidence/client-birdaemon");
+    std::fs::create_dir_all(&evidence_dir)?;
+    let process_leg = Box::pin(run_birdaemon_process_leg(
+        &gw_bin, &server_fixture_bin, &catmos_bin, &seeder_bin, &bir_daemon_bin, &evidence_dir,
+    ))
+    .await?;
+    ensure!(
+        process_leg["run1"]["executableSha256"] == file_sha256(&bir_daemon_bin)?
+            && process_leg["run2"]["executableSha256"] == file_sha256(&bir_daemon_bin)?,
+        "running bot executable differs from the recorded bot binary"
+    );
     let ended_at = Utc::now().to_rfc3339();
 
     // C35 bot parity: exact binaries and shared-source revision this run used.
@@ -1280,8 +1511,7 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
         "signedSeederSha256": file_sha256(&seeder_bin)?,
     });
 
-    let evidence_dir = workspace_root.join("docs/generated-artifacts/encrypted-requests/evidence/client-birdaemon");
-    std::fs::create_dir_all(&evidence_dir)?;
+
     let parity_file = evidence_dir.join("c35-bot-parity.json");
     std::fs::write(&parity_file, serde_json::to_vec_pretty(&parity)?)?;
     let captured_file = evidence_dir.join("bot-process-captured-logs.txt");
@@ -1294,6 +1524,7 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
         "conversationId": convo_id, "draftId": draft_id,
         "declinedLeg": declined,
         "invalidLeg": invalid,
+        "processLeg": process_leg,
         "bridgeCalls": bridge.message_count(), "typingAttempts": typing(), "blobDownloads": downloads(),
         "effectClaims": claim_count(&bob_dir)?,
         "replyLocalSend": {
@@ -1309,15 +1540,24 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
     }))?)?;
     let terminal_file = evidence_dir.join("client-birdaemon-terminal-transcript.txt");
     std::fs::write(&terminal_file, format!(
-        "Headless runtime: no UI surface exists for the bot or CLI; this terminal transcript stands in for a screenshot.\nconversation {convo_id}: request published by CLI, pending preview decrypted by BIRDaemon with zero effects, bot autoaccepted via acceptConversation, one bridge call, reply sent Ok locally (one own row), own echo accepted in-process and after restart against the durable own-echo proof, reply decrypted by CLI, in-process and restart replays suppressed.\n"
+        "Headless runtime: no UI surface exists for the bot or CLI; this terminal transcript stands in for a screenshot.\nconversation {convo_id}: request published by CLI, pending preview decrypted by BIRDaemon with zero effects, bot autoaccepted via acceptConversation, one bridge call, reply sent Ok locally (one own row), own echo accepted in-process and after restart against the durable own-echo proof, reply decrypted by CLI, in-process and restart replays suppressed.\nprocess leg: bird-daemon executable pid {} ({}) received conversation {}, autoaccepted, called the bridge once and replied; the CLI decrypted the reply once; quit and relaunched as pid {}; bridge calls after relaunch {}, effect claims {}.\n",
+        process_leg["run1"]["pid"], process_leg["run1"]["psCommand"], process_leg["conversationId"].as_str().unwrap_or_default(),
+        process_leg["run2"]["pid"], process_leg["bridgeCallsAfterRestart"], process_leg["effectClaims"]
     ))?;
     std::fs::write(evidence_dir.join("result.json"), serde_json::to_vec_pretty(&json!({
         "id": "client-birdaemon", "outcome": "pass", "testCount": 1, "passed": 1, "failed": 0, "skipped": 0,
         "startedAt": started_at, "endedAt": ended_at,
-        "binaryHashes": [make_artifact(workspace_root, &bir_daemon_bin)?, make_artifact(workspace_root, &catmos_bin)?, make_artifact(workspace_root, &test_runner)?],
+        "binaryHashes": [make_artifact(workspace_root, &bir_daemon_bin)?, make_artifact(workspace_root, &catmos_bin)?, make_artifact(workspace_root, &seeder_bin)?, make_artifact(workspace_root, &test_runner)?],
         "runtimeReceipt": make_artifact(workspace_root, &receipt_file)?,
         "screenshots": [make_artifact(workspace_root, &terminal_file)?],
-        "artifacts": [make_artifact(workspace_root, &parity_file)?, make_artifact(workspace_root, &captured_file)?]
+        "artifacts": [
+            make_artifact(workspace_root, &parity_file)?,
+            make_artifact(workspace_root, &captured_file)?,
+            make_artifact(workspace_root, &evidence_dir.join("bird-daemon-process-run1.log"))?,
+            make_artifact(workspace_root, &evidence_dir.join("bird-daemon-process-run2.log"))?,
+            make_artifact(workspace_root, &evidence_dir.join("process-leg-cli-messages-after-reply.txt"))?,
+            make_artifact(workspace_root, &evidence_dir.join("process-leg-cli-messages-after-bot-restart.txt"))?,
+        ]
     }))?)?;
 
     let c31_dir = workspace_root.join("docs/generated-artifacts/encrypted-requests/evidence/c31");
