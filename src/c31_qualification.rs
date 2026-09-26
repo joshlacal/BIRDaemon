@@ -503,16 +503,19 @@ impl Drop for DedicatedDbGuard {
 struct GatewayChild {
     child: std::process::Child,
     stdout: std::io::BufReader<std::process::ChildStdout>,
+    err_log: PathBuf,
     finished: bool,
 }
 
 impl GatewayChild {
     fn spawn(gw_bin: &Path, config: &Value, server_fixture_bin: &Path, db_url: &str) -> Result<Self> {
+        let err_log = std::env::temp_dir().join(format!("gw-stderr-{}.log", uuid::Uuid::new_v4()));
+        let err_file = std::fs::File::create(&err_log)?;
         let mut child = Command::new(gw_bin)
             .current_dir("/Users/joshlacalamito/Developer/.workspaces/catbird-encrypted-requests-20260919/mls-ds")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(err_file)
             .env("REQUEST_TEST_DATABASE_URL", db_url)
             .env("REQUEST_SERVER_FIXTURE_BINARY", server_fixture_bin)
             .spawn()
@@ -522,7 +525,7 @@ impl GatewayChild {
             stdin.write_all(&serde_json::to_vec(config)?)?;
         }
         let stdout = std::io::BufReader::new(child.stdout.take().context("gw stdout")?);
-        Ok(Self { child, stdout, finished: false })
+        Ok(Self { child, stdout, err_log, finished: false })
     }
 
     fn stdout_line(&mut self) -> Result<String> {
@@ -532,11 +535,7 @@ impl GatewayChild {
     }
 
     fn take_stderr(&mut self) -> Result<String> {
-        let mut err = String::new();
-        if let Some(mut stderr) = self.child.stderr.take() {
-            std::io::Read::read_to_string(&mut stderr, &mut err)?;
-        }
-        Ok(err)
+        std::fs::read_to_string(&self.err_log).map_err(Into::into)
     }
 
     fn descendants(&self) -> Vec<String> {
@@ -808,6 +807,7 @@ async fn run_invalid_introduction_leg(
         max_reply_characters: 1000,
     })?)?;
     let bob = assemble_runtime(DebugFixtureContext::load(&run_path)?).await?;
+    bob.orchestrator.set_direct_request_delivery_enabled(true).await?;
     bob.bot.maintain_request_keys().await;
     ensure!(
         bob.orchestrator.get_direct_request_delivery_enabled().await? == Some(true),
