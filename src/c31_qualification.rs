@@ -1222,7 +1222,10 @@ async fn run_birdaemon_process_leg(
         provisioner.orchestrator.replenish_direct_request_keys_if_needed().await?;
         drop(provisioner);
         let before_block_counts = remote_request_counts(&dedicated_db.url)?;
-        ensure!(before_block_counts == (0, 0), "block probe is not a fresh request context: {before_block_counts:?}");
+        ensure!(
+            before_block_counts.0 == after_draft_counts.0 + 1 && before_block_counts.1 == 0,
+            "unavailable-key probe should add one refused attempt and no publication: {before_block_counts:?}"
+        );
         // ── Account Block & Repeat-Request Refusal Leg ──
         // Bob blocks Alice on the gateway (com.atproto.repo.createRecord).
         let origin = manifest["origin"].as_str().context("origin")?;
