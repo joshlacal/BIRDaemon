@@ -10,6 +10,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
+use url::Url;
 
 use catbird_mls::orchestrator::credentials::{CleanChatSigningAuthority, CredentialStore};
 use catbird_mls::orchestrator::error::{OrchestratorError, Result};
@@ -95,6 +96,21 @@ impl FileCredentialStore {
     #[cfg(debug_assertions)]
     pub fn set_http_client(&self, client: reqwest::Client) {
         *self.http_client.lock().unwrap() = Some(client);
+    }
+
+    fn http_client(&self) -> Result<reqwest::Client> {
+        #[cfg(debug_assertions)]
+        {
+            if let Some(client) = self.http_client.lock().unwrap().clone() {
+                return Ok(client);
+            }
+        }
+        reqwest::Client::builder()
+            .https_only(true)
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .map_err(|e| OrchestratorError::Credential(format!("HTTP client build failed: {e}")))
     }
 
     fn key(user_did: &str, field: &str) -> String {
@@ -443,49 +459,65 @@ fn keychain_delete(_account: &str) -> Result<()> {
 
 #[async_trait]
 impl CredentialStore for FileCredentialStore {
-    async fn direct_request_receipt_authority_document(&self) -> Result<Option<Vec<u8>>> {
-        // Fixed independently authenticated authority, never a receipt-provided URL.
-        #[cfg(debug_assertions)]
-        let http = if let Some(client) = self.http_client.lock().unwrap().clone() {
-            client
-        } else {
-            reqwest::Client::builder()
-                .https_only(true)
-                .redirect(reqwest::redirect::Policy::none())
-                .timeout(std::time::Duration::from_secs(10))
-                .build()
-                .map_err(|_| OrchestratorError::Credential("receipt resolver unavailable".into()))?
-        };
-        #[cfg(not(debug_assertions))]
-        let http = reqwest::Client::builder()
-            .https_only(true)
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .map_err(|_| OrchestratorError::Credential("receipt resolver unavailable".into()))?;
-        let mut response = http
-            .get("https://chat.catbird.blue/.well-known/did.json")
+    async fn direct_request_receipt_authority_document(
+        &self,
+        expected_authority_did: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        validate_bare_did(expected_authority_did)?;
+        let url = did_document_url(expected_authority_did)?;
+        validate_safe_https_endpoint(&url)?;
+        let http = self.http_client()?;
+        let response = http
+            .get(url.as_str())
+            .header("accept", "application/json")
             .send()
             .await
-            .map_err(|_| {
-                OrchestratorError::Credential("receipt authority resolution failed".into())
-            })?
+            .map_err(|e| OrchestratorError::Credential(format!("receipt authority resolution failed: {e}")))?
             .error_for_status()
-            .map_err(|_| OrchestratorError::Credential("receipt authority unavailable".into()))?;
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|_| OrchestratorError::Credential("receipt authority read failed".into()))?
-        {
-            if bytes.len().saturating_add(chunk.len()) > 256 * 1024 {
-                return Err(OrchestratorError::Credential(
-                    "receipt authority document exceeds limit".into(),
-                ));
-            }
-            bytes.extend_from_slice(&chunk);
+            .map_err(|e| OrchestratorError::Credential(format!("receipt authority unavailable: {e}")))?;
+        let bytes = read_bounded_body(response, MAX_AUTHORITY_RESPONSE_BYTES).await?;
+        let doc: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|e| OrchestratorError::Credential(format!("parse authority document: {e}")))?;
+        let doc_id = doc
+            .get("id")
+            .and_then(|id| id.as_str())
+            .ok_or_else(|| OrchestratorError::Credential("authority document missing id".into()))?;
+        if doc_id != expected_authority_did {
+            return Err(OrchestratorError::Credential(
+                "authority document ID does not match expected authority DID".into(),
+            ));
         }
         Ok(Some(bytes))
+    }
+
+    async fn get_chat_declaration_authority(
+        &self,
+        user_did: &str,
+    ) -> Result<Option<String>> {
+        validate_bare_did(user_did)?;
+        let url = did_document_url(user_did)?;
+        validate_safe_https_endpoint(&url)?;
+        let http = self.http_client()?;
+        let response = http
+            .get(url.as_str())
+            .header("accept", "application/json")
+            .send()
+            .await
+            .map_err(|e| OrchestratorError::Credential(format!("user DID resolution failed: {e}")))?
+            .error_for_status()
+            .map_err(|e| OrchestratorError::Credential(format!("user DID document unavailable: {e}")))?;
+        let doc_bytes = read_bounded_body(response, MAX_AUTHORITY_RESPONSE_BYTES).await?;
+        let pds_url = parse_did_document_pds_endpoint(user_did, &doc_bytes)?;
+        let record_url = declaration_record_url(&pds_url, user_did)?;
+        let response = http
+            .get(record_url.as_str())
+            .header("accept", "application/json")
+            .send()
+            .await
+            .map_err(|e| OrchestratorError::Credential(format!("chat declaration getRecord failed: {e}")))?;
+        let status = response.status().as_u16();
+        let body_bytes = read_bounded_body(response, MAX_AUTHORITY_RESPONSE_BYTES).await?;
+        parse_chat_declaration_response(user_did, status, &body_bytes)
     }
 
     async fn store_signing_key(&self, user_did: &str, key_data: &[u8]) -> Result<()> {
@@ -758,6 +790,276 @@ fn remove_pending_enrollment(data: &mut HashMap<String, String>, user_did: &str)
     }
 }
 
+const MAX_AUTHORITY_RESPONSE_BYTES: usize = 1024 * 1024;
+
+pub(crate) fn validate_bare_did(did: &str) -> Result<()> {
+    if did.len() < 12
+        || did.len() > 261
+        || did.contains('#')
+        || did.contains('?')
+        || did.contains(' ')
+        || did.contains('\t')
+        || did.contains('\r')
+        || did.contains('\n')
+    {
+        return Err(OrchestratorError::Credential("invalid DID format".into()));
+    }
+    if let Some(host) = did.strip_prefix("did:web:") {
+        if host.contains(':') || host.contains('/') || host.contains('%') {
+            return Err(OrchestratorError::Credential(
+                "did:web must be hostname only (no port, path, or percent encoding)".into(),
+            ));
+        }
+        let labels: Vec<&str> = host.split('.').collect();
+        if labels.len() < 2 {
+            return Err(OrchestratorError::Credential(
+                "did:web requires at least two domain labels".into(),
+            ));
+        }
+        for label in &labels {
+            if label.is_empty()
+                || label.len() > 63
+                || label.starts_with('-')
+                || label.ends_with('-')
+            {
+                return Err(OrchestratorError::Credential(
+                    "invalid domain label in did:web".into(),
+                ));
+            }
+            if !label
+                .bytes()
+                .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'-'))
+            {
+                return Err(OrchestratorError::Credential(
+                    "invalid character in did:web (lowercase alphanumeric and hyphen only)".into(),
+                ));
+            }
+        }
+        let tld = labels.last().unwrap();
+        if !tld.starts_with(|c: char| c.is_ascii_alphabetic())
+            || *tld == "localhost"
+            || *tld == "local"
+        {
+            return Err(OrchestratorError::Credential(
+                "invalid TLD in did:web".into(),
+            ));
+        }
+    } else if let Some(plc) = did.strip_prefix("did:plc:") {
+        if plc.len() != 24 || !plc.bytes().all(|b| matches!(b, b'a'..=b'z' | b'2'..=b'7')) {
+            return Err(OrchestratorError::Credential(
+                "invalid did:plc format (must be 24 base32 chars [a-z2-7])".into(),
+            ));
+        }
+    } else {
+        return Err(OrchestratorError::Credential(
+            "unsupported DID method (only did:web and did:plc are supported)".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn did_document_url(did: &str) -> Result<Url> {
+    validate_bare_did(did)?;
+    let raw = if let Some(host) = did.strip_prefix("did:web:") {
+        format!("https://{host}/.well-known/did.json")
+    } else if did.starts_with("did:plc:") {
+        format!("https://plc.directory/{did}")
+    } else {
+        return Err(OrchestratorError::Credential("unsupported DID method".into()));
+    };
+    Url::parse(&raw).map_err(|e| OrchestratorError::Credential(format!("invalid DID document URL: {e}")))
+}
+
+pub(crate) fn validate_safe_https_endpoint(url: &Url) -> Result<()> {
+    if url.scheme() != "https" {
+        return Err(OrchestratorError::Credential("endpoint must use HTTPS".into()));
+    }
+    let Some(host) = url.host_str() else {
+        return Err(OrchestratorError::Credential("endpoint must have a host".into()));
+    };
+    if host.is_empty() {
+        return Err(OrchestratorError::Credential("endpoint host is empty".into()));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(OrchestratorError::Credential("endpoint credentials forbidden".into()));
+    }
+    if url.fragment().is_some() {
+        return Err(OrchestratorError::Credential("endpoint fragment forbidden".into()));
+    }
+    let host_lower = host.to_ascii_lowercase();
+    if host_lower == "localhost"
+        || host_lower.ends_with(".localhost")
+        || host_lower.ends_with(".local")
+        || host_lower == "127.0.0.1"
+        || host_lower == "::1"
+        || host_lower.starts_with("127.")
+        || host_lower.parse::<std::net::IpAddr>().is_ok()
+    {
+        return Err(OrchestratorError::Credential(
+            "endpoint must be a public domain name".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn parse_did_document_pds_endpoint(expected_did: &str, bytes: &[u8]) -> Result<Url> {
+    let doc: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|e| OrchestratorError::Credential(format!("parse DID document: {e}")))?;
+    let doc_id = doc
+        .get("id")
+        .and_then(|id| id.as_str())
+        .ok_or_else(|| OrchestratorError::Credential("DID document missing id".into()))?;
+    if doc_id != expected_did {
+        return Err(OrchestratorError::Credential(
+            "DID document id does not match expected DID".into(),
+        ));
+    }
+    let services = doc
+        .get("service")
+        .and_then(|s| s.as_array())
+        .ok_or_else(|| OrchestratorError::Credential("DID document missing service array".into()))?;
+
+    let short_id = "#atproto_pds";
+    let full_id = format!("{expected_did}#atproto_pds");
+    let mut found = None;
+
+    for service in services {
+        let service_obj = match service.as_object() {
+            Some(obj) => obj,
+            None => continue,
+        };
+        let id = match service_obj.get("id").and_then(|v| v.as_str()) {
+            Some(id) => id,
+            None => continue,
+        };
+        if id != short_id && id != full_id.as_str() {
+            continue;
+        }
+        let service_type = service_obj.get("type").and_then(|v| v.as_str());
+        if service_type != Some("AtprotoPersonalDataServer") {
+            return Err(OrchestratorError::Credential(
+                "PDS service type must be AtprotoPersonalDataServer".into(),
+            ));
+        }
+        let endpoint_str = service_obj
+            .get("serviceEndpoint")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| OrchestratorError::Credential("PDS service missing serviceEndpoint".into()))?;
+
+        let endpoint_url = Url::parse(endpoint_str)
+            .map_err(|e| OrchestratorError::Credential(format!("invalid PDS endpoint URL: {e}")))?;
+        validate_safe_https_endpoint(&endpoint_url)?;
+        if endpoint_url.query().is_some() {
+            return Err(OrchestratorError::Credential(
+                "PDS endpoint query forbidden".into(),
+            ));
+        }
+
+        if found.is_some() {
+            return Err(OrchestratorError::Credential(
+                "ambiguous PDS services in DID document".into(),
+            ));
+        }
+        found = Some(endpoint_url);
+    }
+
+    found.ok_or_else(|| {
+        OrchestratorError::Credential(
+            "DID document has no authoritative AtprotoPersonalDataServer service".into(),
+        )
+    })
+}
+
+pub(crate) fn declaration_record_url(pds: &Url, user_did: &str) -> Result<Url> {
+    let mut url = pds.clone();
+    let base_path = url.path().trim_end_matches('/');
+    url.set_path(&format!("{base_path}/xrpc/com.atproto.repo.getRecord"));
+    url.set_query(Some(&format!(
+        "repo={user_did}&collection=blue.catbird.chat.declaration&rkey=self"
+    )));
+    Ok(url)
+}
+
+pub(crate) fn parse_chat_declaration_response(
+    user_did: &str,
+    status: u16,
+    bytes: &[u8],
+) -> Result<Option<String>> {
+    validate_bare_did(user_did)?;
+    if status == 200 {
+        let root: serde_json::Value = serde_json::from_slice(bytes)
+            .map_err(|e| OrchestratorError::Credential(format!("parse declaration response: {e}")))?;
+        let expected_uri = format!("at://{user_did}/blue.catbird.chat.declaration/self");
+        let uri = root
+            .get("uri")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| OrchestratorError::Credential("declaration response missing uri".into()))?;
+        if uri != expected_uri {
+            return Err(OrchestratorError::Credential(
+                "declaration record uri does not match expected uri".into(),
+            ));
+        }
+        let value = root
+            .get("value")
+            .and_then(|v| v.as_object())
+            .ok_or_else(|| OrchestratorError::Credential("declaration response missing value".into()))?;
+        let record_type = value
+            .get("$type")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| OrchestratorError::Credential("declaration record missing $type".into()))?;
+        if record_type != "blue.catbird.chat.declaration" {
+            return Err(OrchestratorError::Credential(
+                "declaration record $type mismatch".into(),
+            ));
+        }
+        let delivery_service = value
+            .get("deliveryService")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                OrchestratorError::Credential("declaration record missing deliveryService".into())
+            })?;
+        validate_bare_did(delivery_service)?;
+        return Ok(Some(delivery_service.to_owned()));
+    }
+
+    if status == 400 || status == 404 {
+        if let Ok(err_val) = serde_json::from_slice::<serde_json::Value>(bytes) {
+            if err_val.get("error").and_then(|v| v.as_str()) == Some("RecordNotFound") {
+                return Ok(None);
+            }
+        }
+        return Err(OrchestratorError::Credential(format!(
+            "chat declaration getRecord rejected with status {status}"
+        )));
+    }
+
+    Err(OrchestratorError::Credential(format!(
+        "chat declaration getRecord failed with status {status}"
+    )))
+}
+
+async fn read_bounded_body(mut response: reqwest::Response, max_bytes: usize) -> Result<Vec<u8>> {
+    if response.content_length().is_some_and(|len| len > max_bytes as u64) {
+        return Err(OrchestratorError::Credential(format!(
+            "response exceeds limit of {max_bytes} bytes"
+        )));
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| OrchestratorError::Credential(format!("read response chunk failed: {e}")))?
+    {
+        if bytes.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(OrchestratorError::Credential(format!(
+                "response exceeds limit of {max_bytes} bytes"
+            )));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -917,6 +1219,219 @@ mod tests {
 
         assert!(FileCredentialStore::new(path.clone()).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), malformed);
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn bare_did_validation_strictly_enforces_syntax() {
+        assert!(validate_bare_did("did:web:chat.catbird.blue").is_ok());
+        assert!(validate_bare_did("did:web:alice.example.com").is_ok());
+        assert!(validate_bare_did("did:plc:alicefixtureaaaaaaaaaaaa").is_ok());
+
+        // Rejections
+        assert!(validate_bare_did("did:web:127.0.0.1").is_err());
+        assert!(validate_bare_did("did:web:localhost").is_err());
+        assert!(validate_bare_did("did:web:api.localhost").is_err());
+        assert!(validate_bare_did("did:web:chat.catbird.blue:443").is_err());
+        assert!(validate_bare_did("did:web:chat.catbird.blue/path").is_err());
+        assert!(validate_bare_did("did:web:Chat.catbird.blue").is_err());
+        assert!(validate_bare_did("did:web:chat%2ecatbird.blue").is_err());
+        assert!(validate_bare_did("did:key:z6Mku").is_err());
+        assert!(validate_bare_did("did:plc:short").is_err());
+        assert!(validate_bare_did("did:plc:contains0digit00000000").is_err());
+        assert!(validate_bare_did("").is_err());
+        assert!(validate_bare_did("did:web:foo").is_err());
+    }
+
+    #[test]
+    fn did_document_url_construction_and_safety_checks() {
+        let web_url = did_document_url("did:web:chat.catbird.blue").unwrap();
+        assert_eq!(web_url.as_str(), "https://chat.catbird.blue/.well-known/did.json");
+        assert!(validate_safe_https_endpoint(&web_url).is_ok());
+
+        let plc_url = did_document_url("did:plc:alicefixtureaaaaaaaaaaaa").unwrap();
+        assert_eq!(
+            plc_url.as_str(),
+            "https://plc.directory/did:plc:alicefixtureaaaaaaaaaaaa"
+        );
+        assert!(validate_safe_https_endpoint(&plc_url).is_ok());
+
+        // Unsafe endpoints
+        assert!(validate_safe_https_endpoint(&Url::parse("http://chat.catbird.blue/.well-known/did.json").unwrap()).is_err());
+        assert!(validate_safe_https_endpoint(&Url::parse("https://user:pass@chat.catbird.blue/").unwrap()).is_err());
+        assert!(validate_safe_https_endpoint(&Url::parse("https://127.0.0.1/").unwrap()).is_err());
+        assert!(validate_safe_https_endpoint(&Url::parse("https://localhost/").unwrap()).is_err());
+        assert!(validate_safe_https_endpoint(&Url::parse("https://chat.catbird.blue/#fragment").unwrap()).is_err());
+    }
+
+    #[test]
+    fn did_document_pds_endpoint_resolution_and_validation() {
+        let valid_doc = serde_json::json!({
+            "id": DID,
+            "service": [
+                {
+                    "id": "#atproto_pds",
+                    "type": "AtprotoPersonalDataServer",
+                    "serviceEndpoint": "https://pds.example.com"
+                }
+            ]
+        });
+        let endpoint = parse_did_document_pds_endpoint(DID, &serde_json::to_vec(&valid_doc).unwrap()).unwrap();
+        assert_eq!(endpoint.as_str(), "https://pds.example.com/");
+
+        // Full ID format
+        let full_id_doc = serde_json::json!({
+            "id": DID,
+            "service": [
+                {
+                    "id": format!("{DID}#atproto_pds"),
+                    "type": "AtprotoPersonalDataServer",
+                    "serviceEndpoint": "https://pds.example.com"
+                }
+            ]
+        });
+        assert!(parse_did_document_pds_endpoint(DID, &serde_json::to_vec(&full_id_doc).unwrap()).is_ok());
+
+        // Mismatched doc ID
+        let mismatch_doc = serde_json::json!({
+            "id": "did:plc:otheraaaaaaaaaaaaaaaaaa",
+            "service": [
+                {
+                    "id": "#atproto_pds",
+                    "type": "AtprotoPersonalDataServer",
+                    "serviceEndpoint": "https://pds.example.com"
+                }
+            ]
+        });
+        assert!(parse_did_document_pds_endpoint(DID, &serde_json::to_vec(&mismatch_doc).unwrap()).is_err());
+
+        // Ambiguous services
+        let ambiguous_doc = serde_json::json!({
+            "id": DID,
+            "service": [
+                {
+                    "id": "#atproto_pds",
+                    "type": "AtprotoPersonalDataServer",
+                    "serviceEndpoint": "https://pds1.example.com"
+                },
+                {
+                    "id": format!("{DID}#atproto_pds"),
+                    "type": "AtprotoPersonalDataServer",
+                    "serviceEndpoint": "https://pds2.example.com"
+                }
+            ]
+        });
+        assert!(parse_did_document_pds_endpoint(DID, &serde_json::to_vec(&ambiguous_doc).unwrap()).is_err());
+
+        // Wrong service type
+        let wrong_type_doc = serde_json::json!({
+            "id": DID,
+            "service": [
+                {
+                    "id": "#atproto_pds",
+                    "type": "OtherServiceType",
+                    "serviceEndpoint": "https://pds.example.com"
+                }
+            ]
+        });
+        assert!(parse_did_document_pds_endpoint(DID, &serde_json::to_vec(&wrong_type_doc).unwrap()).is_err());
+
+        // Non-HTTPS PDS endpoint
+        let insecure_doc = serde_json::json!({
+            "id": DID,
+            "service": [
+                {
+                    "id": "#atproto_pds",
+                    "type": "AtprotoPersonalDataServer",
+                    "serviceEndpoint": "http://pds.example.com"
+                }
+            ]
+        });
+        assert!(parse_did_document_pds_endpoint(DID, &serde_json::to_vec(&insecure_doc).unwrap()).is_err());
+    }
+
+    #[test]
+    fn chat_declaration_response_parsing_and_fail_closed_semantics() {
+        let valid_record = serde_json::json!({
+            "uri": format!("at://{DID}/blue.catbird.chat.declaration/self"),
+            "cid": "bafyreie5cvv4h45feadgeuwhbcutmh6t2ceseocmxhdoo6uhnqqstx54re",
+            "value": {
+                "$type": "blue.catbird.chat.declaration",
+                "allowIncoming": "all",
+                "deliveryService": "did:web:chat.catbird.blue",
+                "protocolVersion": "1",
+                "createdAt": "2026-09-19T00:00:00Z"
+            }
+        });
+        let res = parse_chat_declaration_response(DID, 200, &serde_json::to_vec(&valid_record).unwrap()).unwrap();
+        assert_eq!(res.as_deref(), Some("did:web:chat.catbird.blue"));
+
+        // RecordNotFound on 404 => Ok(None)
+        let not_found = serde_json::json!({"error": "RecordNotFound", "message": "Record not found"});
+        assert_eq!(
+            parse_chat_declaration_response(DID, 404, &serde_json::to_vec(&not_found).unwrap()).unwrap(),
+            None
+        );
+
+        // RecordNotFound on 400 => Ok(None)
+        assert_eq!(
+            parse_chat_declaration_response(DID, 400, &serde_json::to_vec(&not_found).unwrap()).unwrap(),
+            None
+        );
+
+        // InvalidRequest on 400 => Err (fail closed!)
+        let invalid_req = serde_json::json!({"error": "InvalidRequest", "message": "Repo not found"});
+        assert!(parse_chat_declaration_response(DID, 400, &serde_json::to_vec(&invalid_req).unwrap()).is_err());
+
+        // 500 error => Err (fail closed!)
+        let server_err = serde_json::json!({"error": "InternalServerError"});
+        assert!(parse_chat_declaration_response(DID, 500, &serde_json::to_vec(&server_err).unwrap()).is_err());
+
+        // 200 with mismatched URI => Err
+        let mismatched_uri = serde_json::json!({
+            "uri": "at://did:plc:other/blue.catbird.chat.declaration/self",
+            "value": {
+                "$type": "blue.catbird.chat.declaration",
+                "deliveryService": "did:web:chat.catbird.blue"
+            }
+        });
+        assert!(parse_chat_declaration_response(DID, 200, &serde_json::to_vec(&mismatched_uri).unwrap()).is_err());
+
+        // 200 with mismatched $type => Err
+        let mismatched_type = serde_json::json!({
+            "uri": format!("at://{DID}/blue.catbird.chat.declaration/self"),
+            "value": {
+                "$type": "chat.bsky.actor.declaration",
+                "deliveryService": "did:web:chat.catbird.blue"
+            }
+        });
+        assert!(parse_chat_declaration_response(DID, 200, &serde_json::to_vec(&mismatched_type).unwrap()).is_err());
+
+        // 200 with invalid deliveryService DID => Err
+        let invalid_service = serde_json::json!({
+            "uri": format!("at://{DID}/blue.catbird.chat.declaration/self"),
+            "value": {
+                "$type": "blue.catbird.chat.declaration",
+                "deliveryService": "did:web:127.0.0.1"
+            }
+        });
+        assert!(parse_chat_declaration_response(DID, 200, &serde_json::to_vec(&invalid_service).unwrap()).is_err());
+    }
+
+    #[tokio::test]
+    async fn authority_resolver_methods_fail_closed_on_invalid_syntax_without_network() {
+        let (directory, store) = temporary_store("authority-fail-closed");
+
+        // direct_request_receipt_authority_document with invalid DID
+        assert!(store.direct_request_receipt_authority_document("did:web:127.0.0.1").await.is_err());
+        assert!(store.direct_request_receipt_authority_document("did:web:localhost").await.is_err());
+        assert!(store.direct_request_receipt_authority_document("did:other:unsupported").await.is_err());
+
+        // get_chat_declaration_authority with invalid DID
+        assert!(store.get_chat_declaration_authority("did:web:127.0.0.1").await.is_err());
+        assert!(store.get_chat_declaration_authority("not-a-did").await.is_err());
+        assert!(store.get_chat_declaration_authority("did:key:unsupported").await.is_err());
 
         let _ = std::fs::remove_dir_all(directory);
     }

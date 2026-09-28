@@ -1856,8 +1856,21 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
     // Box the legs: their deep core futures otherwise overflow the test thread stack.
     let declined = Box::pin(run_declined_leg(&gw_bin, &server_fixture_bin, &catmos_bin, &seeder_bin, &log_capture)).await?;
     let invalid = Box::pin(run_invalid_introduction_leg(&gw_bin, &server_fixture_bin, &log_capture)).await?;
-    let evidence_dir = workspace_root.join("docs/generated-artifacts/encrypted-requests/evidence/client-birdaemon");
+    let evidence_root = workspace_root.join("docs/generated-artifacts/encrypted-requests/evidence/client-birdaemon");
+    let evidence_dir = std::env::var_os("EVIDENCE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| evidence_root.clone());
+    ensure!(
+        evidence_dir.is_absolute()
+            && evidence_dir.starts_with(&evidence_root)
+            && !evidence_dir.components().any(|part| part == std::path::Component::ParentDir),
+        "bot evidence directory must stay inside the isolated row evidence root"
+    );
     std::fs::create_dir_all(&evidence_dir)?;
+    ensure!(
+        evidence_dir.canonicalize()?.starts_with(evidence_root.canonicalize()?),
+        "bot evidence directory escaped the isolated row evidence root"
+    );
     let process_leg = Box::pin(run_birdaemon_process_leg(
         &gw_bin, &server_fixture_bin, &catmos_bin, &seeder_bin, &bir_daemon_bin, &evidence_dir,
     ))
@@ -1884,6 +1897,7 @@ pub(crate) async fn run_client_birdaemon_live_scenario() -> Result<()> {
         "birDaemonBinary": {"path": bir_daemon_bin, "sha256": file_sha256(&bir_daemon_bin)?},
         "birDaemonCargoLockSha256": file_sha256(&workspace_root.join("BIRDaemon/Cargo.lock"))?,
         "catbirdMlsWorkingCopy": jj_commit("catbird-mls"),
+        "catmosCliWorkingCopy": jj_commit("catmos-cli"),
         "birDaemonWorkingCopy": jj_commit("BIRDaemon"),
         "gatewayBinarySha256": file_sha256(&gw_bin)?,
         "serverFixtureSha256": file_sha256(&server_fixture_bin)?,
