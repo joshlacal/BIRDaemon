@@ -9,57 +9,57 @@ description = "BIRD - Bluesky DM chatbot daemon using MLS encryption"
 catbird_mls = { path = "../catbird-mls", default-features = false }
 
 # Generated AT Protocol types (proper $bytes serialization)
-catbird-atproto = { path = "../catbird-atproto" }
+catbird-atproto = { git = "https://github.com/joshlacal/catbird-atproto", rev = "d3da6f7f4fce482e3255c74128a05a40001af671" }
 
 # ATProto client (jacquard) — auth, identity resolution
-jacquard = { git = "https://tangled.org/nonbinary.computer/jacquard", rev = "3287244a99262a361bd32873a871982da0a76c40", default-features = false, features = ["api_full", "dns", "cache", "reqwest-client"] }
-jacquard-common = { git = "https://tangled.org/nonbinary.computer/jacquard", rev = "3287244a99262a361bd32873a871982da0a76c40", features = ["reqwest-client"] }
-jacquard-identity = { git = "https://tangled.org/nonbinary.computer/jacquard", rev = "3287244a99262a361bd32873a871982da0a76c40", features = ["dns", "cache"] }
+jacquard = { git = "https://github.com/joshlacal/jacquard", rev = "1f5bcf1570c5978aa03d997dd7eef0b9ef25430d", version = "0.13.0", default-features = false, features = ["api_full", "dns", "cache", "reqwest-client"] }
+jacquard-common = { git = "https://github.com/joshlacal/jacquard", rev = "1f5bcf1570c5978aa03d997dd7eef0b9ef25430d", version = "0.13.0", features = ["reqwest-client"] }
+jacquard-identity = { git = "https://github.com/joshlacal/jacquard", rev = "1f5bcf1570c5978aa03d997dd7eef0b9ef25430d", version = "0.13.0", features = ["dns", "cache"] }
 
 # Async runtime
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.54.1", features = ["full"] }
 
 # HTTP client (for LLM + MLS XRPC calls)
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "stream", "rustls", "query"] }
 
 # Storage
-rusqlite = { version = "=0.37.0", features = ["bundled-sqlcipher"] }
+rusqlite = { version = "0.41.0", features = ["bundled-sqlcipher"] }
 
 # Serialization
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
 
 # Async traits
-async-trait = "0.1"
+async-trait = "0.1.92"
 
 # Logging
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 # WebSocket (for MLS event subscription)
-tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
+tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-native-roots"] }
 
 # DAG-CBOR (for WebSocket frame parsing)
-ciborium = "0.2"
+ciborium = "0.2.2"
 
 # Crypto / encoding
-base64 = "0.22"
-ed25519-dalek = "2.2"
-openmls_basic_credential = "0.5"
-openmls_traits = "0.5"
-sha2 = "0.10"
-hex = "0.4"
+base64 = "0.23.1"
+ed25519-dalek = "3.0.0"
+openmls_basic_credential = { git = "https://github.com/joshlacal/openmls", rev = "4de3b9e764f02fe148d6ba73a7c771502365f7a4", version = "=0.6.0", features = ["draft-ietf-mls-pq-ciphersuites"] }
+openmls_traits = { git = "https://github.com/joshlacal/openmls", rev = "4de3b9e764f02fe148d6ba73a7c771502365f7a4", version = "=0.6.0", features = ["draft-ietf-mls-pq-ciphersuites"] }
+sha2 = "0.11.1"
+hex = "0.4.3"
 
 # Utilities
-rand = "0.8"
-uuid = { version = "1", features = ["v4"] }
-chrono = { version = "0.4", features = ["serde"] }
-thiserror = "1.0"
-anyhow = "1.0"
-futures-util = "0.3"
-dotenvy = "0.15"
-url = "2.5"
-dirs = "5"
+rand = "0.10.3"
+uuid = { version = "1.29.0", features = ["v4"] }
+chrono = { version = "0.4.45", features = ["serde"] }
+thiserror = "2.0.21"
+anyhow = "1.0.104"
+futures-util = "0.3.34"
+dotenvy = "0.15.7"
+url = "2.5.8"
+dirs = "7.0.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-security-framework = "3.7"
+security-framework = "3.7.0"

@@ -132,6 +132,18 @@ impl SqliteStorage {
         OrchestratorError::Storage(e.to_string())
     }
 
+    fn sql_u64(value: u64) -> Result<i64> {
+        i64::try_from(value).map_err(|_| {
+            OrchestratorError::Storage("unsigned value exceeds SQLite INTEGER range".into())
+        })
+    }
+
+    fn row_u64<I: rusqlite::RowIndex>(row: &rusqlite::Row<'_>, index: I) -> rusqlite::Result<u64> {
+        let column = index.idx(row.as_ref())?;
+        let value: i64 = row.get(column)?;
+        u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(column, value))
+    }
+
     fn parse_state(s: &str) -> ConversationState {
         match s {
             "Active" => ConversationState::Active,
@@ -149,6 +161,8 @@ impl SqliteStorage {
                 since_ms: 0,
             },
             "Failed" => ConversationState::Failed,
+            "DeviceRemoved" => ConversationState::DeviceRemoved,
+            "Closed" => ConversationState::Closed,
             _ => ConversationState::Initializing,
         }
     }
@@ -162,6 +176,8 @@ impl SqliteStorage {
             ConversationState::ResetPending { .. } => "ResetPending",
             ConversationState::Quarantined { .. } => "Quarantined",
             ConversationState::Failed => "Failed",
+            ConversationState::DeviceRemoved => "DeviceRemoved",
+            ConversationState::Closed => "Closed",
         }
     }
 
@@ -182,7 +198,7 @@ impl SqliteStorage {
     fn row_to_conversation_view(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConversationView> {
         let conversation_id: String = row.get("conversation_id")?;
         let group_id: String = row.get("group_id")?;
-        let epoch: u64 = row.get("epoch")?;
+        let epoch = Self::row_u64(row, "epoch")?;
         let members_json: String = row.get("members_json")?;
         let metadata_json: Option<String> = row.get("metadata_json")?;
         let created_at: Option<String> = row.get("created_at")?;
@@ -202,6 +218,7 @@ impl SqliteStorage {
             created_at: created_at.and_then(|s| Self::parse_dt(&s)),
             updated_at: updated_at.and_then(|s| Self::parse_dt(&s)),
             sequencer_did,
+            canonical_state: None,
         })
     }
 }
@@ -244,7 +261,7 @@ impl MLSStorageBackend for SqliteStorage {
         conn.execute(
             "UPDATE conversations SET join_method = ?1, join_epoch = ?2, epoch = ?2
              WHERE conversation_id = ?3",
-            rusqlite::params![method_str, join_epoch, conversation_id],
+            rusqlite::params![method_str, Self::sql_u64(join_epoch)?, conversation_id],
         )
         .map_err(Self::map_err)?;
         Ok(())
@@ -395,8 +412,9 @@ impl MLSStorageBackend for SqliteStorage {
         authoritative_new_target: &str,
     ) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
-        let rows = conn.execute(
-            "UPDATE conversations
+        let rows = conn
+            .execute(
+                "UPDATE conversations
              SET reset_new_group_id = ?1,
                  group_id = ?1,
                  updated_at = ?2
@@ -404,15 +422,15 @@ impl MLSStorageBackend for SqliteStorage {
                AND reset_generation = ?4
                AND reset_new_group_id = ?5
                AND reset_pending = 1",
-            rusqlite::params![
-                authoritative_new_target,
-                Utc::now().to_rfc3339(),
-                conversation_id,
-                expected_generation,
-                expected_old_target,
-            ],
-        )
-        .map_err(Self::map_err)?;
+                rusqlite::params![
+                    authoritative_new_target,
+                    Utc::now().to_rfc3339(),
+                    conversation_id,
+                    expected_generation,
+                    expected_old_target,
+                ],
+            )
+            .map_err(Self::map_err)?;
         Ok(rows > 0)
     }
 
@@ -424,8 +442,9 @@ impl MLSStorageBackend for SqliteStorage {
         landed_epoch: u64,
     ) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
-        let rows = conn.execute(
-            "UPDATE conversations
+        let rows = conn
+            .execute(
+                "UPDATE conversations
              SET state = 'Active',
                  reset_pending = 0,
                  reset_new_group_id = NULL,
@@ -438,15 +457,15 @@ impl MLSStorageBackend for SqliteStorage {
                AND reset_generation = ?4
                AND reset_new_group_id = ?5
                AND reset_pending = 1",
-            rusqlite::params![
-                landed_epoch,
-                Utc::now().to_rfc3339(),
-                conversation_id,
-                expected_generation,
-                expected_new_group_id_hex,
-            ],
-        )
-        .map_err(Self::map_err)?;
+                rusqlite::params![
+                    Self::sql_u64(landed_epoch)?,
+                    Utc::now().to_rfc3339(),
+                    conversation_id,
+                    expected_generation,
+                    expected_new_group_id_hex,
+                ],
+            )
+            .map_err(Self::map_err)?;
         Ok(rows > 0)
     }
 
@@ -456,8 +475,9 @@ impl MLSStorageBackend for SqliteStorage {
         expected_generation: i32,
     ) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
-        let rows = conn.execute(
-            "UPDATE conversations
+        let rows = conn
+            .execute(
+                "UPDATE conversations
              SET reset_pending = 0,
                  reset_new_group_id = NULL,
                  reset_generation = NULL,
@@ -466,13 +486,13 @@ impl MLSStorageBackend for SqliteStorage {
              WHERE conversation_id = ?2
                AND reset_generation = ?3
                AND reset_pending = 1",
-            rusqlite::params![
-                Utc::now().to_rfc3339(),
-                conversation_id,
-                expected_generation,
-            ],
-        )
-        .map_err(Self::map_err)?;
+                rusqlite::params![
+                    Utc::now().to_rfc3339(),
+                    conversation_id,
+                    expected_generation,
+                ],
+            )
+            .map_err(Self::map_err)?;
         Ok(rows > 0)
     }
 
@@ -508,8 +528,8 @@ impl MLSStorageBackend for SqliteStorage {
                 message.sender_did,
                 message.text,
                 message.timestamp.to_rfc3339(),
-                message.epoch,
-                message.sequence_number,
+                Self::sql_u64(message.epoch)?,
+                Self::sql_u64(message.sequence_number)?,
                 message.is_own as i32,
                 delivery_json,
                 message.payload_json,
@@ -538,7 +558,7 @@ impl MLSStorageBackend for SqliteStorage {
                 .map_err(Self::map_err)?;
             let rows = stmt
                 .query_map(
-                    rusqlite::params![conversation_id, before, limit],
+                    rusqlite::params![conversation_id, Self::sql_u64(before)?, limit],
                     Self::row_to_message,
                 )
                 .map_err(Self::map_err)?;
@@ -629,7 +649,7 @@ impl MLSStorageBackend for SqliteStorage {
             rusqlite::params![
                 state.group_id,
                 state.conversation_id,
-                state.epoch,
+                Self::sql_u64(state.epoch)?,
                 members_json
             ],
         )
@@ -646,7 +666,7 @@ impl MLSStorageBackend for SqliteStorage {
             |row| {
                 let group_id: String = row.get(0)?;
                 let conversation_id: String = row.get(1)?;
-                let epoch: u64 = row.get(2)?;
+                let epoch = Self::row_u64(row, 2)?;
                 let members_json: String = row.get(3)?;
                 let members: Vec<String> = serde_json::from_str(&members_json).unwrap_or_default();
                 Ok(GroupState {
@@ -691,8 +711,8 @@ impl SqliteStorage {
         let sender_did: String = row.get("sender_did")?;
         let text: String = row.get("text")?;
         let timestamp_str: String = row.get("timestamp")?;
-        let epoch: u64 = row.get("epoch")?;
-        let sequence_number: u64 = row.get("sequence_number")?;
+        let epoch = Self::row_u64(row, "epoch")?;
+        let sequence_number = Self::row_u64(row, "sequence_number")?;
         let is_own: i32 = row.get("is_own")?;
         let delivery_json: Option<String> = row.get("delivery_status_json")?;
 
@@ -721,6 +741,33 @@ impl SqliteStorage {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn sqlite_unsigned_values_reject_negative_and_overflow() {
+        assert_eq!(SqliteStorage::sql_u64(i64::MAX as u64).unwrap(), i64::MAX);
+        assert!(SqliteStorage::sql_u64(i64::MAX as u64 + 1).is_err());
+        let conn = Connection::open_in_memory().unwrap();
+        assert_eq!(
+            conn.query_row("SELECT ?1", [i64::MAX], |row| SqliteStorage::row_u64(
+                row, 0
+            ))
+            .unwrap(),
+            i64::MAX as u64
+        );
+        assert!(conn
+            .query_row("SELECT -1", [], |row| SqliteStorage::row_u64(row, 0))
+            .is_err());
+    }
+
+    #[test]
+    fn terminal_conversation_states_survive_storage_round_trip() {
+        for state in [ConversationState::DeviceRemoved, ConversationState::Closed] {
+            assert_eq!(
+                SqliteStorage::parse_state(SqliteStorage::state_str(state.clone())),
+                state
+            );
+        }
+    }
 
     fn new_temp_storage() -> (PathBuf, SqliteStorage) {
         let path =

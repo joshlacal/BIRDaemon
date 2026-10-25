@@ -1,7 +1,7 @@
-//! MLSAPIClient implementation using PDS atproto-proxy.
+//! MLS gateway using opaque Nest authority for canonical chat requests.
 //!
-//! Routes MLS calls through the PDS with the atproto-proxy header.
-//! Uses jacquard session for automatic token refresh on expiry.
+//! Prepared device-signed requests retain their exact bytes. The separate
+//! AT Protocol repository helpers use the Jacquard session for PDS access.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -11,6 +11,7 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use catbird_mls::orchestrator::{
     decode_clean_chat_response, CanonicalOperation, CleanChatAuthContext, CleanChatSigningContext,
+    GatewayResponse, PreparedRequest,
 };
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::json;
@@ -82,12 +83,8 @@ pub struct BirdApiClient {
     authority: Option<Arc<AuthorityState>>,
     credentials: Option<Arc<FileCredentialStore>>,
     signer: Arc<Mutex<Option<Arc<dyn CleanChatRequestSigner>>>>,
-    inventory: Arc<Mutex<Option<(String, String)>>>,
-    cached_coordinates: Arc<
-        Mutex<
-            HashMap<String, catbird_atproto::blue_catbird::chat::ConversationCoordinates<String>>,
-        >,
-    >,
+    cached_coordinates:
+        Arc<Mutex<HashMap<String, catbird_atproto::blue_catbird::chat::ConversationCoordinates>>>,
     /// Stored for re-authentication when refresh token also expires.
     handle: String,
     app_password: String,
@@ -112,7 +109,6 @@ impl BirdApiClient {
             authority: None,
             credentials: None,
             signer: Arc::new(Mutex::new(None)),
-            inventory: Arc::new(Mutex::new(None)),
             cached_coordinates: Arc::new(Mutex::new(HashMap::new())),
             handle,
             app_password,
@@ -161,7 +157,7 @@ impl BirdApiClient {
     /// Get current access JWT from the jacquard session.
     async fn get_jwt(&self) -> Result<String> {
         match self.session.access_token().await {
-            Some(token) => Ok(Self::extract_jwt(token)),
+            Some(token) => Self::extract_jwt(token),
             None => {
                 // Session state lost — try to recover
                 tracing::warn!("No access token in session, attempting refresh");
@@ -176,7 +172,7 @@ impl BirdApiClient {
         match self.session.refresh().await {
             Ok(token) => {
                 tracing::info!("Session token refreshed successfully");
-                Ok(Self::extract_jwt(token))
+                Self::extract_jwt(token)
             }
             Err(e) => {
                 tracing::warn!(
@@ -184,14 +180,7 @@ impl BirdApiClient {
                     e
                 );
                 self.session
-                    .login(
-                        jacquard_common::CowStr::from(self.handle.clone()),
-                        jacquard_common::CowStr::from(self.app_password.clone()),
-                        None,
-                        None,
-                        None,
-                        None,
-                    )
+                    .login(&self.handle, &self.app_password, None, None, None, None)
                     .await
                     .map_err(|e| {
                         OrchestratorError::Api(format!("Re-authentication failed: {e}"))
@@ -201,6 +190,7 @@ impl BirdApiClient {
                     .access_token()
                     .await
                     .map(Self::extract_jwt)
+                    .transpose()?
                     .ok_or_else(|| {
                         OrchestratorError::Api("No token after re-authentication".into())
                     })
@@ -208,10 +198,15 @@ impl BirdApiClient {
         }
     }
 
-    fn extract_jwt(token: jacquard_common::AuthorizationToken<'_>) -> String {
+    fn extract_jwt(token: jacquard_common::AuthorizationToken) -> Result<String> {
         match token {
-            jacquard_common::AuthorizationToken::Bearer(s) => s.to_string(),
-            jacquard_common::AuthorizationToken::Dpop(s) => s.to_string(),
+            jacquard_common::AuthorizationToken::Bearer(token) => Ok(token.to_string()),
+            jacquard_common::AuthorizationToken::Dpop(_)
+            | jacquard_common::AuthorizationToken::Delegation(_) => {
+                Err(OrchestratorError::Credential(
+                    "PDS repository helpers require a bearer credential session".into(),
+                ))
+            }
         }
     }
 
@@ -354,22 +349,6 @@ impl BirdApiClient {
             .map_err(|e| OrchestratorError::Api(format!("JSON decode: {e}")))
     }
 
-    /// Get a v2 subscription ticket through Nest. The returned endpoint is
-    /// opened directly by the WebSocket client; Nest explicitly refuses to
-    /// proxy `subscribeEvents` upgrades.
-    pub async fn get_subscription_ticket(&self) -> Result<(String, String)> {
-        let (inventory_session_id, event_cursor) =
-            self.inventory.lock().unwrap().clone().ok_or_else(|| {
-                OrchestratorError::Api(
-                    "v2 subscription ticket requires a current inventory session and cursor".into(),
-                )
-            })?;
-        let (nest, authority, snapshot) = self.authority_for_call()?;
-        nest.get_subscription_ticket(&snapshot, &inventory_session_id, &event_cursor)
-            .await
-            .map_err(|error| self.map_authority_error(&authority, &snapshot, error))
-    }
-
     fn authority_for_call(
         &self,
     ) -> Result<(Arc<NestClient>, Arc<AuthorityState>, AuthoritySnapshot)> {
@@ -405,11 +384,27 @@ impl BirdApiClient {
         OrchestratorError::Api("clean-chat authority was invalidated".into())
     }
 
-    async fn canonical_get_response(&self, path: &str) -> Result<Vec<u8>> {
+    async fn canonical_get_response(
+        &self,
+        expected: &AuthoritySnapshot,
+        path: &str,
+    ) -> Result<Vec<u8>> {
         let (nest, authority, snapshot) = self.authority_for_call()?;
-        nest.get_clean_chat_bytes(&snapshot, path)
+        if &snapshot != expected {
+            return Err(OrchestratorError::Credential(
+                "clean-chat authority changed before read".into(),
+            ));
+        }
+        let body = nest
+            .get_clean_chat_bytes(&snapshot, path)
             .await
-            .map_err(|error| self.map_authority_error(&authority, &snapshot, error))
+            .map_err(|error| self.map_authority_error(&authority, &snapshot, error))?;
+        if authority.snapshot().as_ref() != Some(&snapshot) {
+            return Err(OrchestratorError::Credential(
+                "clean-chat authority changed during read".into(),
+            ));
+        }
+        Ok(body)
     }
 
     async fn get_canonical_conversations(
@@ -422,24 +417,18 @@ impl BirdApiClient {
                 "getConversations limit must be positive".into(),
             ));
         }
-        let path = canonical_get_conversations_path(limit, cursor);
-        let body = self.canonical_get_response(&path).await?;
+        let (_, _, snapshot) = self.authority_for_call()?;
+        let path = canonical_get_conversations_path(snapshot.device_id(), limit, cursor);
+        let body = self.canonical_get_response(&snapshot, &path).await?;
         let decoded = decode_clean_chat_response(CanonicalOperation::GetConversations.into(), body)
             .map_err(|e| {
                 OrchestratorError::Api(format!("Canonical getConversations decode: {e}"))
             })?;
-        let output: catbird_atproto::blue_catbird::chat::get_conversations::GetConversationsOutput<
-            String,
-        > = serde_json::from_slice(&decoded)
-            .map_err(|e| OrchestratorError::Api(format!("Canonical getConversations JSON: {e}")))?;
+        let output: catbird_atproto::blue_catbird::chat::get_conversations::GetConversationsOutput =
+            serde_json::from_slice(&decoded).map_err(|e| {
+                OrchestratorError::Api(format!("Canonical getConversations JSON: {e}"))
+            })?;
 
-        {
-            let mut inventory = self.inventory.lock().unwrap();
-            *inventory = Some((
-                output.inventory_session_id.to_string(),
-                output.snapshot_event_cursor.to_string(),
-            ));
-        }
         {
             let mut coords_map = self.cached_coordinates.lock().unwrap();
             for item in &output.items {
@@ -466,7 +455,7 @@ impl BirdApiClient {
             .collect::<Result<Vec<_>>>()?;
         Ok(ConversationListPage {
             conversations,
-            cursor: output.next_page_cursor,
+            cursor: output.next_page_cursor.map(|cursor| cursor.to_string()),
         })
     }
 
@@ -487,8 +476,9 @@ impl BirdApiClient {
                 "getEntries limit must be positive".into(),
             ));
         }
-        let path = canonical_get_entries_path(convo_id, after_seq, limit);
-        let body = self.canonical_get_response(&path).await?;
+        let (_, _, snapshot) = self.authority_for_call()?;
+        let path = canonical_get_entries_path(snapshot.device_id(), convo_id, after_seq, limit);
+        let body = self.canonical_get_response(&snapshot, &path).await?;
         let decoded = decode_clean_chat_response(CanonicalOperation::GetEntries.into(), body)
             .map_err(|e| OrchestratorError::Api(format!("Canonical getEntries decode: {e}")))?;
         let output: catbird_atproto::blue_catbird::chat::get_entries::GetEntriesOutput<String> =
@@ -498,11 +488,15 @@ impl BirdApiClient {
         let envelopes = output
             .entries
             .into_iter()
-            .filter_map(|entry| canonical_entry_envelope(entry, convo_id))
+            .map(|entry| canonical_entry_envelope(entry, convo_id))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
             .filter(|(kind, envelope)| {
                 let type_matches = match message_type {
                     Some("app") => *kind == CanonicalEntryKind::Application,
                     Some("commit") => *kind == CanonicalEntryKind::Commit,
+                    Some("control") => *kind == CanonicalEntryKind::Control,
                     _ => true,
                 };
                 let epoch_matches = from_epoch
@@ -520,9 +514,14 @@ impl BirdApiClient {
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
-fn canonical_get_conversations_path(limit: u32, cursor: Option<&str>) -> String {
+fn canonical_get_conversations_path(
+    actor_device_id: &str,
+    limit: u32,
+    cursor: Option<&str>,
+) -> String {
     let mut query = url::form_urlencoded::Serializer::new(String::new());
     query.append_pair("limit", &limit.to_string());
+    query.append_pair("actorDeviceId", actor_device_id);
     if let Some(cursor) = cursor {
         query.append_pair("pageCursor", cursor);
     }
@@ -532,16 +531,22 @@ fn canonical_get_conversations_path(limit: u32, cursor: Option<&str>) -> String 
     )
 }
 
-fn canonical_get_entries_path(convo_id: &str, after_seq: i64, limit: u32) -> String {
+fn canonical_get_entries_path(
+    actor_device_id: &str,
+    convo_id: &str,
+    after_seq: i64,
+    limit: u32,
+) -> String {
     let mut query = url::form_urlencoded::Serializer::new(String::new());
     query.append_pair("afterSeq", &after_seq.to_string());
+    query.append_pair("actorDeviceId", actor_device_id);
     query.append_pair("conversationId", convo_id);
     query.append_pair("limit", &limit.to_string());
     format!("/xrpc/blue.catbird.chat.getEntries?{}", query.finish())
 }
 
 fn canonical_conversation_view(
-    state: &catbird_atproto::blue_catbird::chat::ConversationState<String>,
+    state: &catbird_atproto::blue_catbird::chat::ConversationState,
 ) -> Result<ConversationView> {
     let coordinates = &state.coordinates;
     let members = state
@@ -557,6 +562,7 @@ fn canonical_conversation_view(
         })
         .collect();
     Ok(ConversationView {
+        canonical_state: Some(state.clone()),
         group_id: hex::encode(coordinates.group_id.as_ref()),
         conversation_id: coordinates.conversation_id.to_string(),
         epoch: coordinates.epoch.max(0) as u64,
@@ -572,49 +578,25 @@ fn canonical_conversation_view(
 enum CanonicalEntryKind {
     Application,
     Commit,
+    Control,
 }
 
 fn canonical_entry_envelope(
     entry: catbird_atproto::blue_catbird::chat::ConversationEntry<String>,
     requested_convo_id: &str,
-) -> Option<(CanonicalEntryKind, IncomingEnvelope)> {
-    match entry {
-        catbird_atproto::blue_catbird::chat::ConversationEntry::ApplicationEntry(entry) => {
-            let body = &entry.signed_request.body;
-            Some((
-                CanonicalEntryKind::Application,
-                IncomingEnvelope {
-                    conversation_id: entry.conversation_id.to_string(),
-                    sender_did: body.actor_did.to_string(),
-                    ciphertext: body.application_message.bytes.to_vec(),
-                    timestamp: parse_dt(&entry.received_at.to_string()).unwrap_or_else(Utc::now),
-                    server_message_id: Some(entry.entry_id.to_string()),
-                    server_epoch: Some(body.prior.epoch.max(0) as u64),
-                },
-            ))
-        }
-        catbird_atproto::blue_catbird::chat::ConversationEntry::CommitEntry(entry) => {
-            let body = &entry.signed_request.body;
-            Some((
-                CanonicalEntryKind::Commit,
-                IncomingEnvelope {
-                    conversation_id: entry.conversation_id.to_string(),
-                    sender_did: body.actor_did.to_string(),
-                    ciphertext: body.commit.bytes.to_vec(),
-                    timestamp: parse_dt(&entry.received_at.to_string()).unwrap_or_else(Utc::now),
-                    server_message_id: Some(entry.entry_id.to_string()),
-                    server_epoch: Some(body.next.epoch.max(0) as u64),
-                },
-            ))
-        }
-        _ => {
-            tracing::debug!(
-                conversation_id = requested_convo_id,
-                "Ignoring canonical control entry without MLS ciphertext"
-            );
-            None
-        }
-    }
+) -> Result<Option<(CanonicalEntryKind, IncomingEnvelope)>> {
+    use catbird_atproto::blue_catbird::chat::ConversationEntry;
+    let kind = match &entry {
+        ConversationEntry::ApplicationEntry(_) => CanonicalEntryKind::Application,
+        ConversationEntry::CommitEntry(_)
+        | ConversationEntry::LeafRecoveryFulfillmentEntry(_)
+        | ConversationEntry::LeaveCommitFulfillmentEntry(_) => CanonicalEntryKind::Commit,
+        _ => CanonicalEntryKind::Control,
+    };
+    let value = serde_json::to_value(entry)
+        .map_err(|error| OrchestratorError::Api(format!("encode canonical entry: {error}")))?;
+    IncomingEnvelope::from_canonical_entry(&value, requested_convo_id)
+        .map(|envelope| envelope.map(|envelope| (kind, envelope)))
 }
 #[cfg(test)]
 fn canonical_entry_server_epoch(value: &serde_json::Value) -> Option<u64> {
@@ -647,85 +629,6 @@ fn parse_u64(v: &serde_json::Value, key: &str) -> u64 {
         .unwrap_or(0)
 }
 
-fn parse_conversation(v: &serde_json::Value) -> ConversationView {
-    let members = v
-        .get("members")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|m| {
-                    let did = m
-                        .get("did")
-                        .or(m.get("userDid"))
-                        .and_then(|v| v.as_str())?
-                        .to_string();
-                    let is_admin = m.get("isAdmin").and_then(|v| v.as_bool()).unwrap_or(false);
-                    Some(MemberView {
-                        did,
-                        role: if is_admin {
-                            MemberRole::Admin
-                        } else {
-                            MemberRole::Member
-                        },
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let metadata_obj = v.get("metadata");
-    let name = metadata_obj
-        .and_then(|m| m.get("name"))
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let description = metadata_obj
-        .and_then(|m| m.get("description"))
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-
-    let metadata = if name.is_some() || description.is_some() {
-        Some(ConversationMetadata {
-            name,
-            description,
-            avatar_url: None,
-        })
-    } else {
-        None
-    };
-
-    let group_id = v
-        .get("groupId")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let conversation_id = v
-        .get("conversationId")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| group_id.clone());
-
-    ConversationView {
-        group_id,
-        conversation_id,
-        epoch: parse_u64(v, "epoch"),
-        members,
-        metadata,
-        created_at: v
-            .get("createdAt")
-            .and_then(|v| v.as_str())
-            .and_then(parse_dt),
-        updated_at: v
-            .get("updatedAt")
-            .and_then(|v| v.as_str())
-            .and_then(parse_dt),
-        // WS-4 rung 2 (ADR-010 D4): optional on the wire; older servers omit it.
-        sequencer_did: v
-            .get("sequencerDid")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
-    }
-}
-
 // ── MLSAPIClient implementation ─────────────────────────────────────────
 
 #[async_trait]
@@ -738,62 +641,70 @@ impl MLSAPIClient for BirdApiClient {
         Some(self.did.clone())
     }
 
+    async fn submit_prepared_request(&self, request: PreparedRequest) -> Result<GatewayResponse> {
+        let expected_path = request.operation.path();
+        if request.path.split('?').next() != Some(expected_path) {
+            return Err(OrchestratorError::Api(
+                "prepared clean-chat route mismatch".into(),
+            ));
+        }
+        let expected_method = match request.operation {
+            CanonicalOperation::SubscribeEvents | CanonicalOperation::UploadBlob => {
+                return Err(OrchestratorError::Api(
+                    "operation requires its dedicated streaming transport".into(),
+                ));
+            }
+            CanonicalOperation::GetConversations
+            | CanonicalOperation::GetBlob
+            | CanonicalOperation::GetBlobUsage
+            | CanonicalOperation::GetConversationState
+            | CanonicalOperation::GetDevices
+            | CanonicalOperation::GetDeviceKey
+            | CanonicalOperation::GetDirectRequestOutcome
+            | CanonicalOperation::GetEntries
+            | CanonicalOperation::GetLeafRecoveryInbox
+            | CanonicalOperation::GetOwnDevices
+            | CanonicalOperation::GetPendingWelcomes => "GET",
+            _ => "POST",
+        };
+        if request.method != expected_method
+            || (expected_method == "POST" && request.body.is_none())
+            || (expected_method == "GET" && request.body.is_some())
+        {
+            return Err(OrchestratorError::Api(
+                "prepared clean-chat method/body mismatch".into(),
+            ));
+        }
+        let (nest, authority, snapshot) = self.authority_for_call()?;
+        let method = if expected_method == "GET" {
+            reqwest::Method::GET
+        } else {
+            reqwest::Method::POST
+        };
+        let response = nest
+            .submit_clean_chat_request(&snapshot, method, &request.path, request.body)
+            .await
+            .map_err(|error| self.map_authority_error(&authority, &snapshot, error))?;
+        if matches!(response.status, 401 | 403) {
+            authority
+                .invalidate_if_matches(&snapshot, InvalidationReason::Unauthorized)
+                .map_err(|_| {
+                    OrchestratorError::Credential("could not persist authority invalidation".into())
+                })?;
+        } else if authority.snapshot().as_ref() != Some(&snapshot) {
+            return Err(OrchestratorError::Credential(
+                "clean-chat authority changed during request".into(),
+            ));
+        }
+        Ok(response)
+    }
+
     async fn get_conversations(
         &self,
         limit: u32,
         cursor: Option<&str>,
     ) -> Result<ConversationListPage> {
         self.get_canonical_conversations(limit, cursor).await
-    }
-
-    async fn create_conversation(
-        &self,
-        group_id: &str,
-        initial_members: Option<&[String]>,
-        metadata: Option<&ConversationMetadata>,
-        _commit_data: Option<&[u8]>,
-        welcome_data: Option<&[u8]>,
-    ) -> Result<CreateConversationResult> {
-        let mut input = json!({
-            "groupId": group_id,
-            "cipherSuite": "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
-            "idempotencyKey": uuid::Uuid::new_v4().to_string(),
-        });
-        if let Some(members) = initial_members {
-            input["initialMembers"] =
-                serde_json::Value::Array(members.iter().map(|d| json!(d)).collect());
-        }
-        if let Some(m) = metadata {
-            let mut meta = serde_json::Map::new();
-            if let Some(name) = &m.name {
-                meta.insert("name".into(), json!(name));
-            }
-            if let Some(desc) = &m.description {
-                meta.insert("description".into(), json!(desc));
-            }
-            input["metadata"] = serde_json::Value::Object(meta);
-        }
-        if let Some(welcome) = welcome_data {
-            input["welcomeMessage"] = json!(B64.encode(welcome));
-        }
-
-        let output = self
-            .post("blue.catbird.chat.createConversation", &input)
-            .await?;
-
-        Ok(CreateConversationResult {
-            conversation: parse_conversation(&output),
-            commit_data: None,
-            welcome_data: None,
-        })
-    }
-
-    async fn leave_conversation(&self, convo_id: &str) -> Result<()> {
-        self.post_void(
-            "blue.catbird.chat.requestLeave",
-            &json!({ "convoId": convo_id }),
-        )
-        .await
     }
 
     async fn get_messages(
@@ -809,76 +720,150 @@ impl MLSAPIClient for BirdApiClient {
             .await
     }
 
-    async fn add_members(
+    async fn get_key_packages(
         &self,
-        convo_id: &str,
-        member_dids: &[String],
-        commit_data: &[u8],
-        welcome_data: Option<&[u8]>,
-    ) -> Result<AddMembersServerResult> {
-        let mut input = json!({
-            "action": "addMembers",
-            "convoId": convo_id,
-            "memberDids": member_dids,
-            "commit": B64.encode(commit_data),
-            "idempotencyKey": uuid::Uuid::new_v4().to_string(),
-        });
-        if let Some(welcome) = welcome_data {
-            input["welcome"] = json!(B64.encode(welcome));
-        }
+        _actor_device_id: &str,
+        _dids: &[String],
+    ) -> Result<Vec<KeyPackageRef>> {
+        Err(OrchestratorError::Api(
+            "raw KeyPackage lookup is unavailable in the canonical chat protocol".into(),
+        ))
+    }
 
-        let output = self
-            .post("blue.catbird.chat.submitTransition", &input)
-            .await?;
-
-        Ok(AddMembersServerResult {
-            success: output
-                .get("success")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true),
-            new_epoch: parse_u64(&output, "newEpoch"),
-            receipt: None,
+    async fn get_key_package_stats(&self) -> Result<KeyPackageStats> {
+        let (_, _, snapshot) = self.authority_for_call()?;
+        let devices = self.list_devices(snapshot.device_id()).await?;
+        let device = devices
+            .iter()
+            .find(|device| device.device_id == snapshot.device_id())
+            .ok_or_else(|| {
+                OrchestratorError::Api("admitted device missing from own-device inventory".into())
+            })?;
+        let available = device.available_package_count.ok_or_else(|| {
+            OrchestratorError::Api("own-device inventory is missing key-package counts".into())
+        })?;
+        let reserved = device.reserved_package_count.ok_or_else(|| {
+            OrchestratorError::Api("own-device inventory is missing key-package counts".into())
+        })?;
+        Ok(KeyPackageStats {
+            available,
+            total: available.saturating_add(reserved),
         })
     }
 
-    async fn remove_members(
+    async fn sync_key_packages(
         &self,
-        convo_id: &str,
-        member_dids: &[String],
-        commit_data: &[u8],
-    ) -> Result<()> {
-        for did in member_dids {
-            self.post_void(
-                "blue.catbird.chat.requestLeave",
-                &json!({
-                    "convoId": convo_id,
-                    "commit": B64.encode(commit_data),
-                    "targetDid": did,
-                }),
-            )
-            .await?;
-        }
-        Ok(())
-    }
-    async fn send_message(
-        &self,
-        convo_id: &str,
-        ciphertext: &[u8],
-        epoch: u64,
-    ) -> Result<SendMessageResponse> {
-        let msg_id = uuid::Uuid::new_v4().to_string();
-        self.send_message_with_id(convo_id, ciphertext, epoch, &msg_id)
-            .await
+        _local_hashes: &[String],
+        _device_id: &str,
+    ) -> Result<KeyPackageSyncResult> {
+        Err(OrchestratorError::Api(
+            "key-package hash reconciliation is unavailable in the canonical chat protocol".into(),
+        ))
     }
 
-    async fn send_message_with_id(
+    async fn list_devices(&self, actor_device_id: &str) -> Result<Vec<DeviceInfo>> {
+        let (_, _, snapshot) = self.authority_for_call()?;
+        if snapshot.device_id() != actor_device_id {
+            return Err(OrchestratorError::Credential(
+                "own-device query does not match admitted device".into(),
+            ));
+        }
+        let mut devices = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = std::collections::HashSet::new();
+        loop {
+            let path = {
+                let mut query = url::form_urlencoded::Serializer::new(String::new());
+                query
+                    .append_pair("actorDeviceId", actor_device_id)
+                    .append_pair("limit", "100");
+                if let Some(cursor) = &cursor {
+                    query.append_pair("pageCursor", cursor);
+                }
+                format!("/xrpc/blue.catbird.chat.getOwnDevices?{}", query.finish())
+            };
+            let body = self.canonical_get_response(&snapshot, &path).await?;
+            let output: catbird_atproto::blue_catbird::chat::get_own_devices::GetOwnDevicesOutput<
+                String,
+            > = serde_json::from_slice(&body)
+                .map_err(|e| OrchestratorError::Api(format!("decode own-device inventory: {e}")))?;
+            for item in output.items {
+                let device = item.device;
+                let available = u32::try_from(device.available_package_count).map_err(|_| {
+                    OrchestratorError::Api("invalid available key-package count".into())
+                })?;
+                let reserved = u32::try_from(device.reserved_package_count).map_err(|_| {
+                    OrchestratorError::Api("invalid reserved key-package count".into())
+                })?;
+                if available
+                    .checked_add(reserved)
+                    .is_none_or(|total| total > 1000)
+                {
+                    return Err(OrchestratorError::Api(
+                        "own-device key-package counts exceed the protocol limit".into(),
+                    ));
+                }
+                devices.push(DeviceInfo {
+                    device_id: device.device_id.to_string(),
+                    mls_did: format!("{}#{}", snapshot.actor_did(), device.device_id),
+                    device_uuid: device.device_id.to_string(),
+                    created_at: parse_dt(&device.created_at.to_string()),
+                    key_id: Some(device.key_id.to_string()),
+                    signature_public_key: Some(device.signature_public_key.to_vec()),
+                    auth_generation: Some(device.auth_generation),
+                    status: Some(device.status.to_string()),
+                    available_package_count: Some(available),
+                    reserved_package_count: Some(reserved),
+                });
+            }
+            if !output.has_more {
+                break;
+            }
+            let next = output.next_page_cursor.ok_or_else(|| {
+                OrchestratorError::Api("own-device inventory omitted continuation cursor".into())
+            })?;
+            if !seen_cursors.insert(next.clone()) {
+                return Err(OrchestratorError::Api(
+                    "own-device inventory repeated continuation cursor".into(),
+                ));
+            }
+            cursor = Some(next);
+        }
+        Ok(devices)
+    }
+
+    async fn get_group_info(&self, _convo_id: &str) -> Result<Vec<u8>> {
+        Err(OrchestratorError::Api(
+            "raw GroupInfo lookup is unavailable in the canonical chat protocol".into(),
+        ))
+    }
+
+    async fn get_welcome(&self, _convo_id: &str) -> Result<Vec<u8>> {
+        Err(OrchestratorError::Api(
+            "Welcome consumption requires a durable join and canonical acknowledgement".into(),
+        ))
+    }
+
+    async fn get_group_metadata_blob(
+        &self,
+        _convo_id: &str,
+        _group_id_hex: &str,
+        blob_locator: &str,
+    ) -> Result<Vec<u8>> {
+        self.get_blob(blob_locator).await
+    }
+}
+
+impl BirdApiClient {
+    #[cfg(test)]
+    pub(crate) async fn send_message_with_id(
         &self,
         convo_id: &str,
         ciphertext: &[u8],
         epoch: u64,
         msg_id: &str,
     ) -> Result<SendMessageResponse> {
-        let (nest, authority, snapshot) = self.authority_for_call()?;
+        let (_, _, snapshot) = self.authority_for_call()?;
         let signer = {
             let s = self.signer.lock().unwrap();
             s.clone().ok_or_else(|| {
@@ -922,7 +907,6 @@ impl MLSAPIClient for BirdApiClient {
         let signing_context = CleanChatSigningContext {
             actor_did: snapshot.actor_did().to_string(),
             device_id: snapshot.device_id().to_string(),
-            dpop_jkt: snapshot.dpop_jkt().to_string(),
             auth_generation: Some(snapshot.auth_generation()),
         };
 
@@ -930,18 +914,14 @@ impl MLSAPIClient for BirdApiClient {
             .prepare_signed_request(signing_context, CanonicalOperation::SendMessage, body_bytes)
             .await?;
 
-        let request_body = prepared_request
-            .body
-            .ok_or_else(|| OrchestratorError::Api("Empty signed request body".into()))?;
-
-        let response_bytes = nest
-            .post_clean_chat_signed_request(
-                &snapshot,
-                "/xrpc/blue.catbird.chat.sendMessage",
-                request_body,
-            )
-            .await
-            .map_err(|error| self.map_authority_error(&authority, &snapshot, error))?;
+        let response = self.submit_prepared_request(prepared_request).await?;
+        if !(200..300).contains(&response.status) {
+            return Err(OrchestratorError::ServerError {
+                status: response.status,
+                body: String::from_utf8_lossy(&response.body).into_owned(),
+            });
+        }
+        let response_bytes = response.body;
 
         let decoded =
             decode_clean_chat_response(CanonicalOperation::SendMessage.into(), response_bytes)
@@ -955,306 +935,6 @@ impl MLSAPIClient for BirdApiClient {
             message_id: output.entry.entry_id.to_string(),
             seq: output.entry.seq as u64,
             epoch: output.entry.signed_request.body.prior.epoch.max(0) as u64,
-        })
-    }
-
-    async fn publish_key_package(
-        &self,
-        key_package: &[u8],
-        cipher_suite: &str,
-        expires_at: &str,
-        device_id: Option<&str>,
-    ) -> Result<()> {
-        use catbird_atproto::blue_catbird::chat::replenish_key_packages;
-
-        let body = json!({
-            "keyPackages": [{
-                "cipherSuite": cipher_suite,
-                "expiresAt": expires_at,
-                "data": B64.encode(key_package),
-            }],
-            "deviceId": device_id,
-        });
-
-        self.post_void("blue.catbird.chat.replenishKeyPackages", &body)
-            .await
-    }
-
-    async fn get_key_packages(&self, dids: &[String]) -> Result<Vec<KeyPackageRef>> {
-        let dids_str = dids.join(",");
-        let output = self
-            .get(
-                "blue.catbird.chat.getKeyPackages",
-                &[("dids", dids_str.as_str())],
-            )
-            .await?;
-
-        let kps = output
-            .get("keyPackages")
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| OrchestratorError::Api("missing keyPackages".into()))?;
-
-        Ok(kps
-            .iter()
-            .filter_map(|kp| {
-                let did = kp.get("did").and_then(|v| v.as_str())?.to_string();
-                let kp_data = B64
-                    .decode(kp.get("keyPackage").and_then(|v| v.as_str())?)
-                    .ok()?;
-                let hash = kp
-                    .get("keyPackageHash")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-                let cipher_suite = kp
-                    .get("cipherSuite")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                Some(KeyPackageRef {
-                    did,
-                    key_package_data: kp_data,
-                    hash,
-                    cipher_suite,
-                })
-            })
-            .collect())
-    }
-
-    async fn get_key_package_stats(&self) -> Result<KeyPackageStats> {
-        let output = self
-            .get(
-                "blue.catbird.chat.getDevices",
-                &[("include", "stats")],
-            )
-            .await?;
-
-        let stats = output
-            .get("stats")
-            .and_then(|v| v.as_object())
-            .ok_or_else(|| OrchestratorError::Api("missing stats".into()))?;
-
-        let parse_u32 = |key: &str| -> u32 {
-            stats
-                .get(key)
-                .and_then(|v| {
-                    v.as_u64()
-                        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-                })
-                .unwrap_or(0) as u32
-        };
-
-        let available = parse_u32("available");
-        let total = if parse_u32("total") > 0 {
-            parse_u32("total")
-        } else {
-            parse_u32("published").max(available)
-        };
-
-        Ok(KeyPackageStats { available, total })
-    }
-
-    async fn sync_key_packages(
-        &self,
-        _local_hashes: &[String],
-        _device_id: &str,
-    ) -> Result<KeyPackageSyncResult> {
-        // Not implemented on server yet
-        Ok(KeyPackageSyncResult {
-            orphaned_count: 0,
-            deleted_count: 0,
-        })
-    }
-
-    async fn register_device(
-        &self,
-        device_uuid: &str,
-        device_name: &str,
-        _mls_did: &str,
-        signature_key: &[u8],
-        key_packages: &[Vec<u8>],
-    ) -> Result<DeviceInfo> {
-        use catbird_atproto::blue_catbird::chat::enroll_device;
-
-        let kp_items: Vec<serde_json::Value> = key_packages
-            .iter()
-            .map(|kp| {
-                let expires_str = (Utc::now() + chrono::Duration::days(90)).to_rfc3339();
-                json!({
-                    "cipherSuite": "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
-                    "expiresAt": expires_str,
-                    "data": B64.encode(kp),
-                })
-            })
-            .collect();
-
-        let body = json!({
-            "deviceUuid": device_uuid,
-            "deviceName": device_name,
-            "signaturePublicKey": { "$bytes": B64.encode(signature_key) },
-            "keyPackages": kp_items,
-        });
-
-        let output = self
-            .post("blue.catbird.chat.enrollDevice", &body)
-            .await?;
-
-        Ok(DeviceInfo {
-            device_id: output
-                .get("deviceId")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            mls_did: output
-                .get("mlsDid")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            device_uuid: device_uuid.to_string(),
-            created_at: None,
-        })
-    }
-
-    async fn list_devices(&self) -> Result<Vec<DeviceInfo>> {
-        let output = self.get("blue.catbird.chat.getDevices", &[]).await?;
-
-        let devices = output
-            .get("devices")
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| OrchestratorError::Api("missing devices".into()))?;
-
-        Ok(devices
-            .iter()
-            .map(|d| DeviceInfo {
-                device_id: d
-                    .get("deviceId")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                mls_did: d
-                    .get("credentialDid")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                device_uuid: d
-                    .get("deviceUuid")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                created_at: d
-                    .get("registeredAt")
-                    .and_then(|v| v.as_str())
-                    .and_then(parse_dt),
-            })
-            .collect())
-    }
-
-    async fn remove_device(&self, device_id: &str) -> Result<()> {
-        use catbird_atproto::blue_catbird::chat::revoke_device;
-
-        let body = json!({
-            "deviceId": device_id,
-        });
-
-        self.post_void("blue.catbird.chat.revokeDevice", &body)
-            .await
-    }
-
-    async fn publish_group_info(&self, convo_id: &str, group_info: &[u8]) -> Result<()> {
-        self.post_void(
-            "blue.catbird.chat.submitTransition",
-            &json!({
-                "action": "updateGroupInfo",
-                "convoId": convo_id,
-                "groupInfo": B64.encode(group_info),
-            }),
-        )
-        .await
-    }
-
-    async fn get_group_info(&self, convo_id: &str) -> Result<Vec<u8>> {
-        let output = self
-            .get(
-                "blue.catbird.chat.getConversationState",
-                &[("convoId", convo_id), ("include", "groupInfo,epoch")],
-            )
-            .await?;
-
-        let b64 = output
-            .get("groupInfo")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| OrchestratorError::Api("missing groupInfo".into()))?;
-        B64.decode(b64)
-            .map_err(|e| OrchestratorError::Api(e.to_string()))
-    }
-
-    async fn get_welcome(&self, convo_id: &str) -> Result<Vec<u8>> {
-        let output = self
-            .get(
-                "blue.catbird.chat.getConversationState",
-                &[("convoId", convo_id), ("include", "welcome")],
-            )
-            .await?;
-
-        let b64 = output
-            .get("welcome")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| OrchestratorError::ServerError {
-                status: 404,
-                body: "No welcome available for this conversation".to_string(),
-            })?;
-        B64.decode(b64)
-            .map_err(|e| OrchestratorError::Api(e.to_string()))
-    }
-
-    async fn report_recovery_failure(
-        &self,
-        convo_id: &str,
-        failure_type: &str,
-        epoch_authenticator: Option<&str>,
-        failure_mode: Option<&str>,
-    ) -> Result<()> {
-        let body = build_report_recovery_failure_body(
-            convo_id,
-            failure_type,
-            epoch_authenticator,
-            failure_mode,
-        );
-
-        self.post_void("blue.catbird.chat.requestLeafRecovery", &body)
-            .await
-    }
-
-    async fn process_external_commit(
-        &self,
-        convo_id: &str,
-        commit_data: &[u8],
-        group_info: Option<&[u8]>,
-        confirmation_tag: Option<&str>,
-    ) -> Result<ProcessExternalCommitResult> {
-        let mut input = json!({
-            "action": "externalCommit",
-            "convoId": convo_id,
-            "commit": B64.encode(commit_data),
-        });
-        if let Some(gi) = group_info {
-            input["groupInfo"] = json!(B64.encode(gi));
-        }
-        if let Some(tag) = confirmation_tag {
-            input["confirmationTag"] = json!(tag);
-        }
-
-        let output = self
-            .post("blue.catbird.chat.submitTransition", &input)
-            .await?;
-
-        Ok(ProcessExternalCommitResult {
-            epoch: parse_u64(&output, "newEpoch"),
-            rejoined_at: output
-                .get("rejoinedAt")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            receipt: None,
         })
     }
 }
@@ -1275,9 +955,7 @@ impl BirdApiClient {
     /// Mirrors `MLSDeviceRecordService.ensureDeviceRecordPublished` in CatbirdMLSCore.
     pub async fn ensure_device_record_published(&self, signature_public_key: &[u8]) -> Result<()> {
         // Check if a device record with this key already exists
-        let existing = self
-            .list_repo_records("blue.catbird.chat.device")
-            .await?;
+        let existing = self.list_repo_records("blue.catbird.chat.device").await?;
         let our_key_b64 = B64.encode(signature_public_key);
 
         for record in &existing {
@@ -1487,7 +1165,7 @@ fn build_application_send_body(
         "blobBindings": [],
         "applicationMessage": {
             "bytes": {"$bytes": B64.encode(ciphertext)},
-            "sha256": ciphertext_sha256.to_vec(),
+            "sha256": {"$bytes": B64.encode(ciphertext_sha256)},
             "framing": "mlsMessage",
             "contentType": "privateMessageApplication"
         },
@@ -1503,11 +1181,11 @@ fn build_application_send_body(
         },
         "aad": {
             "protocolVersion": "1",
-            "conversationId": convo_uuid.as_bytes().to_vec(),
+            "conversationId": {"$bytes": B64.encode(convo_uuid.as_bytes())},
             "generation": auth_generation,
-            "messageId": msg_uuid.as_bytes().to_vec(),
+            "messageId": {"$bytes": B64.encode(msg_uuid.as_bytes())},
             "prior": {
-                "conversationId": convo_uuid.as_bytes().to_vec(),
+                "conversationId": {"$bytes": B64.encode(convo_uuid.as_bytes())},
                 "groupId": {"$bytes": B64.encode(group_id)},
                 "epoch": epoch as i64,
                 "generation": auth_generation,
@@ -1585,76 +1263,116 @@ mod tests {
     }
 
     #[test]
+    fn repository_helpers_never_relabel_proof_bound_tokens_as_bearer() {
+        use jacquard_common::AuthorizationToken;
+        assert_eq!(
+            super::BirdApiClient::extract_jwt(AuthorizationToken::Bearer("fixture-token".into()))
+                .unwrap(),
+            "fixture-token"
+        );
+        for token in [
+            AuthorizationToken::Dpop("fixture-token".into()),
+            AuthorizationToken::Delegation("fixture-token".into()),
+        ] {
+            assert!(matches!(
+                super::BirdApiClient::extract_jwt(token),
+                Err(catbird_mls::orchestrator::error::OrchestratorError::Credential(_))
+            ));
+        }
+    }
+
+    #[test]
     fn canonical_read_path_contains_only_query_parameters() {
-        let path = canonical_get_conversations_path(25, Some("cursor"));
+        let path = canonical_get_conversations_path(
+            "11111111-1111-4111-8111-111111111111",
+            25,
+            Some("cursor"),
+        );
         assert_eq!(
             path,
-            "/xrpc/blue.catbird.chat.getConversations?limit=25&pageCursor=cursor"
+            "/xrpc/blue.catbird.chat.getConversations?limit=25&actorDeviceId=11111111-1111-4111-8111-111111111111&pageCursor=cursor"
         );
     }
 
     #[test]
     fn canonical_entry_epoch_is_propagated_to_incoming_envelope() {
+        use base64::Engine as _;
+        use sha2::Digest as _;
+        let bytes = |value: &[u8]| json!({"$bytes": super::B64.encode(value)});
+        let conversation_id =
+            uuid::Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+        let message_id = uuid::Uuid::parse_str("33333333-3333-4333-8333-333333333333").unwrap();
+        // This fixture checks typed entry projection; it does not claim valid MLS ciphertext/signatures.
         let wire = json!({
             "$type": "blue.catbird.chat.defs#applicationEntry",
             "conversationId": "11111111-1111-4111-8111-111111111111",
             "entryId": "22222222-2222-4222-8222-222222222222",
-            "receivedAt": "2026-08-16T00:00:00Z",
+            "receivedAt": "2026-08-16T00:00:00.000Z",
             "seq": 1,
             "signedRequest": {
                 "body": {
+                    "$type": "blue.catbird.chat.defs#applicationSendBody",
                     "aad": {
-                        "conversationId": "AA==",
+                        "conversationId": bytes(conversation_id.as_bytes()),
                         "generation": 7,
-                        "messageId": "AA==",
+                        "messageId": bytes(message_id.as_bytes()),
                         "prior": {
-                            "confirmationTag": {"$bytes": "AA=="},
-                            "conversationId": "11111111-1111-4111-8111-111111111111",
+                            "confirmationTag": bytes(&[1; 32]),
+                            "conversationId": bytes(conversation_id.as_bytes()),
                             "epoch": 42,
                             "generation": 7,
-                            "groupContextHash": {"$bytes": "AA=="},
-                            "groupId": {"$bytes": "AA=="},
+                            "groupContextHash": bytes(&[2; 32]),
+                            "groupId": bytes(&[3; 32]),
                             "lifecycle": "active",
                             "stateVersion": 1
                         },
-                        "protocolVersion": "mls-v1"
+                        "protocolVersion": "1"
                     },
                     "actorDeviceId": "11111111-1111-4111-8111-111111111111",
                     "actorDid": "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
                     "applicationMessage": {
                         "bytes": {"$bytes": "AQID"},
-                        "contentType": "application/octet-stream",
-                        "framing": "mls",
-                        "sha256": "AA=="
+                        "contentType": "privateMessageApplication",
+                        "framing": "mlsMessage",
+                        "sha256": bytes(&sha2::Sha256::digest([1, 2, 3]))
                     },
                     "authGeneration": 7,
                     "blobBindings": [],
-                    "keyId": "key-1",
+                    "keyId": crate::chat_authority::derive_key_id(&[4; 32]),
                     "messageId": "33333333-3333-4333-8333-333333333333",
                     "prior": {
-                        "confirmationTag": {"$bytes": "AA=="},
+                        "confirmationTag": bytes(&[1; 32]),
                         "conversationId": "11111111-1111-4111-8111-111111111111",
                         "epoch": 42,
                         "generation": 7,
-                        "groupContextHash": {"$bytes": "AA=="},
-                        "groupId": {"$bytes": "AA=="},
+                        "groupContextHash": bytes(&[2; 32]),
+                        "groupId": bytes(&[3; 32]),
                         "lifecycle": "active",
                         "stateVersion": 1
                     },
-                    "signatureDomain": "CATBIRD-CHAT-MESSAGE",
-                    "signedAt": "2026-08-16T00:00:00Z"
+                    "signatureDomain": "CATBIRD-CHAT-MESSAGE\u{0000}",
+                    "signedAt": "2026-08-16T00:00:00.000Z"
                 },
-                "signature": {"$bytes": "AA=="}
+                "signature": bytes(&[0; 64])
             }
         });
-        let entry = serde_json::from_str::<
-            catbird_atproto::blue_catbird::chat::ConversationEntry<String>,
-        >(&wire.to_string())
-        .expect("generated application entry fixture");
+        let response = json!({"entries": [wire], "nextAfterSeq": 1, "hasMore": false});
+        let decoded = super::decode_clean_chat_response(
+            super::CanonicalOperation::GetEntries.into(),
+            serde_json::to_vec(&response).unwrap(),
+        )
+        .expect("shared response decoder accepts canonical bytes");
+        let output: catbird_atproto::blue_catbird::chat::get_entries::GetEntriesOutput<String> =
+            serde_json::from_slice(&decoded)
+                .expect("shared decoded bytes retain the generated DTO presentation");
+        assert_eq!(output.next_after_seq, 1);
+        let entry = output.entries.into_iter().next().unwrap();
 
         let (_, envelope) = canonical_entry_envelope(entry, "11111111-1111-4111-8111-111111111111")
+            .expect("valid canonical entry")
             .expect("application entry maps to envelope");
         assert_eq!(envelope.server_epoch, Some(42));
+        assert_eq!(envelope.server_sequence, Some(1));
         assert_eq!(envelope.ciphertext, vec![1, 2, 3]);
     }
 }

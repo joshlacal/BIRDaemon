@@ -9,9 +9,10 @@ use std::fmt;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use base64::engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD};
+#[cfg(test)]
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -883,6 +884,20 @@ impl NestClient {
         if returned_jkt != expected_jkt {
             return Err(AuthorityError::JktMismatch);
         }
+        if let Some(content_type) = response.headers().get(reqwest::header::CONTENT_TYPE) {
+            let content_type = content_type
+                .to_str()
+                .map_err(|_| AuthorityError::InvalidDeviceResponse)?;
+            if !content_type
+                .split(';')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .eq_ignore_ascii_case("application/json")
+            {
+                return Err(AuthorityError::InvalidDeviceResponse);
+            }
+        }
         response
             .json()
             .await
@@ -895,25 +910,33 @@ impl NestClient {
         device_id: &str,
         expected_jkt: Option<&str>,
     ) -> Result<Vec<DeviceView>, AuthorityError> {
-        let query = [("limit", "100".to_string())];
-        let response = self
-            .clean_chat_request(
-                session_handle,
-                device_id,
-                reqwest::Method::GET,
-                "/xrpc/blue.catbird.chat.getOwnDevices",
-                None,
-                Some(&query),
-            )
-            .await?;
-        let status = response.status().as_u16();
-        if status == 401 || status == 403 {
-            return Err(AuthorityError::Remote);
-        }
-        if !response.status().is_success() {
-            return Err(AuthorityError::Remote);
-        }
-        if let Some(expected_jkt) = expected_jkt {
+        validate_device_id(device_id)?;
+        let expected_jkt = expected_jkt.ok_or(AuthorityError::Unavailable)?;
+        validate_jkt(expected_jkt)?;
+        let mut devices = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            let mut query = vec![
+                ("actorDeviceId", device_id.to_string()),
+                ("limit", "100".to_string()),
+            ];
+            if let Some(cursor) = &cursor {
+                query.push(("pageCursor", cursor.clone()));
+            }
+            let response = self
+                .clean_chat_request(
+                    session_handle,
+                    device_id,
+                    reqwest::Method::GET,
+                    "/xrpc/blue.catbird.chat.getOwnDevices",
+                    None,
+                    Some(&query),
+                )
+                .await?;
+            if !response.status().is_success() {
+                return Err(AuthorityError::Remote);
+            }
             let returned_jkt = response
                 .headers()
                 .get(CHAT_JKT_HEADER)
@@ -922,103 +945,78 @@ impl NestClient {
             if returned_jkt != expected_jkt {
                 return Err(AuthorityError::JktMismatch);
             }
+            let value: serde_json::Value = response
+                .json()
+                .await
+                .map_err(|_| AuthorityError::InvalidDeviceResponse)?;
+            let (page, next) = parse_own_devices(&value, device_id, expected_jkt)?;
+            devices.extend(page);
+            let Some(next) = next else {
+                break;
+            };
+            if !seen.insert(next.clone()) {
+                return Err(AuthorityError::InvalidDeviceResponse);
+            }
+            cursor = Some(next);
         }
-        let value: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|_| AuthorityError::InvalidDeviceResponse)?;
-        parse_own_devices(&value)
+        if devices
+            .iter()
+            .filter(|device| device.device_id == device_id)
+            .count()
+            != 1
+        {
+            return Err(AuthorityError::DeviceMismatch);
+        }
+        Ok(devices)
     }
 
-    pub(crate) async fn get_subscription_ticket(
+    /// Forward exact prepared bytes and preserve the gateway's status and media type.
+    /// Unauthorized responses may omit JKT; the caller invalidates only the
+    /// authority snapshot that issued this request. All other replies must
+    /// retain the admitted JKT before their bodies can reach the shared core.
+    pub(crate) async fn submit_clean_chat_request(
         &self,
         snapshot: &AuthoritySnapshot,
-        inventory_session_id: &str,
-        event_cursor: &str,
-    ) -> Result<(String, String), AuthorityError> {
-        let body = serde_json::to_vec(&serde_json::json!({
-            "inventorySessionId": inventory_session_id,
-            "eventCursor": event_cursor,
-        }))
-        .map_err(|_| AuthorityError::InvalidDeviceResponse)?;
-        let response = self
-            .clean_chat_request(
-                snapshot.session_handle(),
-                snapshot.device_id(),
-                reqwest::Method::POST,
-                "/xrpc/blue.catbird.chat.getSubscriptionTicket",
-                Some(body),
-                None,
-            )
-            .await?;
-        let status = response.status().as_u16();
-        if status == 401 || status == 403 {
-            return Err(AuthorityError::Remote);
-        }
-        if !response.status().is_success() {
-            return Err(AuthorityError::Remote);
-        }
-        let returned_jkt = response
-            .headers()
-            .get(CHAT_JKT_HEADER)
-            .and_then(|value| value.to_str().ok())
-            .ok_or(AuthorityError::InvalidDeviceResponse)?;
-        if returned_jkt != snapshot.dpop_jkt() {
-            return Err(AuthorityError::JktMismatch);
-        }
-        let value: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|_| AuthorityError::InvalidDeviceResponse)?;
-        let ticket = value
-            .get("ticket")
-            .and_then(serde_json::Value::as_str)
-            .ok_or(AuthorityError::InvalidDeviceResponse)?
-            .to_owned();
-        let endpoint = value
-            .get("endpoint")
-            .and_then(serde_json::Value::as_str)
-            .ok_or(AuthorityError::InvalidDeviceResponse)?
-            .to_owned();
-        Ok((ticket, endpoint))
-    }
-
-    pub(crate) async fn post_clean_chat_signed_request(
-        &self,
-        snapshot: &AuthoritySnapshot,
+        method: reqwest::Method,
         path: &str,
-        request_body: Vec<u8>,
-    ) -> Result<Vec<u8>, AuthorityError> {
+        request_body: Option<Vec<u8>>,
+    ) -> Result<catbird_mls::orchestrator::GatewayResponse, AuthorityError> {
         let response = self
             .clean_chat_request(
                 snapshot.session_handle(),
                 snapshot.device_id(),
-                reqwest::Method::POST,
+                method,
                 path,
-                Some(request_body),
+                request_body,
                 None,
             )
             .await?;
         let status = response.status().as_u16();
-        if status == 401 || status == 403 {
-            return Err(AuthorityError::Remote);
+        if !matches!(status, 401 | 403) {
+            let returned_jkt = response
+                .headers()
+                .get(CHAT_JKT_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .ok_or(AuthorityError::InvalidDeviceResponse)?;
+            if returned_jkt != snapshot.dpop_jkt() {
+                return Err(AuthorityError::JktMismatch);
+            }
         }
-        if !response.status().is_success() {
-            return Err(AuthorityError::Remote);
-        }
-        let returned_jkt = response
+        let content_type = response
             .headers()
-            .get(CHAT_JKT_HEADER)
+            .get(reqwest::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
-            .ok_or(AuthorityError::InvalidDeviceResponse)?;
-        if returned_jkt != snapshot.dpop_jkt() {
-            return Err(AuthorityError::JktMismatch);
-        }
-        response
+            .map(str::to_owned);
+        let body = response
             .bytes()
             .await
-            .map(|body| body.to_vec())
-            .map_err(|_| AuthorityError::Transport)
+            .map_err(|_| AuthorityError::Transport)?
+            .to_vec();
+        Ok(catbird_mls::orchestrator::GatewayResponse {
+            status,
+            content_type,
+            body,
+        })
     }
 
     pub(crate) async fn get_blob(
@@ -1026,7 +1024,10 @@ impl NestClient {
         snapshot: &AuthoritySnapshot,
         blob_id: &str,
     ) -> Result<Vec<u8>, AuthorityError> {
-        let query = [("blobId", blob_id.to_string())];
+        let query = [
+            ("actorDeviceId", snapshot.device_id().to_string()),
+            ("blobId", blob_id.to_string()),
+        ];
         let response = self
             .clean_chat_request(
                 snapshot.session_handle(),
@@ -1060,57 +1061,53 @@ impl NestClient {
     }
 }
 
-fn parse_own_devices(value: &serde_json::Value) -> Result<Vec<DeviceView>, AuthorityError> {
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct Output {
-        items: Vec<Item>,
-    }
-    #[derive(Deserialize)]
-    struct Item {
-        device: Device,
-    }
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct Device {
-        device_id: String,
-        dpop_jkt: String,
-        auth_generation: i64,
-        status: String,
-        key_id: String,
-        signature_public_key: EncodedBytes,
-    }
-    #[derive(Deserialize)]
-    struct EncodedBytes {
-        #[serde(rename = "$bytes")]
-        value: String,
-    }
-    let output: Output =
+fn parse_own_devices(
+    value: &serde_json::Value,
+    actor_device_id: &str,
+    verified_jkt: &str,
+) -> Result<(Vec<DeviceView>, Option<String>), AuthorityError> {
+    use catbird_atproto::blue_catbird::chat::get_own_devices::GetOwnDevicesOutput;
+    let output: GetOwnDevicesOutput<String> =
         serde_json::from_value(value.clone()).map_err(|_| AuthorityError::InvalidDeviceResponse)?;
-    output
+    let next = if output.has_more {
+        Some(
+            output
+                .next_page_cursor
+                .filter(|cursor| !cursor.is_empty())
+                .ok_or(AuthorityError::InvalidDeviceResponse)?,
+        )
+    } else {
+        None
+    };
+    let devices = output
         .items
         .into_iter()
         .map(|item| {
-            validate_device_id(&item.device.device_id)?;
-            validate_jkt(&item.device.dpop_jkt)?;
-            let signature_public_key = B64
-                .decode(item.device.signature_public_key.value)
-                .map_err(|_| AuthorityError::InvalidDeviceResponse)?;
+            let device = item.device;
+            validate_device_id(&device.device_id)?;
+            let signature_public_key = device.signature_public_key.to_vec();
             if signature_public_key.len() != 32
-                || derive_key_id(&signature_public_key) != item.device.key_id
+                || derive_key_id(&signature_public_key) != device.key_id
             {
                 return Err(AuthorityError::InvalidDeviceResponse);
             }
             Ok(DeviceView {
-                device_id: item.device.device_id,
-                dpop_jkt: item.device.dpop_jkt,
-                auth_generation: item.device.auth_generation,
-                status: item.device.status,
-                key_id: item.device.key_id,
+                // JKT belongs to the authenticated Nest request, not a peer device row.
+                // Only the exact requested actor can be admitted with this header.
+                dpop_jkt: if device.device_id == actor_device_id {
+                    verified_jkt.to_owned()
+                } else {
+                    String::new()
+                },
+                device_id: device.device_id,
+                auth_generation: device.auth_generation,
+                status: device.status,
+                key_id: device.key_id,
                 signature_public_key,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>, AuthorityError>>()?;
+    Ok((devices, next))
 }
 
 async fn write_callback_response(
@@ -1237,7 +1234,9 @@ mod tests {
         let read = stream.read(&mut request).await.unwrap();
         let request = String::from_utf8_lossy(&request[..read]);
         assert!(request.contains("/xrpc/blue.catbird.chat.getOwnDevices"));
-        assert!(request.contains("x-catbird-chat-device-id"));
+        assert!(request.contains(&format!("actorDeviceId={DEVICE}")));
+        assert!(request.contains(&format!("x-catbird-chat-device-id: {DEVICE}")));
+        assert!(request.contains("authorization: Bearer opaque-session"));
         let jkt_header = jkt
             .map(|value| format!("x-catbird-chat-dpop-jkt: {value}\r\n"))
             .unwrap_or_default();
@@ -1248,20 +1247,151 @@ mod tests {
         stream.write_all(response.as_bytes()).await.unwrap();
     }
 
+    fn own_devices_body(device_ids: &[&str]) -> String {
+        serde_json::json!({
+            "hasMore": false,
+            "snapshotExpiresAt": "2026-10-25T10:00:00.000Z",
+            "items": device_ids.iter().map(|device| serde_json::json!({"device": {
+                "deviceId": device,
+                "authGeneration": 7,
+                "availablePackageCount": 2,
+                "reservedPackageCount": 1,
+                "createdAt": "2026-10-25T09:00:00.000Z",
+                "updatedAt": "2026-10-25T09:00:00.000Z",
+                "status": "active",
+                "keyId": derive_key_id(&[0; 32]),
+                "signaturePublicKey": {"$bytes": B64.encode([0_u8; 32])}
+            }})).collect::<Vec<_>>()
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn own_device_header_is_bound_only_to_the_queried_actor() {
+        const PEER: &str = "22222222-2222-4222-8222-222222222222";
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let nest = NestClient::new(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let server = tokio::spawn(http_fixture(
+            listener,
+            "200 OK",
+            Some(JKT),
+            own_devices_body(&[DEVICE, PEER]),
+        ));
+        let devices = nest
+            .own_devices("opaque-session", DEVICE, Some(JKT))
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(
+            devices
+                .iter()
+                .find(|device| device.device_id == DEVICE)
+                .unwrap()
+                .dpop_jkt,
+            JKT
+        );
+        assert!(devices
+            .iter()
+            .find(|device| device.device_id == PEER)
+            .unwrap()
+            .dpop_jkt
+            .is_empty());
+        assert!(matches!(
+            AuthoritySnapshot::admit(
+                "opaque-session".into(),
+                &SessionInfo::new(DID.into(), "fixture".into()),
+                DID,
+                &devices,
+                PEER,
+                JKT,
+                7,
+                derive_key_id(&[0; 32]),
+                &[0; 32],
+                1,
+            ),
+            Err(AuthorityError::JktMismatch)
+        ));
+
+        for (header, body, expected) in [
+            (
+                None,
+                own_devices_body(&[DEVICE]),
+                AuthorityError::InvalidDeviceResponse,
+            ),
+            (
+                Some(JKT),
+                own_devices_body(&[PEER]),
+                AuthorityError::DeviceMismatch,
+            ),
+            (
+                Some(JKT),
+                own_devices_body(&[DEVICE, DEVICE]),
+                AuthorityError::DeviceMismatch,
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let nest =
+                NestClient::new(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+            let server = tokio::spawn(http_fixture(listener, "200 OK", header, body));
+            assert_eq!(
+                nest.own_devices("opaque-session", DEVICE, Some(JKT))
+                    .await
+                    .unwrap_err(),
+                expected
+            );
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn own_devices_refuses_missing_preflight_without_network() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let nest = NestClient::new(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        assert_eq!(
+            nest.own_devices("opaque-session", DEVICE, None)
+                .await
+                .unwrap_err(),
+            AuthorityError::Unavailable
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn enrollment_rejects_explicit_non_json_media_type() {
+        for (content_type, accepted) in [
+            ("text/plain", false),
+            ("application/json; charset=utf-8", true),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let nest =
+                NestClient::new(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 4096];
+                let read = stream.read(&mut request).await.unwrap();
+                assert!(String::from_utf8_lossy(&request[..read])
+                    .starts_with("POST /xrpc/blue.catbird.chat.enrollDevice "));
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\n{CHAT_JKT_HEADER}: {JKT}\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{{}}"
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            });
+            let result = nest
+                .post_signed_enrollment("opaque-session", DEVICE, b"{}".to_vec(), JKT)
+                .await;
+            server.await.unwrap();
+            assert_eq!(result.is_ok(), accepted);
+        }
+    }
+
     #[tokio::test]
     async fn http_fixture_success_wrong_proof_and_unauthorized_fail_closed() {
         let key_id = derive_key_id(&[0; 32]);
-        let body = serde_json::json!({
-            "items": [{"device": {
-                "deviceId": DEVICE,
-                "dpopJkt": JKT,
-                "authGeneration": 7,
-                "status": "active",
-                "keyId": key_id,
-                "signaturePublicKey": {"$bytes": B64.encode([0_u8; 32])}
-            }}]
-        })
-        .to_string();
+        let body = own_devices_body(&[DEVICE]);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}/", listener.local_addr().unwrap());
         let nest = NestClient::new(&base).unwrap();

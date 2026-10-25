@@ -1,0 +1,52 @@
+name: Linux dependency validation
+
+on:
+  pull_request:
+  push:
+    branches: [codex/dependency-refresh-20261025]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dependency-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Record native Linux runner and install build prerequisites
+        run: |
+          test "$(uname -m)" = x86_64
+          uname -a
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y clang cmake jq pkg-config libssl-dev
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal --component clippy,rustfmt
+          rustup default 1.99.1
+          rustc --version --verbose
+          cargo --version
+      - name: Verify immutable core and locked feature provenance
+        run: ./scripts/check-canonical-sibling-provenance.sh
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Build all targets
+        run: cargo build --locked --all-targets
+      - name: Run local transport, storage and authority tests
+        run: cargo test --locked --all-targets
+      - name: Lint all targets
+        run: cargo clippy --locked --all-targets
+      - name: Audit the locked graph without advisory suppressions
+        run: |
+          cargo install cargo-audit --locked --version 0.22.2
+          cargo audit

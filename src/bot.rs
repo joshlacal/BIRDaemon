@@ -8,20 +8,43 @@ use tokio::sync::Mutex;
 use tokio::time::Instant;
 
 use catbird_mls::blob_crypto::decrypt_blob;
-use catbird_mls::orchestrator::{IncomingEnvelope, MLSOrchestrator, MLSStorageBackend};
+use catbird_mls::orchestrator::subscription::{SubscriptionDispatchOutcome, SubscriptionTicket};
+use catbird_mls::orchestrator::{IncomingEnvelope, MLSOrchestrator, MLSStorageBackend, Message};
 use catbird_mls::MLSContext;
 
 use crate::bridge_client::BridgeClient;
 use crate::config::BirdConfig;
 use crate::credentials::FileCredentialStore;
 use crate::storage::SqliteStorage;
-use crate::websocket::{MlsEvent, MlsWebSocket};
+use crate::websocket::{MlsEvent, MlsWebSocket, SubscriptionRuntime};
 use crate::xrpc_client::BirdApiClient;
 use tokio::sync::Notify;
 
 /// Type alias for our concrete orchestrator (generic params: S, A, C).
 type BirdOrchestrator =
     MLSOrchestrator<SqliteStorage, BirdApiClient, FileCredentialStore, MLSContext>;
+
+#[async_trait::async_trait]
+impl SubscriptionRuntime for BirdOrchestrator {
+    async fn prepare(&self) -> Result<SubscriptionTicket, String> {
+        // The server replaces inventory capabilities as events advance. Reconnect
+        // must apply a fresh inventory and bind its exact cursor into the ticket.
+        let ticket = self
+            .prepare_subscription()
+            .await
+            .map_err(|e| e.to_string())?;
+        self.initialize_subscription_cursor(&ticket)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(ticket)
+    }
+
+    async fn apply(&self, raw: &str) -> Result<SubscriptionDispatchOutcome, String> {
+        self.apply_subscription_frame(raw)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
 
 /// Cooldown period after a rejoin before allowing another rejoin for the same conversation.
 /// This prevents infinite rejoin loops when the sender hasn't caught up yet.
@@ -83,7 +106,7 @@ impl BirdBot {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
         // Start WebSocket subscription
-        let ws = MlsWebSocket::new(self.api_client.clone());
+        let ws = MlsWebSocket::new(self.orchestrator.clone());
         let ws_reconnect = ws.reconnect_handle();
         let mut events = ws.subscribe(shutdown_rx);
 
@@ -98,6 +121,19 @@ impl BirdBot {
                 // WebSocket events
                 Some(event) = events.recv() => {
                     match event {
+                        MlsEvent::Canonical(SubscriptionDispatchOutcome::MessageAvailable { messages, .. }) => {
+                            for message in messages {
+                                let api_client = Arc::clone(&self.api_client);
+                                let orchestrator = Arc::clone(&self.orchestrator);
+                                let llm = Arc::clone(&self.llm);
+                                tokio::spawn(async move {
+                                    handle_decrypted_message_bg(&api_client, &orchestrator, &llm, message).await;
+                                });
+                            }
+                        }
+                        MlsEvent::Canonical(_) => {
+                            tracing::debug!("Canonical subscription control or typing event applied");
+                        }
                         MlsEvent::Message {
                             id,
                             conversation_id,
@@ -386,6 +422,8 @@ async fn handle_message_bg(
         timestamp,
         server_message_id: Some(id.to_string()),
         server_epoch: Some(msg_epoch),
+        server_sequence: None,
+        canonical_entry_json: None,
     };
 
     let decrypted = match orchestrator.process_incoming(&envelope).await {
@@ -439,6 +477,17 @@ async fn handle_message_bg(
         }
     };
 
+    handle_decrypted_message_bg(api_client, orchestrator, llm, decrypted).await;
+}
+
+/// Crypto processing and cursor durability complete before the slow LLM call.
+async fn handle_decrypted_message_bg(
+    api_client: &Arc<BirdApiClient>,
+    orchestrator: &Arc<BirdOrchestrator>,
+    llm: &Arc<BridgeClient>,
+    decrypted: Message,
+) {
+    let conversation_id = decrypted.conversation_id.as_str();
     if decrypted.is_own {
         tracing::debug!("Skipping own message");
         return;

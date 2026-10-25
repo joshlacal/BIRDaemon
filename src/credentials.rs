@@ -72,8 +72,7 @@ impl FileCredentialStore {
         let obsolete_binding_keys = data
             .keys()
             .filter(|key| {
-                key.ends_with("/clean_chat_dpop_jkt")
-                    || key.ends_with("/clean_chat_device_id")
+                key.ends_with("/clean_chat_dpop_jkt") || key.ends_with("/clean_chat_device_id")
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -109,8 +108,9 @@ impl FileCredentialStore {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
-                .map_err(|e| OrchestratorError::Credential(format!("set credentials permissions: {e}")))?;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).map_err(
+                |e| OrchestratorError::Credential(format!("set credentials permissions: {e}")),
+            )?;
         }
         std::fs::rename(&tmp, &self.path)
             .map_err(|e| OrchestratorError::Credential(format!("rename credentials: {e}")))?;
@@ -221,8 +221,7 @@ impl FileCredentialStore {
                 || request.signed_request.body.expected_auth_generation != 0
             {
                 return Err(OrchestratorError::Credential(
-                    "pending enrollment prepared request does not match its durable binding"
-                        .into(),
+                    "pending enrollment prepared request does not match its durable binding".into(),
                 ));
             }
             let encoded = B64.encode(prepared_body);
@@ -277,10 +276,7 @@ impl FileCredentialStore {
                     ));
                 }
             }
-            for (field, value) in [
-                ("device_uuid", device_uuid),
-                ("mls_did", mls_did),
-            ] {
+            for (field, value) in [("device_uuid", device_uuid), ("mls_did", mls_did)] {
                 data.insert(Self::key(user_did, field), value.to_owned());
             }
             data.insert(
@@ -294,11 +290,7 @@ impl FileCredentialStore {
 
     pub fn get_admitted_device_tuple(&self, user_did: &str) -> Result<Option<AdmittedDeviceTuple>> {
         let data = self.data.lock().unwrap();
-        let fields = [
-            "device_uuid",
-            "mls_did",
-            "clean_chat_auth_generation",
-        ];
+        let fields = ["device_uuid", "mls_did", "clean_chat_auth_generation"];
         let present = fields
             .iter()
             .filter(|field| data.contains_key(&Self::key(user_did, field)))

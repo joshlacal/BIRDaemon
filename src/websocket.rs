@@ -14,7 +14,23 @@ use serde::Deserialize;
 use tokio::sync::{mpsc, Notify};
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 
-use crate::xrpc_client::BirdApiClient;
+use catbird_atproto::blue_catbird::chat::{EventEnvelope, SubscriptionMessage, TypingEvent};
+use catbird_mls::orchestrator::subscription::{
+    SubscriptionDispatchOutcome, SubscriptionTicket, MAX_FRAME_BYTES,
+};
+
+/// Canonical protocol policy stays in the shared Rust orchestrator. The transport
+/// only adapts DAG-CBOR frames and never persists or guesses a cursor itself.
+#[async_trait::async_trait]
+pub(crate) trait SubscriptionRuntime: Send + Sync {
+    async fn prepare(&self) -> Result<SubscriptionTicket, String>;
+    async fn apply(&self, raw: &str) -> Result<SubscriptionDispatchOutcome, String>;
+}
+
+enum DecodedFrame {
+    Canonical(String),
+    Legacy(MlsEvent),
+}
 
 // ── DAG-CBOR frame helpers ───────────────────────────────────────────────
 
@@ -105,6 +121,8 @@ fn split_frame(data: &[u8]) -> Option<(FrameHeader, &[u8])> {
 /// Events received from the MLS WebSocket.
 #[derive(Debug)]
 pub enum MlsEvent {
+    /// Canonical event whose state and cursor were durably applied by the core.
+    Canonical(SubscriptionDispatchOutcome),
     /// Encrypted message received.
     Message {
         id: String,
@@ -138,14 +156,14 @@ pub enum MlsEvent {
 /// Handles connection lifecycle, reconnection with exponential backoff,
 /// and DAG-CBOR frame parsing. Returns parsed events via an mpsc channel.
 pub struct MlsWebSocket {
-    api_client: Arc<BirdApiClient>,
+    runtime: Arc<dyn SubscriptionRuntime>,
     reconnect: Arc<Notify>,
 }
 
 impl MlsWebSocket {
-    pub fn new(api_client: Arc<BirdApiClient>) -> Self {
+    pub fn new(runtime: Arc<dyn SubscriptionRuntime>) -> Self {
         Self {
-            api_client,
+            runtime,
             reconnect: Arc::new(Notify::new()),
         }
     }
@@ -162,11 +180,10 @@ impl MlsWebSocket {
         shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> mpsc::Receiver<MlsEvent> {
         let (tx, rx) = mpsc::channel(100);
-        let api_client = self.api_client.clone();
+        let runtime = self.runtime.clone();
         let reconnect = self.reconnect.clone();
 
         tokio::spawn(async move {
-            let mut last_cursor: Option<String> = None;
             let mut attempt = 0u32;
 
             loop {
@@ -177,17 +194,8 @@ impl MlsWebSocket {
                 attempt += 1;
                 tracing::info!("WebSocket connecting (attempt {})", attempt);
 
-                match do_subscribe(
-                    &api_client,
-                    last_cursor.as_deref(),
-                    &tx,
-                    &shutdown,
-                    &reconnect,
-                )
-                .await
-                {
-                    Ok(cursor) => {
-                        last_cursor = cursor;
+                match do_subscribe(runtime.as_ref(), &tx, &shutdown, &reconnect).await {
+                    Ok(()) => {
                         attempt = 0; // Reset on successful connection
                     }
                     Err(e) => {
@@ -214,25 +222,28 @@ impl MlsWebSocket {
 
 // ── do_subscribe ─────────────────────────────────────────────────────────
 
-/// Single WebSocket connection session. Returns the last cursor on clean disconnect.
+/// Build the upgrade URL from the exact cursor bound into the one-use ticket.
+fn subscription_url(ticket: &SubscriptionTicket) -> Result<String, String> {
+    let mut url =
+        url::Url::parse(&ticket.endpoint).map_err(|e| format!("Invalid endpoint: {e}"))?;
+    if !matches!(url.scheme(), "ws" | "wss") || url.query().is_some() || url.fragment().is_some() {
+        return Err("Invalid subscription endpoint".into());
+    }
+    url.query_pairs_mut()
+        .append_pair("ticket", &ticket.ticket)
+        .append_pair("cursor", &ticket.event_cursor);
+    Ok(url.into())
+}
+
+/// One connection uses one freshly applied inventory and its exact ticket/cursor.
 async fn do_subscribe(
-    api_client: &BirdApiClient,
-    cursor: Option<&str>,
+    runtime: &dyn SubscriptionRuntime,
     tx: &mpsc::Sender<MlsEvent>,
     shutdown: &tokio::sync::watch::Receiver<bool>,
     reconnect: &Notify,
-) -> Result<Option<String>, String> {
-    // 1. Get subscription ticket via PDS proxy
-    let (ticket, ws_endpoint) = api_client
-        .get_subscription_ticket()
-        .await
-        .map_err(|e| format!("Ticket request failed: {}", e))?;
-
-    // 2. Build WebSocket URL
-    let mut ws_url = format!("{}?ticket={}", ws_endpoint, ticket);
-    if let Some(cur) = cursor {
-        ws_url.push_str(&format!("&cursor={}", cur));
-    }
+) -> Result<(), String> {
+    let ticket = runtime.prepare().await?;
+    let ws_url = subscription_url(&ticket)?;
 
     tracing::info!("Opening direct DS WebSocket subscription");
 
@@ -244,7 +255,6 @@ async fn do_subscribe(
     tracing::info!("WebSocket connected");
     let _ = tx.send(MlsEvent::Connected).await;
 
-    let mut last_cursor: Option<String> = cursor.map(String::from);
     let mut shutdown = shutdown.clone();
 
     // 4. Event loop
@@ -255,14 +265,21 @@ async fn do_subscribe(
                     Some(Ok(WsMessage::Binary(data))) => {
                         tracing::info!("WebSocket binary frame: {} bytes", data.len());
                         match handle_frame(&data) {
-                            Ok(Some((event, cur))) => {
-                                if let Some(c) = cur {
-                                    last_cursor = Some(c);
-                                }
-                                let _ = tx.send(event).await;
+                            Ok(Some(DecodedFrame::Canonical(raw))) => {
+                                // apply() validates the exact previousCursor chain, fetches
+                                // canonical entries and durably processes them before CAS
+                                // advancing the cursor. Any failure reconnects; it is never
+                                // converted into a successful acknowledgement.
+                                let outcome = runtime.apply(&raw).await?;
+                                tx.send(MlsEvent::Canonical(outcome)).await
+                                    .map_err(|_| "Event consumer closed".to_string())?;
                             }
-                            Ok(None) => {} // Ignored frame (keepalive)
-                            Err(e) => tracing::warn!("Frame error: {}", e),
+                            Ok(Some(DecodedFrame::Legacy(event))) => {
+                                tx.send(event).await
+                                    .map_err(|_| "Event consumer closed".to_string())?;
+                            }
+                            Ok(None) => {} // Keepalive has no cursor.
+                            Err(e) => return Err(e),
                         }
                     }
                     Some(Ok(WsMessage::Ping(data))) => {
@@ -290,7 +307,7 @@ async fn do_subscribe(
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
                     let _ = ws_stream.close(None).await;
-                    return Ok(last_cursor);
+                    return Ok(());
                 }
             }
             // Reconnect signal from bot (e.g., new conversations discovered during sync)
@@ -302,13 +319,16 @@ async fn do_subscribe(
         }
     }
 
-    Ok(last_cursor)
+    Ok(())
 }
 
 // ── handle_frame ─────────────────────────────────────────────────────────
 
 /// Parse a binary DAG-CBOR frame into an MlsEvent.
-fn handle_frame(data: &[u8]) -> Result<Option<(MlsEvent, Option<String>)>, String> {
+fn handle_frame(data: &[u8]) -> Result<Option<DecodedFrame>, String> {
+    if data.len() > MAX_FRAME_BYTES {
+        return Err("Subscription frame exceeds bound".into());
+    }
     let (header, payload_bytes) =
         split_frame(data).ok_or("Failed to decode DAG-CBOR frame header")?;
 
@@ -321,9 +341,32 @@ fn handle_frame(data: &[u8]) -> Result<Option<(MlsEvent, Option<String>)>, Strin
         return Ok(None);
     }
 
+    if header.op != 1 {
+        return Err("Unknown subscription operation".into());
+    }
     let event_type = header.t.as_deref().unwrap_or("");
 
     match event_type {
+        "blue.catbird.chat.defs#eventEnvelope" | "blue.catbird.chat.defs#typingEvent" => {
+            let mut input = Cursor::new(payload_bytes);
+            let message: SubscriptionMessage<String> = if event_type.ends_with("#eventEnvelope") {
+                let value: EventEnvelope<String> = ciborium::from_reader(&mut input)
+                    .map_err(|e| format!("Invalid canonical event envelope: {e}"))?;
+                SubscriptionMessage::EventEnvelope(Box::new(value))
+            } else {
+                let value: TypingEvent<String> = ciborium::from_reader(&mut input)
+                    .map_err(|e| format!("Invalid typing event: {e}"))?;
+                SubscriptionMessage::TypingEvent(Box::new(value))
+            };
+            if input.position() as usize != payload_bytes.len() {
+                return Err("Trailing subscription frame data".into());
+            }
+            let raw = serde_json::to_string(&message).map_err(|e| e.to_string())?;
+            // Reuse the core's strict schema validation before any dispatch.
+            catbird_mls::orchestrator::subscription::decode_subscription_frame(&raw)
+                .map_err(|e| e.to_string())?;
+            Ok(Some(DecodedFrame::Canonical(raw)))
+        }
         "#messageEvent" => {
             let payload: CborValue = ciborium::from_reader(Cursor::new(payload_bytes))
                 .map_err(|e| format!("Failed to decode messageEvent CBOR: {}", e))?;
@@ -351,17 +394,14 @@ fn handle_frame(data: &[u8]) -> Result<Option<(MlsEvent, Option<String>)>, Strin
                 "Parsed messageEvent"
             );
 
-            Ok(Some((
-                MlsEvent::Message {
-                    id,
-                    conversation_id: convo_id,
-                    ciphertext,
-                    epoch,
-                    created_at,
-                    cursor: cursor.clone(),
-                },
+            Ok(Some(DecodedFrame::Legacy(MlsEvent::Message {
+                id,
+                conversation_id: convo_id,
+                ciphertext,
+                epoch,
+                created_at,
                 cursor,
-            )))
+            })))
         }
         "#infoEvent" => {
             let payload: CborValue = ciborium::from_reader(Cursor::new(payload_bytes))
@@ -376,13 +416,7 @@ fn handle_frame(data: &[u8]) -> Result<Option<(MlsEvent, Option<String>)>, Strin
             };
 
             tracing::debug!(info = %info, "Info event");
-            Ok(Some((
-                MlsEvent::Info {
-                    info,
-                    cursor: cursor.clone(),
-                },
-                cursor,
-            )))
+            Ok(Some(DecodedFrame::Legacy(MlsEvent::Info { info, cursor })))
         }
         "#groupResetEvent" => {
             let payload: CborValue = ciborium::from_reader(Cursor::new(payload_bytes))
@@ -392,7 +426,6 @@ fn handle_frame(data: &[u8]) -> Result<Option<(MlsEvent, Option<String>)>, Strin
                 return Err("groupResetEvent payload is not a CBOR map".into());
             };
 
-            let cursor = cbor_str(top, "cursor");
             let conversation_id = cbor_str(top, "convoId")
                 .or_else(|| cbor_str(top, "conversationId"))
                 .ok_or("Missing convoId in groupResetEvent")?;
@@ -410,37 +443,242 @@ fn handle_frame(data: &[u8]) -> Result<Option<(MlsEvent, Option<String>)>, Strin
                 "Parsed groupResetEvent"
             );
 
-            Ok(Some((
-                MlsEvent::GroupReset {
-                    conversation_id,
-                    new_group_id,
-                    reset_generation,
-                },
-                cursor,
-            )))
+            Ok(Some(DecodedFrame::Legacy(MlsEvent::GroupReset {
+                conversation_id,
+                new_group_id,
+                reset_generation,
+            })))
         }
-        other => {
-            tracing::debug!(event_type = %other, "Ignoring unhandled event type");
-            // Still extract cursor if possible
-            let cursor = if !payload_bytes.is_empty() {
-                ciborium::from_reader::<CborValue, _>(Cursor::new(payload_bytes))
-                    .ok()
-                    .and_then(|v| match &v {
-                        CborValue::Map(entries) => cbor_str(entries, "cursor"),
-                        _ => None,
+        other => Err(format!("Unsupported subscription event type: {other}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tokio::net::TcpListener;
+    use tokio::sync::Mutex;
+    use tokio_tungstenite::{
+        accept_hdr_async,
+        tungstenite::handshake::server::{Request, Response},
+    };
+
+    const CONVERSATION: &str = "11111111-1111-4111-8111-111111111111";
+
+    fn event_frame(previous: &str, next: &str) -> Vec<u8> {
+        // Serialize the same generated inner DTO and two-item framing as the
+        // active mls-ds handler; this fixture has no accounts or encrypted data.
+        let envelope: EventEnvelope<String> = serde_json::from_value(serde_json::json!({
+            "previousCursor": previous,
+            "cursor": next,
+            "createdAt": "2026-10-25T10:00:00.000Z",
+            "payload": {
+                "$type": "blue.catbird.chat.defs#messageAvailableEvent",
+                "conversationId": CONVERSATION,
+                "seq": 1
+            }
+        }))
+        .unwrap();
+        let mut bytes = Vec::new();
+        ciborium::into_writer(
+            &serde_json::json!({"op": 1, "t": "blue.catbird.chat.defs#eventEnvelope"}),
+            &mut bytes,
+        )
+        .unwrap();
+        ciborium::into_writer(&envelope, &mut bytes).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn production_envelope_frame_retains_payload_and_cursor_chain() {
+        let Some(DecodedFrame::Canonical(raw)) =
+            handle_frame(&event_frame("before", "after")).unwrap()
+        else {
+            panic!("canonical envelope was not decoded");
+        };
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value["$type"], "blue.catbird.chat.defs#eventEnvelope");
+        assert_eq!(value["previousCursor"], "before");
+        assert_eq!(value["cursor"], "after");
+        assert_eq!(value["payload"]["conversationId"], CONVERSATION);
+        assert_eq!(value["payload"]["seq"], 1);
+    }
+
+    #[test]
+    fn production_typing_frame_is_typed_and_has_no_cursor() {
+        let typing: TypingEvent<String> = serde_json::from_value(serde_json::json!({
+            "actorDeviceId": "22222222-2222-4222-8222-222222222222",
+            "actorDid": "did:plc:abcdefghijklmnopqrstuvwx",
+            "conversationId": CONVERSATION,
+            "expiresAt": "2026-10-25T10:00:03.000Z",
+            "isTyping": true,
+            "typingId": "33333333-3333-4333-8333-333333333333"
+        }))
+        .unwrap();
+        let mut bytes = Vec::new();
+        ciborium::into_writer(
+            &serde_json::json!({"op": 1, "t": "blue.catbird.chat.defs#typingEvent"}),
+            &mut bytes,
+        )
+        .unwrap();
+        ciborium::into_writer(&typing, &mut bytes).unwrap();
+        let Some(DecodedFrame::Canonical(raw)) = handle_frame(&bytes).unwrap() else {
+            panic!("typing frame was not decoded");
+        };
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value["$type"], "blue.catbird.chat.defs#typingEvent");
+        assert_eq!(value["isTyping"], true);
+        assert!(value.get("cursor").is_none());
+    }
+
+    #[test]
+    fn frame_rejects_unknown_types_trailing_data_and_oversize_input() {
+        let mut unknown = Vec::new();
+        ciborium::into_writer(
+            &serde_json::json!({"op": 1, "t": "blue.catbird.chat.defs#futureEvent"}),
+            &mut unknown,
+        )
+        .unwrap();
+        ciborium::into_writer(
+            &serde_json::json!({"cursor": "must-not-advance"}),
+            &mut unknown,
+        )
+        .unwrap();
+        assert!(handle_frame(&unknown).is_err());
+        let mut trailing = event_frame("before", "after");
+        trailing.push(0xf6);
+        assert!(handle_frame(&trailing).is_err());
+        assert!(handle_frame(&vec![0; MAX_FRAME_BYTES + 1]).is_err());
+    }
+
+    struct FixtureRuntime {
+        endpoint: String,
+        prepares: AtomicUsize,
+        fail_next_apply: AtomicBool,
+        cursor: Mutex<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl SubscriptionRuntime for FixtureRuntime {
+        async fn prepare(&self) -> Result<SubscriptionTicket, String> {
+            let index = self.prepares.fetch_add(1, Ordering::SeqCst);
+            let event_cursor = format!("inventory:{index}&exact=cursor");
+            *self.cursor.lock().await = event_cursor.clone();
+            Ok(SubscriptionTicket {
+                endpoint: self.endpoint.clone(),
+                ticket: format!("one-use-ticket-{index}&exact=token"),
+                inventory_session_id: format!("inventory-session-{index}"),
+                event_cursor,
+            })
+        }
+
+        async fn apply(&self, raw: &str) -> Result<SubscriptionDispatchOutcome, String> {
+            if self.fail_next_apply.swap(false, Ordering::SeqCst) {
+                return Err("fixture entry processing failed before cursor persistence".into());
+            }
+            let value: serde_json::Value = serde_json::from_str(raw).unwrap();
+            let mut cursor = self.cursor.lock().await;
+            if value["previousCursor"] != *cursor || value["cursor"] == *cursor {
+                return Err("fixture rejected replay or broken cursor chain".into());
+            }
+            *cursor = value["cursor"].as_str().unwrap().to_string();
+            Ok(SubscriptionDispatchOutcome::MessageAvailable {
+                conversation_id: CONVERSATION.into(),
+                target_seq: 1,
+                messages: vec![],
+                cursor: cursor.clone(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn loopback_reconnect_uses_fresh_ticket_and_processing_failure_never_dispatches() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!(
+            "ws://{}/xrpc/blue.catbird.chat.subscribeEvents",
+            listener.local_addr().unwrap()
+        );
+        let queries = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let capture = queries.clone();
+        let server = tokio::spawn(async move {
+            for index in 0..2 {
+                let (socket, _) = listener.accept().await.unwrap();
+                let capture = capture.clone();
+                let mut ws =
+                    accept_hdr_async(socket, move |request: &Request, response: Response| {
+                        capture.lock().unwrap().push(request.uri().to_string());
+                        Ok(response)
                     })
-            } else {
-                None
-            };
-            Ok(cursor.map(|c| {
-                (
-                    MlsEvent::Info {
-                        info: format!("event: {}", other),
-                        cursor: Some(c.clone()),
-                    },
-                    Some(c),
-                )
-            }))
+                    .await
+                    .unwrap();
+                let frame = event_frame(
+                    &format!("inventory:{index}&exact=cursor"),
+                    "processed-cursor",
+                );
+                ws.send(WsMessage::Binary(frame.clone().into()))
+                    .await
+                    .unwrap();
+                if index == 1 {
+                    // The same envelope replay must fail instead of dispatching twice.
+                    ws.send(WsMessage::Binary(frame.into())).await.unwrap();
+                }
+                let _ = ws.next().await;
+            }
+        });
+        let runtime = FixtureRuntime {
+            endpoint,
+            prepares: AtomicUsize::new(0),
+            fail_next_apply: AtomicBool::new(true),
+            cursor: Mutex::new(String::new()),
+        };
+        let (tx, mut rx) = mpsc::channel(10);
+        let (_shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
+        let reconnect = Notify::new();
+        let failure = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            do_subscribe(&runtime, &tx, &shutdown, &reconnect),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(failure.contains("processing failed"));
+        assert_eq!(*runtime.cursor.lock().await, "inventory:0&exact=cursor");
+        assert!(matches!(rx.try_recv().unwrap(), MlsEvent::Connected));
+        assert!(
+            rx.try_recv().is_err(),
+            "failed processing must not dispatch a canonical event"
+        );
+
+        let replay = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            do_subscribe(&runtime, &tx, &shutdown, &reconnect),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(replay.contains("replay"));
+        assert_eq!(*runtime.cursor.lock().await, "processed-cursor");
+        assert!(matches!(rx.try_recv().unwrap(), MlsEvent::Connected));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            MlsEvent::Canonical(SubscriptionDispatchOutcome::MessageAvailable {
+                target_seq: 1,
+                ..
+            })
+        ));
+        assert!(rx.try_recv().is_err(), "a replay must not dispatch twice");
+        server.await.unwrap();
+        for (index, uri) in queries.lock().unwrap().iter().enumerate() {
+            let url = url::Url::parse(&format!("http://localhost{uri}")).unwrap();
+            let query: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+            assert_eq!(query.len(), 2);
+            assert_eq!(
+                query["ticket"],
+                format!("one-use-ticket-{index}&exact=token")
+            );
+            assert_eq!(query["cursor"], format!("inventory:{index}&exact=cursor"));
         }
+        assert_eq!(runtime.prepares.load(Ordering::SeqCst), 2);
     }
 }

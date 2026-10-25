@@ -23,8 +23,7 @@ use crate::storage::SqliteStorage;
 use crate::xrpc_client::BirdApiClient;
 
 use catbird_atproto::blue_catbird::chat::{
-    enroll_device::EnrollDeviceOutput, DeviceCapability, DeviceEnrollmentBody,
-    KeyPackageArtifact,
+    enroll_device::EnrollDeviceOutput, DeviceCapability, DeviceEnrollmentBody, KeyPackageArtifact,
 };
 use catbird_mls::orchestrator::credentials::CredentialStore;
 use catbird_mls::orchestrator::{
@@ -132,7 +131,8 @@ async fn main() -> anyhow::Result<()> {
     // Use a sanitized DID for the database filename (replace : and . with _)
     let did_sanitized = did.replace([':', '.'], "_");
     let mls_db_path = mls_state_dir.join(format!("{}.db", did_sanitized));
-    let mls_db_key = get_or_create_mls_db_key(&mls_state_dir, &did_sanitized, &secrets.app_password)?;
+    let mls_db_key =
+        get_or_create_mls_db_key(&mls_state_dir, &did_sanitized, &secrets.app_password)?;
     let mls_context = MLSContext::new(
         mls_db_path.to_string_lossy().to_string(),
         mls_db_key,
@@ -145,7 +145,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Create storage backend
     let storage_db_path = data_dir.join("bird.db");
-    let storage = Arc::new(SqliteStorage::new(storage_db_path, did.clone())?);
+    let storage = Arc::new(SqliteStorage::new(storage_db_path)?);
 
     // Create orchestrator
     let orchestrator = Arc::new(MLSOrchestrator::new(
@@ -220,9 +220,9 @@ fn get_or_create_mls_db_key(
     let hex_key = if db_path.exists() {
         fallback_app_password.to_string()
     } else {
-        use rand::RngCore;
+        use rand::Rng;
         let mut raw = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut raw);
+        rand::rng().fill_bytes(&mut raw);
         hex::encode(raw)
     };
     let tmp = key_path.with_extension("key.tmp");
@@ -254,11 +254,9 @@ async fn establish_or_restore_authority(
     let persisted_session = credentials.get_opaque_chat_session(did)?;
     let persisted_tuple = credentials.get_admitted_device_tuple(did);
     let pending_enrollment = credentials.get_pending_enrollment(did);
-    if let (Some(session), Ok(Some(tuple)), Ok(None)) = (
-        &persisted_session,
-        &persisted_tuple,
-        &pending_enrollment,
-    ) {
+    if let (Some(session), Ok(Some(tuple)), Ok(None)) =
+        (&persisted_session, &persisted_tuple, &pending_enrollment)
+    {
         if let Ok(snapshot) = admit_existing_session(
             &nest,
             session,
@@ -274,20 +272,12 @@ async fn establish_or_restore_authority(
             return Ok(());
         }
     }
-    if let (Some(session), Ok(None), Ok(Some(pending))) = (
-        &persisted_session,
-        &persisted_tuple,
-        &pending_enrollment,
-    ) {
+    if let (Some(session), Ok(None), Ok(Some(pending))) =
+        (&persisted_session, &persisted_tuple, &pending_enrollment)
+    {
         if pending.prepared_body.is_some() {
-            let snapshot = reconcile_pending_enrollment(
-                &nest,
-                session,
-                did,
-                pending,
-                credentials,
-            )
-            .await?;
+            let snapshot =
+                reconcile_pending_enrollment(&nest, session, did, pending, credentials).await?;
             authority_state.install(snapshot);
             prepare_admitted_device_runtime(orchestrator, credentials, did).await?;
             return Ok(());
@@ -365,8 +355,9 @@ async fn establish_or_restore_authority(
         .body
         .ok_or_else(|| anyhow::anyhow!("Task 1 returned an empty enrollment body"))?;
     let typed: catbird_atproto::blue_catbird::chat::enroll_device::EnrollDevice<String> =
-        serde_json::from_slice(&body)
-            .map_err(|error| anyhow::anyhow!("prepared enrollment is not generated DTO JSON: {error}"))?;
+        serde_json::from_slice(&body).map_err(|error| {
+            anyhow::anyhow!("prepared enrollment is not generated DTO JSON: {error}")
+        })?;
     if typed.signed_request.body.idempotency_key.as_str() != idempotency_key
         || typed.signed_request.body.actor_did.as_str() != did
         || typed.signed_request.body.device_id.as_str() != device_id
@@ -379,7 +370,8 @@ async fn establish_or_restore_authority(
     let pending = credentials
         .get_pending_enrollment(did)?
         .ok_or_else(|| anyhow::anyhow!("pending enrollment disappeared before submission"))?;
-    let admitted = reconcile_pending_enrollment(&nest, &session, did, &pending, credentials).await?;
+    let admitted =
+        reconcile_pending_enrollment(&nest, &session, did, &pending, credentials).await?;
     authority_state.install(admitted);
     prepare_admitted_device_runtime(orchestrator, credentials, did).await?;
     Ok(())
@@ -417,7 +409,10 @@ pub(crate) async fn admit_existing_session(
     credentials: &Arc<FileCredentialStore>,
 ) -> Result<AuthoritySnapshot, AuthorityError> {
     let session_info = nest.session_info(session).await?;
-    let devices = nest.own_devices(session, device_id).await?;
+    let dpop_jkt = nest.preflight(session, device_id).await?;
+    let devices = nest
+        .own_devices(session, device_id, Some(&dpop_jkt))
+        .await?;
     let signer = credentials
         .get_signing_key(did)
         .await
@@ -434,6 +429,7 @@ pub(crate) async fn admit_existing_session(
         did,
         &devices,
         device_id,
+        &dpop_jkt,
         generation,
         signer_handle,
         &signer_public_key,
@@ -452,27 +448,15 @@ async fn reconcile_pending_enrollment(
         .prepared_body
         .clone()
         .ok_or_else(|| anyhow::anyhow!("pending enrollment has no prepared request bytes"))?;
+    let dpop_jkt = nest
+        .preflight(session, &pending.device_uuid)
+        .await
+        .map_err(|error| anyhow::anyhow!("Nest device preflight failed: {error}"))?;
     let response = nest
-        .post_signed_enrollment(session, &pending.device_uuid, body)
+        .post_signed_enrollment(session, &pending.device_uuid, body, &dpop_jkt)
         .await
         .map_err(|error| anyhow::anyhow!("Nest enrollment transport failed: {error}"))?;
-    if !(200..300).contains(&response.status) {
-        return Err(anyhow::anyhow!(
-            "Nest enrollment returned HTTP {}: {}",
-            response.status,
-            String::from_utf8_lossy(&response.body)
-        ));
-    }
-    if response.content_type.as_deref().is_some_and(|content_type| {
-        !content_type
-            .to_ascii_lowercase()
-            .starts_with("application/json")
-    }) {
-        return Err(anyhow::anyhow!(
-            "Nest enrollment returned non-JSON content type"
-        ));
-    }
-    let output: EnrollDeviceOutput<String> = serde_json::from_slice(&response.body)
+    let output: EnrollDeviceOutput<String> = serde_json::from_value(response)
         .map_err(|error| anyhow::anyhow!("Nest enrollment response is invalid: {error}"))?;
     if output.device.device_id.as_str() != pending.device_uuid
         || output.device.auth_generation < 1
@@ -488,7 +472,7 @@ async fn reconcile_pending_enrollment(
         .await
         .map_err(|error| anyhow::anyhow!("Nest session reconciliation failed: {error}"))?;
     let devices = nest
-        .own_devices(session, &pending.device_uuid)
+        .own_devices(session, &pending.device_uuid, Some(&dpop_jkt))
         .await
         .map_err(|error| anyhow::anyhow!("Nest getOwnDevices reconciliation failed: {error}"))?;
     let signer = credentials
@@ -513,6 +497,7 @@ async fn reconcile_pending_enrollment(
         did,
         &devices,
         &pending.device_uuid,
+        &dpop_jkt,
         output.device.auth_generation,
         signer_handle,
         &signer_public_key,
@@ -550,6 +535,7 @@ fn enrollment_body(
             cipher_suite: "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519".into(),
             control_profile: "publicGroup1".into(),
             credential_type: "basic".into(),
+            direct_request_profile: None,
             external_pub_group_info: "presentButExternalCommitsForbidden".into(),
             metadata_profile: "exporterAes256Gcm1".into(),
             mls_version: "1.0".into(),
