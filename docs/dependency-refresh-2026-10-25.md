@@ -30,7 +30,7 @@ rustup run 1.99.1 cargo fmt --check
 cargo audit
 ```
 
-The provenance command retains its historical filename for callers. The guard checks Cargo's resolved core dependency (either the canonical sibling repository or immutable Git revision), its complete enabled feature set (`[]`), the sealed commit `48f8adcaa0c18cd211ba2545581fca4a8ec175b0`, clean working tree state, and the tracked lockfile hash. The previous machine-specific receipt is retained under `scripts/provenance-baselines/` and is not represented as current evidence.
+The provenance command retains its historical filename for callers. The guard checks Cargo's resolved core dependency (either the canonical sibling repository or immutable Git revision), its complete enabled feature set (`[]`), the sealed commit `1b34865afc30a69c9b7fc78784c433513b40b656`, clean working tree state, and the tracked lockfile hash. The previous machine-specific receipt is retained under `scripts/provenance-baselines/` and is not represented as current evidence.
 
 Loopback tests exercise the actual HTTP/WebSocket transport with local fixtures and no accounts. They cover target validation, raw error preservation, session invalidation, generated frame decoding, fresh ticket/cursor encoding, failed processing without dispatch, and duplicate-frame rejection. These fixtures are separate from the shared core's native cursor/storage tests and do not establish live MLS decryption or bridge replies.
 

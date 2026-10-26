@@ -71,20 +71,38 @@ if [[ "$package_source" == "path" ]]; then
     exit 1
   fi
 
-  status_output=$(cd "$sibling_root" && jj st)
-  if ! grep -Fq 'The working copy has no changes.' <<<"$status_output"; then
-    printf 'catbird-mls sibling is dirty or conflicted: %s\n%s\n' "$sibling_root" "$status_output" >&2
-    exit 1
-  fi
+  if [[ -d "$sibling_root/.jj" ]] && command -v jj >/dev/null 2>&1; then
+    status_output=$(cd "$sibling_root" && jj st)
+    if ! grep -Fq 'The working copy has no changes.' <<<"$status_output"; then
+      printf 'catbird-mls sibling is dirty or conflicted: %s\n%s\n' "$sibling_root" "$status_output" >&2
+      exit 1
+    fi
 
-  actual_child=$(cd "$sibling_root" && jj log -r '@' --no-graph -T 'commit_id')
-  actual_parent=$(cd "$sibling_root" && jj log -r '@-' --no-graph -T 'commit_id')
-  actual_tree=$(cd "$sibling_root" && jj debug object commit "$actual_child" | awk '/TreeId\(/ { getline; gsub(/[",[:space:]]/, ""); print; exit }')
+    actual_child=$(cd "$sibling_root" && jj log -r '@' --no-graph -T 'commit_id')
+    actual_parent=$(cd "$sibling_root" && jj log -r '@-' --no-graph -T 'commit_id')
+    actual_tree=$(cd "$sibling_root" && jj debug object commit "$actual_child" | awk '/TreeId\(/ { getline; gsub(/[",[:space:]]/, ""); print; exit }')
 
-  if [[ "$actual_child" != "$expected_child" || "$actual_parent" != "$expected_commit" || "$actual_tree" != "$expected_tree" ]]; then
-    printf 'catbird-mls provenance mismatch\nexpected child: %s\nactual child:   %s\nexpected parent: %s\nactual parent:   %s\nexpected tree:   %s\nactual tree:     %s\n' \
-      "$expected_child" "$actual_child" "$expected_commit" "$actual_parent" "$expected_tree" "$actual_tree" >&2
-    exit 1
+    if [[ "$actual_child" != "$expected_child" || "$actual_parent" != "$expected_commit" || "$actual_tree" != "$expected_tree" ]]; then
+      printf 'catbird-mls provenance mismatch\nexpected child: %s\nactual child:   %s\nexpected parent: %s\nactual parent:   %s\nexpected tree:   %s\nactual tree:     %s\n' \
+        "$expected_child" "$actual_child" "$expected_commit" "$actual_parent" "$expected_tree" "$actual_tree" >&2
+      exit 1
+    fi
+  else
+    status_output=$(git -C "$sibling_root" status --porcelain --untracked-files=all)
+    if [[ -n "$status_output" ]]; then
+      printf 'catbird-mls sibling is dirty or conflicted: %s\n%s\n' "$sibling_root" "$status_output" >&2
+      exit 1
+    fi
+
+    actual_parent=$(git -C "$sibling_root" rev-parse HEAD)
+    actual_tree=$(git -C "$sibling_root" rev-parse 'HEAD^{tree}')
+    actual_child="git-head:$actual_parent"
+
+    if [[ "$actual_parent" != "$expected_commit" || "$actual_tree" != "$expected_tree" ]]; then
+      printf 'catbird-mls provenance mismatch\nexpected commit: %s\nactual commit:   %s\nexpected tree:   %s\nactual tree:     %s\n' \
+        "$expected_commit" "$actual_parent" "$expected_tree" "$actual_tree" >&2
+      exit 1
+    fi
   fi
 
   printf 'exact Cargo-resolved catbird-mls and lock provenance verified: manifest=%s commit=%s child=%s tree=%s features=%s lock=%s toolchain=%s\n' \

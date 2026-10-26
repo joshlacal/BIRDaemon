@@ -23,7 +23,7 @@ tokio = { version = "1.54.1", features = ["full"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "stream", "rustls", "query"] }
 
 # Storage
-rusqlite = { version = "0.37.0", features = ["bundled-sqlcipher"] }
+rusqlite = { version = "0.41.0", features = ["bundled-sqlcipher"] }
 
 # Serialization
 serde = { version = "1.0.229", features = ["derive"] }
@@ -45,8 +45,8 @@ ciborium = "0.2.2"
 # Crypto / encoding
 base64 = "0.23.1"
 ed25519-dalek = "3.0.0"
-openmls_basic_credential = { git = "https://github.com/joshlacal/openmls", rev = "c8327bfb64c986efd6c57bac4fd9c2bbcf584a62", version = "=0.6.0", features = ["draft-ietf-mls-pq-ciphersuites"] }
-openmls_traits = { git = "https://github.com/joshlacal/openmls", rev = "c8327bfb64c986efd6c57bac4fd9c2bbcf584a62", version = "=0.6.0", features = ["draft-ietf-mls-pq-ciphersuites"] }
+openmls_basic_credential = { git = "https://github.com/joshlacal/openmls", rev = "6874b636d3ada1f5608514441bb24ead5e34f5fa", version = "=0.6.0", features = ["draft-ietf-mls-pq-ciphersuites"] }
+openmls_traits = { git = "https://github.com/joshlacal/openmls", rev = "6874b636d3ada1f5608514441bb24ead5e34f5fa", version = "=0.6.0", features = ["draft-ietf-mls-pq-ciphersuites"] }
 sha2 = "0.11.1"
 hex = "0.4.3"
 

@@ -24,6 +24,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Checkout pinned canonical catbird-mls sibling
+        run: |
+          source scripts/canonical-sibling-provenance.env
+          rm -rf ../catbird-mls
+          git init ../catbird-mls
+          git -C ../catbird-mls remote add origin "$CATBIRD_MLS_REPOSITORY"
+          git -C ../catbird-mls fetch --depth 1 origin "$CATBIRD_MLS_COMMIT"
+          git -C ../catbird-mls checkout --detach FETCH_HEAD
       - name: Record native Linux runner and install build prerequisites
         run: |
           test "$(uname -m)" = x86_64
