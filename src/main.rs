@@ -1,569 +1,157 @@
-mod bot;
-mod bridge_client;
-mod chat_authority;
-mod config;
-mod credentials;
-mod keychain;
-
-mod storage;
-mod websocket;
-mod xrpc_client;
-
-#[cfg(test)]
-mod canonical_runtime_tests;
-
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
-use crate::chat_authority::{AuthorityError, AuthoritySnapshot, AuthorityState, NestClient};
-use crate::config::{data_dir, load_config, load_secrets};
-use crate::credentials::{FileCredentialStore, PendingEnrollment};
-use crate::keychain::FileKeychain;
-use crate::storage::SqliteStorage;
-use crate::xrpc_client::BirdApiClient;
+use bird_daemon::bot::{FederatedBirdBot, FederatedBotConfig, HttpLlmResponder};
+use bird_daemon::config::{data_dir, load_config, load_secrets};
+use catbird_mls::client::REQUIRED_LABYRINTH_OAUTH_SCOPES;
 
-use catbird_atproto::blue_catbird::chat::{
-    enroll_device::EnrollDeviceOutput, DeviceCapability, DeviceEnrollmentBody, KeyPackageArtifact,
-};
-use catbird_mls::orchestrator::credentials::CredentialStore;
-use catbird_mls::orchestrator::{
-    CanonicalOperation, CleanChatSigningContext, MLSOrchestrator, OrchestratorConfig,
-};
-use catbird_mls::MLSContext;
-use chrono::{SecondsFormat, Utc};
-use sha2::Digest as _;
-use std::str::FromStr;
+/// Authenticate directly against an ATProto PDS via `com.atproto.server.createSession` and
+/// mint a `com.atproto.server.getServiceAuth` JWT for the bot's home `mls-ds` (`G3`: zero `nest`).
+async fn authenticate_with_pds_and_home_ds(
+    pds_endpoint: &str,
+    identifier: &str,
+    app_password: &str,
+    home_ds_did: &str,
+) -> anyhow::Result<(String, String, String)> {
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?;
+    let trimmed = pds_endpoint.trim_end_matches('/');
+
+    let session_resp = http
+        .post(format!("{trimmed}/xrpc/com.atproto.server.createSession"))
+        .json(&serde_json::json!({
+            "identifier": identifier,
+            "password": app_password,
+        }))
+        .send()
+        .await?;
+    let status = session_resp.status();
+    let session_val: serde_json::Value = session_resp.json().await?;
+    if !status.is_success() {
+        anyhow::bail!("PDS createSession failed ({status}): {session_val}");
+    }
+    let did = session_val
+        .get("did")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing did in createSession response"))?
+        .to_string();
+    let access_jwt = session_val
+        .get("accessJwt")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing accessJwt in createSession response"))?
+        .to_string();
+
+    let svc_resp = http
+        .get(format!("{trimmed}/xrpc/com.atproto.server.getServiceAuth"))
+        .bearer_auth(&access_jwt)
+        .query(&[("aud", home_ds_did)])
+        .send()
+        .await?;
+    let svc_status = svc_resp.status();
+    let svc_val: serde_json::Value = svc_resp.json().await?;
+    if !svc_status.is_success() {
+        anyhow::bail!("PDS getServiceAuth failed ({svc_status}): {svc_val}");
+    }
+    let service_token = svc_val
+        .get("token")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing token in getServiceAuth response"))?
+        .to_string();
+
+    Ok((did, access_jwt, service_token))
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Init tracing
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
 
-    tracing::info!("BIRD Daemon starting...");
+    tracing::info!("BIRDaemon (Clean-Slate Federated MLS + Spaces, zero Nest) starting...");
 
-    // Load config
-    let config = load_config()?;
+    let cfg = load_config()?;
     let secrets = load_secrets()?;
-    tracing::info!("Handle: {}", config.handle);
-    tracing::info!("LLM: {} at {}", config.llm_model, config.llm_base_url);
+    let storage_root = data_dir();
+    std::fs::create_dir_all(&storage_root)?;
 
-    // Authenticate with Bluesky via jacquard (legacy app password)
-    tracing::info!("Authenticating as {}...", config.handle);
+    let (resolved_did, pds_token, ds_service_token) =
+        if let Some(ref app_pw) = secrets.app_password {
+            let (did, access_jwt, svc_tok) = authenticate_with_pds_and_home_ds(
+                &cfg.pds_endpoint,
+                &cfg.handle,
+                app_pw,
+                &cfg.home_ds_did,
+            )
+            .await?;
+            (
+                did,
+                secrets.pds_oauth_token.clone().unwrap_or(access_jwt),
+                Some(svc_tok),
+            )
+        } else {
+            let did = cfg.bot_did.clone().ok_or_else(|| {
+                anyhow::anyhow!("botDid required when using BIRD_PDS_OAUTH_TOKEN")
+            })?;
+            let tok = secrets
+                .pds_oauth_token
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("missing BIRD_PDS_OAUTH_TOKEN"))?;
+            (did, tok, None)
+        };
 
-    let (session, atp_session) = jacquard::client::MemoryCredentialSession::authenticated(
-        &config.handle,
-        &secrets.app_password,
-        None,
-        None,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("Authentication failed: {}", e))?;
+    let responder = Arc::new(HttpLlmResponder::new(
+        cfg.llm_base_url.clone(),
+        cfg.llm_api_key.clone(),
+        cfg.llm_model.clone(),
+        cfg.system_prompt.clone(),
+    )?);
 
-    let did = atp_session.did.to_string();
-    let pds_endpoint = session.endpoint().await.to_string();
-    let session = Arc::new(session);
+    let bot_cfg = FederatedBotConfig {
+        storage_root,
+        bot_did: resolved_did,
+        bot_handle: cfg.handle.clone(),
+        device_id: cfg.device_id.clone(),
+        home_ds_did: cfg.home_ds_did.clone(),
+        home_ds_endpoint: cfg.home_ds_endpoint.clone(),
+        pds_endpoint: cfg.pds_endpoint.clone(),
+        pds_supports_spaces: true,
+        granted_oauth_scopes: REQUIRED_LABYRINTH_OAUTH_SCOPES
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+        accept_chat_requests: cfg.accept_chat_requests,
+        reply_to_all_messages: cfg.reply_to_all_messages,
+        max_reply_characters: cfg.max_reply_characters,
+    };
 
-    tracing::info!("Authenticated! DID: {}", did);
-    tracing::info!("PDS endpoint: {}", pds_endpoint);
-
-    let data_dir = data_dir();
-    std::fs::create_dir_all(&data_dir)?;
-    let creds_path = data_dir.join("credentials.json");
-    let credentials = Arc::new(
-        FileCredentialStore::new(creds_path)
-            .map_err(|e| anyhow::anyhow!("Failed to open MLS credentials: {e}"))?,
+    let bot = FederatedBirdBot::open_and_enroll(bot_cfg, responder)?;
+    bot.set_auth_tokens(ds_service_token, Some(pds_token));
+    tracing::info!(
+        did = %bot.account_did(),
+        mailbox_space = %bot.enrollment_receipt().mailbox_space_uri,
+        "BIRDaemon enrolled and running without Nest"
     );
 
-    // The Jacquard session remains available for legacy non-chat identity
-    // resolution only. Clean-chat calls are wired to the opaque Nest session
-    // below and never use this bearer.
-    let invalidation_credentials = credentials.clone();
-    let invalidation_did = did.clone();
-    let authority_state = Arc::new(AuthorityState::with_invalidation_hook(Arc::new(
-        move || {
-            invalidation_credentials
-                .clear_clean_chat_authority(&invalidation_did)
-                .map_err(|_| AuthorityError::Unavailable)
-        },
-    )));
-    let nest = match std::env::var("BIRD_NEST_BASE_URL") {
-        Ok(base_url) => {
-            Some(Arc::new(NestClient::new(&base_url).map_err(|_| {
-                anyhow::anyhow!("BIRD_NEST_BASE_URL is invalid")
-            })?))
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("Received Ctrl-C; shutting down BIRDaemon cleanly");
+                break;
+            }
+            _ = tick.tick() => {
+                if let Err(e) = bot.accept_pending_requests() {
+                    tracing::warn!("accept_pending_requests failed: {e}");
+                }
+                if let Err(e) = bot.flush_labyrinth_queue() {
+                    tracing::debug!("flush_labyrinth_queue deferred: {e}");
+                }
+            }
         }
-        Err(_) => None,
-    };
-    let api_client = BirdApiClient::new(
-        pds_endpoint.clone(),
-        session,
-        did.clone(),
-        config.handle.clone(),
-        secrets.app_password.clone(),
-    );
-    let api_client = if let Some(nest) = &nest {
-        Arc::new(api_client.with_chat_authority(
-            nest.clone(),
-            authority_state.clone(),
-            credentials.clone(),
-        ))
-    } else {
-        Arc::new(api_client)
-    };
-
-    // Create MLS state directory
-    let mls_state_dir = data_dir.join("mls-state");
-    std::fs::create_dir_all(&mls_state_dir)?;
-
-    // Create keychain
-    let keychain_path = data_dir.join("keychain.json");
-    let keychain = FileKeychain::new(keychain_path)
-        .map_err(|e| anyhow::anyhow!("Failed to open MLS keychain: {e}"))?;
-    let epoch_secret_storage = keychain
-        .with_epoch_secret_owner(&did)
-        .map_err(|e| anyhow::anyhow!("Failed to scope MLS epoch-secret storage: {e}"))?;
-
-    // Create MLS crypto context
-    // Use a sanitized DID for the database filename (replace : and . with _)
-    let did_sanitized = did.replace([':', '.'], "_");
-    let mls_db_path = mls_state_dir.join(format!("{}.db", did_sanitized));
-    let mls_db_key =
-        get_or_create_mls_db_key(&mls_state_dir, &did_sanitized, &secrets.app_password)?;
-    let mls_context = MLSContext::new(
-        mls_db_path.to_string_lossy().to_string(),
-        mls_db_key,
-        Box::new(keychain),
-    )
-    .map_err(|e| anyhow::anyhow!("Failed to create MLS context: {}", e))?;
-    mls_context
-        .set_epoch_secret_storage(Box::new(epoch_secret_storage))
-        .map_err(|e| anyhow::anyhow!("Failed to install MLS epoch-secret storage: {e}"))?;
-
-    // Create storage backend
-    let storage_db_path = data_dir.join("bird.db");
-    let storage = Arc::new(SqliteStorage::new(storage_db_path)?);
-
-    // Create orchestrator
-    let orchestrator = Arc::new(MLSOrchestrator::new(
-        mls_context,
-        storage,
-        api_client.clone(),
-        credentials.clone(),
-        OrchestratorConfig::default(),
-    ));
-    api_client.set_signer(orchestrator.clone());
-
-    // Initialize orchestrator with user DID
-    tracing::info!("Initializing MLS orchestrator...");
-    orchestrator
-        .initialize(&did)
-        .await
-        .map_err(|e| anyhow::anyhow!("Orchestrator init failed: {}", e))?;
-    tracing::info!("Orchestrator initialized");
-
-    let Some(nest) = nest else {
-        tracing::warn!(
-            "Clean-chat authority disabled: BIRD_NEST_BASE_URL is not configured; chat bot loop will not start"
-        );
-        return Ok(());
-    };
-    match establish_or_restore_authority(
-        nest,
-        authority_state,
-        &did,
-        &config.handle,
-        &orchestrator,
-        &credentials,
-    )
-    .await
-    {
-        Ok(()) => {
-            tracing::info!("Clean-chat authority established; starting BIRD bot loop");
-            let llm = crate::bridge_client::BridgeClient::new("http://127.0.0.1:8789");
-            let bot = crate::bot::BirdBot::new(
-                did.clone(),
-                api_client.clone(),
-                orchestrator.clone(),
-                llm,
-                config.clone(),
-            );
-            bot.run().await?;
-        }
-        Err(error) => tracing::warn!(
-            error = %error,
-            "Clean-chat authority unavailable; chat bot loop disabled"
-        ),
     }
 
     Ok(())
-}
-
-fn get_or_create_mls_db_key(
-    dir: &std::path::Path,
-    did_sanitized: &str,
-    fallback_app_password: &str,
-) -> anyhow::Result<String> {
-    let key_path = dir.join(format!("{}.key", did_sanitized));
-    let db_path = dir.join(format!("{}.db", did_sanitized));
-    if key_path.exists() {
-        let key = std::fs::read_to_string(&key_path)?;
-        let trimmed = key.trim().to_string();
-        if !trimmed.is_empty() {
-            return Ok(trimmed);
-        }
-    }
-    // Backward compatibility: if the database existed before independent keying, reuse the app password
-    let hex_key = if db_path.exists() {
-        fallback_app_password.to_string()
-    } else {
-        use rand::Rng;
-        let mut raw = [0u8; 32];
-        rand::rng().fill_bytes(&mut raw);
-        hex::encode(raw)
-    };
-    let tmp = key_path.with_extension("key.tmp");
-    std::fs::write(&tmp, &hex_key)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    }
-    std::fs::rename(&tmp, &key_path)?;
-    Ok(hex_key)
-}
-
-type BirdOrchestrator =
-    MLSOrchestrator<SqliteStorage, BirdApiClient, FileCredentialStore, MLSContext>;
-
-/// Restore only a protected opaque Nest session after restart, and admit it
-/// only after both `/auth/session` and `getOwnDevices` prove the exact tuple.
-/// Any mismatch clears the local authority and starts a fresh purpose-bound
-/// browser enrollment; it never falls back to Jacquard bearer auth.
-async fn establish_or_restore_authority(
-    nest: Arc<NestClient>,
-    authority_state: Arc<AuthorityState>,
-    did: &str,
-    handle: &str,
-    orchestrator: &Arc<BirdOrchestrator>,
-    credentials: &Arc<FileCredentialStore>,
-) -> anyhow::Result<()> {
-    let persisted_session = credentials.get_opaque_chat_session(did)?;
-    let persisted_tuple = credentials.get_admitted_device_tuple(did);
-    let pending_enrollment = credentials.get_pending_enrollment(did);
-    if let (Some(session), Ok(Some(tuple)), Ok(None)) =
-        (&persisted_session, &persisted_tuple, &pending_enrollment)
-    {
-        if let Ok(snapshot) = admit_existing_session(
-            &nest,
-            session,
-            did,
-            &tuple.device_uuid,
-            tuple.auth_generation,
-            credentials,
-        )
-        .await
-        {
-            authority_state.install(snapshot);
-            prepare_admitted_device_runtime(orchestrator, credentials, did).await?;
-            return Ok(());
-        }
-    }
-    if let (Some(session), Ok(None), Ok(Some(pending))) =
-        (&persisted_session, &persisted_tuple, &pending_enrollment)
-    {
-        if pending.prepared_body.is_some() {
-            let snapshot =
-                reconcile_pending_enrollment(&nest, session, did, pending, credentials).await?;
-            authority_state.install(snapshot);
-            prepare_admitted_device_runtime(orchestrator, credentials, did).await?;
-            return Ok(());
-        }
-    }
-    if persisted_session.is_some()
-        || !matches!(persisted_tuple, Ok(None))
-        || !matches!(pending_enrollment, Ok(None))
-    {
-        // A session without one complete admitted tuple (or vice versa) has no
-        // authority after restart. Clear both halves before a new enrollment.
-        credentials.clear_clean_chat_authority(did)?;
-    }
-
-    let session = nest
-        .establish_session(handle)
-        .await
-        .map_err(|_| anyhow::anyhow!("purpose-bound Nest browser enrollment failed"))?;
-    let session_info = nest
-        .session_info(&session)
-        .await
-        .map_err(|_| anyhow::anyhow!("Nest session admission failed"))?;
-    if session_info.did != did {
-        return Err(anyhow::anyhow!(
-            "Nest browser account does not match daemon DID"
-        ));
-    }
-    credentials.store_opaque_chat_session(did, &session)?;
-
-    // The v2 device identifier is fresh for every enrollment attempt. It is
-    // never read from or reused from the legacy mlsChat credential map.
-    let device_id = uuid::Uuid::new_v4().to_string();
-    let mls_did = format!("{did}#{device_id}");
-    let key_package = orchestrator
-        .mls_context()
-        .create_key_package(mls_did.as_bytes().to_vec())
-        .map_err(|e| anyhow::anyhow!("failed to create v2 key package: {e}"))?;
-    let key_data = orchestrator
-        .mls_context()
-        .export_identity_key(mls_did.clone())
-        .map_err(|e| anyhow::anyhow!("failed to export device-scoped signer material: {e}"))?;
-    credentials.store_signing_key(did, &key_data).await?;
-    let signer_handle = crate::chat_authority::derive_key_id(&key_package.signature_public_key);
-    let idempotency_key = uuid::Uuid::new_v4().to_string();
-    credentials.begin_pending_enrollment(did, &device_id, &mls_did, &idempotency_key)?;
-
-    let enrollment_body = enrollment_body(
-        did,
-        &device_id,
-        &signer_handle,
-        &idempotency_key,
-        &key_package,
-    )?;
-    let prepared = orchestrator
-        .prepare_clean_chat_signed_request(
-            CleanChatSigningContext {
-                actor_did: did.to_owned(),
-                device_id: device_id.clone(),
-                auth_generation: None,
-            },
-            CanonicalOperation::EnrollDevice,
-            enrollment_body,
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("Task 1 refused the v2 enrollment transcript"))?;
-    if prepared.operation != CanonicalOperation::EnrollDevice
-        || prepared.method != "POST"
-        || prepared.path != CanonicalOperation::EnrollDevice.path()
-    {
-        return Err(anyhow::anyhow!(
-            "Task 1 returned a noncanonical enrollment request target"
-        ));
-    }
-    let body = prepared
-        .body
-        .ok_or_else(|| anyhow::anyhow!("Task 1 returned an empty enrollment body"))?;
-    let typed: catbird_atproto::blue_catbird::chat::enroll_device::EnrollDevice<String> =
-        serde_json::from_slice(&body).map_err(|error| {
-            anyhow::anyhow!("prepared enrollment is not generated DTO JSON: {error}")
-        })?;
-    if typed.signed_request.body.idempotency_key.as_str() != idempotency_key
-        || typed.signed_request.body.actor_did.as_str() != did
-        || typed.signed_request.body.device_id.as_str() != device_id
-    {
-        return Err(anyhow::anyhow!(
-            "prepared enrollment escaped its durable account/device/idempotency binding"
-        ));
-    }
-    credentials.finalize_pending_enrollment(did, &idempotency_key, &body)?;
-    let pending = credentials
-        .get_pending_enrollment(did)?
-        .ok_or_else(|| anyhow::anyhow!("pending enrollment disappeared before submission"))?;
-    let admitted =
-        reconcile_pending_enrollment(&nest, &session, did, &pending, credentials).await?;
-    authority_state.install(admitted);
-    prepare_admitted_device_runtime(orchestrator, credentials, did).await?;
-    Ok(())
-}
-
-async fn prepare_admitted_device_runtime(
-    orchestrator: &Arc<BirdOrchestrator>,
-    credentials: &Arc<FileCredentialStore>,
-    did: &str,
-) -> anyhow::Result<()> {
-    let admitted = credentials
-        .get_admitted_device_tuple(did)?
-        .ok_or_else(|| anyhow::anyhow!("admitted clean-chat device tuple disappeared"))?;
-    let orchestrator_identity = orchestrator
-        .ensure_device_registered()
-        .await
-        .map_err(|error| anyhow::anyhow!("admitted MLS device readiness failed: {error}"))?;
-    if orchestrator_identity != admitted.mls_did {
-        return Err(anyhow::anyhow!(
-            "shared orchestrator selected a different MLS device identity"
-        ));
-    }
-    orchestrator
-        .replenish_if_needed()
-        .await
-        .map_err(|error| anyhow::anyhow!("device-scoped key-package replenishment failed: {error}"))
-}
-
-pub(crate) async fn admit_existing_session(
-    nest: &NestClient,
-    session: &str,
-    did: &str,
-    device_id: &str,
-    generation: i64,
-    credentials: &Arc<FileCredentialStore>,
-) -> Result<AuthoritySnapshot, AuthorityError> {
-    let session_info = nest.session_info(session).await?;
-    let dpop_jkt = nest.preflight(session, device_id).await?;
-    let devices = nest
-        .own_devices(session, device_id, Some(&dpop_jkt))
-        .await?;
-    let signer = credentials
-        .get_signing_key(did)
-        .await
-        .map_err(|_| AuthorityError::Unavailable)?
-        .and_then(|key| {
-            serde_json::from_slice::<openmls_basic_credential::SignatureKeyPair>(&key).ok()
-        })
-        .ok_or(AuthorityError::Unavailable)?;
-    let signer_handle = crate::chat_authority::derive_key_id(signer.public());
-    let signer_public_key = signer.public().to_vec();
-    AuthoritySnapshot::admit(
-        session.to_owned(),
-        &session_info,
-        did,
-        &devices,
-        device_id,
-        &dpop_jkt,
-        generation,
-        signer_handle,
-        &signer_public_key,
-        1,
-    )
-}
-
-async fn reconcile_pending_enrollment(
-    nest: &NestClient,
-    session: &str,
-    did: &str,
-    pending: &PendingEnrollment,
-    credentials: &Arc<FileCredentialStore>,
-) -> anyhow::Result<AuthoritySnapshot> {
-    let body = pending
-        .prepared_body
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("pending enrollment has no prepared request bytes"))?;
-    let dpop_jkt = nest
-        .preflight(session, &pending.device_uuid)
-        .await
-        .map_err(|error| anyhow::anyhow!("Nest device preflight failed: {error}"))?;
-    let response = nest
-        .post_signed_enrollment(session, &pending.device_uuid, body, &dpop_jkt)
-        .await
-        .map_err(|error| anyhow::anyhow!("Nest enrollment transport failed: {error}"))?;
-    let output: EnrollDeviceOutput<String> = serde_json::from_value(response)
-        .map_err(|error| anyhow::anyhow!("Nest enrollment response is invalid: {error}"))?;
-    if output.device.device_id.as_str() != pending.device_uuid
-        || output.device.auth_generation < 1
-        || output.device.status.as_str() != "active"
-    {
-        return Err(anyhow::anyhow!(
-            "Nest enrollment response does not admit the pending device"
-        ));
-    }
-
-    let session_info = nest
-        .session_info(session)
-        .await
-        .map_err(|error| anyhow::anyhow!("Nest session reconciliation failed: {error}"))?;
-    let devices = nest
-        .own_devices(session, &pending.device_uuid, Some(&dpop_jkt))
-        .await
-        .map_err(|error| anyhow::anyhow!("Nest getOwnDevices reconciliation failed: {error}"))?;
-    let signer = credentials
-        .get_signing_key(did)
-        .await?
-        .and_then(|key| {
-            serde_json::from_slice::<openmls_basic_credential::SignatureKeyPair>(&key).ok()
-        })
-        .ok_or_else(|| anyhow::anyhow!("pending enrollment signer is unavailable"))?;
-    let signer_handle = crate::chat_authority::derive_key_id(signer.public());
-    let signer_public_key = signer.public().to_vec();
-    if output.device.key_id.as_str() != signer_handle
-        || output.device.signature_public_key.as_ref() != signer_public_key
-    {
-        return Err(anyhow::anyhow!(
-            "Nest enrollment response signer does not match the pending identity"
-        ));
-    }
-    let admitted = AuthoritySnapshot::admit(
-        session.to_owned(),
-        &session_info,
-        did,
-        &devices,
-        &pending.device_uuid,
-        &dpop_jkt,
-        output.device.auth_generation,
-        signer_handle,
-        &signer_public_key,
-        1,
-    )
-    .map_err(|error| anyhow::anyhow!("Nest device tuple could not be admitted: {error}"))?;
-    credentials.install_admitted_device_tuple(
-        did,
-        admitted.device_id(),
-        &pending.mls_did,
-        admitted.auth_generation(),
-    )?;
-    Ok(admitted)
-}
-
-fn enrollment_body(
-    did: &str,
-    device_id: &str,
-    signer_handle: &str,
-    idempotency_key: &str,
-    key_package: &catbird_mls::KeyPackageResult,
-) -> anyhow::Result<Vec<u8>> {
-    let package_sha256 = sha2::Sha256::digest(&key_package.key_package_data);
-    let signed_at = catbird_atproto::blue_catbird::chat::CanonicalDatetime::from_str(
-        &Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
-    )
-    .map_err(|error| anyhow::anyhow!("failed to construct canonical enrollment time: {error}"))?;
-    let body = DeviceEnrollmentBody::<String> {
-        actor_did: catbird_atproto::types::string::Did::<String>::new(did.to_owned())
-            .map_err(|error| anyhow::anyhow!("invalid enrollment actor DID: {error}"))?,
-        capability: DeviceCapability {
-            add_by_value: "supported".into(),
-            application_frame_profile: "dagCborApplication1".into(),
-            attachment_profile: "aes256GcmBlob1".into(),
-            cipher_suite: "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519".into(),
-            control_profile: "publicGroup1".into(),
-            credential_type: "basic".into(),
-            direct_request_profile: None,
-            external_pub_group_info: "presentButExternalCommitsForbidden".into(),
-            metadata_profile: "exporterAes256Gcm1".into(),
-            mls_version: "1.0".into(),
-            protocol_version: "1".into(),
-            ratchet_tree_group_info: "supported".into(),
-            remove_by_value: "supported".into(),
-            typing_profile: "signedClearEphemeral1".into(),
-            update_path: "supported".into(),
-            extra_data: None,
-        },
-        device_id: device_id.to_owned(),
-        device_name: "BIRDaemon".into(),
-        expected_auth_generation: 0,
-        idempotency_key: idempotency_key.to_owned(),
-        key_id: signer_handle.to_owned(),
-        key_packages: vec![KeyPackageArtifact {
-            bytes: key_package.key_package_data.clone().into(),
-            content_type: "keyPackage".into(),
-            framing: "mlsMessage".into(),
-            key_package_ref: key_package.hash_ref.clone().into(),
-            sha256: package_sha256.to_vec().into(),
-            extra_data: None,
-        }],
-        signature_domain: "CATBIRD-CHAT-DEVICE-ENROLL\0".into(),
-        signature_public_key: key_package.signature_public_key.clone().into(),
-        signed_at,
-        extra_data: None,
-    };
-    serde_json::to_vec(&body)
-        .map_err(|error| anyhow::anyhow!("failed to serialize generated enrollment DTO: {error}"))
 }
