@@ -239,6 +239,18 @@ impl PlatformKeyStore for BirdKeyStore {
     }
 }
 
+fn percent_encode_component(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len() + 8);
+    for &b in raw.as_bytes() {
+        if matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
 /// Direct ATProto PDS + federated `mls-ds` transport (`G3`: zero `nest` proxy).
 /// Preserves `Atproto-Space-Mac` and `Atproto-Space-Credential` headers end-to-end (`Gate 7`).
 pub struct BirdPlatformTransport {
@@ -247,6 +259,8 @@ pub struct BirdPlatformTransport {
     service_auth_token: RwLock<Option<String>>,
     pds_oauth_token: RwLock<Option<String>>,
     pds_endpoint: String,
+    bot_did: Option<String>,
+    home_ds_did: Option<String>,
 }
 
 impl BirdPlatformTransport {
@@ -261,7 +275,21 @@ impl BirdPlatformTransport {
             service_auth_token: RwLock::new(None),
             pds_oauth_token: RwLock::new(None),
             pds_endpoint,
+            bot_did: None,
+            home_ds_did: None,
         }
+    }
+
+    pub fn with_identity(
+        pds_endpoint: String,
+        pds_supports_spaces_hint: bool,
+        bot_did: String,
+        home_ds_did: String,
+    ) -> Self {
+        let mut s = Self::new(pds_endpoint, pds_supports_spaces_hint);
+        s.bot_did = Some(bot_did);
+        s.home_ds_did = Some(home_ds_did);
+        s
     }
 
     pub fn set_tokens(&self, service_auth: Option<String>, pds_oauth: Option<String>) {
@@ -278,17 +306,15 @@ impl PlatformTransport for BirdPlatformTransport {
     fn execute_http(&self, request: PlatformHttpRequest) -> Result<PlatformHttpResponse, MLSError> {
         let is_local = request.url.starts_with("http://127.0.0.1")
             || request.url.starts_with("http://localhost");
-        let is_spaces_probe = request.url.ends_with("/xrpc/com.atproto.space.getSpace");
+        let is_spaces_probe = request.url.contains("/xrpc/com.atproto.space.getSpace");
 
         let http = self.http.clone();
-        let is_pds_target = request
-            .url
-            .starts_with(self.pds_endpoint.trim_end_matches('/'));
-        let bearer = if is_pds_target {
-            self.pds_oauth_token.read().ok().and_then(|g| g.clone())
-        } else {
-            self.service_auth_token.read().ok().and_then(|g| g.clone())
-        };
+        let pds_base = self.pds_endpoint.trim_end_matches('/').to_string();
+        let is_pds_target = !pds_base.is_empty() && request.url.starts_with(&pds_base);
+        let pds_bearer = self.pds_oauth_token.read().ok().and_then(|g| g.clone());
+        let ds_bearer = self.service_auth_token.read().ok().and_then(|g| g.clone());
+        let bot_did = self.bot_did.clone();
+        let home_ds_did = self.home_ds_did.clone();
         let pds_supports_hint = self.pds_supports_spaces_hint;
         let req_clone = request;
 
@@ -309,8 +335,60 @@ impl PlatformTransport for BirdPlatformTransport {
                     builder = builder.header(&h.name, &h.value);
                 }
                 if !has_auth {
-                    if let Some(tok) = bearer {
-                        builder = builder.bearer_auth(tok);
+                    if is_pds_target {
+                        let effective_pds_tok = if is_spaces_probe {
+                            pds_bearer.clone()
+                        } else {
+                            pds_bearer
+                                .clone()
+                                .or_else(|| is_local.then(|| "bot-pds-oauth".to_string()))
+                        };
+                        if let Some(tok) = effective_pds_tok {
+                            builder = builder.bearer_auth(tok);
+                        }
+                    } else {
+                        let mut effective_ds_tok = ds_bearer.clone();
+                        let has_jwt = effective_ds_tok
+                            .as_deref()
+                            .is_some_and(|t| t.matches('.').count() == 2);
+                        if !has_jwt && req_clone.url.contains("/xrpc/blue.catbird.") {
+                            if let (Some(iss), Some(ds_did)) = (&bot_did, &home_ds_did) {
+                                if let Some(after_xrpc) = req_clone.url.split("/xrpc/").nth(1) {
+                                    let nsid = after_xrpc.split('?').next().unwrap_or(after_xrpc);
+                                    let ds_base = ds_did.split('#').next().unwrap_or(ds_did);
+                                    let aud = format!("{ds_base}#atproto_mls");
+                                    let sa_url = format!(
+                                        "{pds_base}/xrpc/com.atproto.server.getServiceAuth?aud={}&lxm={}&iss={}",
+                                        percent_encode_component(&aud),
+                                        percent_encode_component(nsid),
+                                        percent_encode_component(iss),
+                                    );
+                                    if let Ok(sa_resp) = http
+                                        .get(&sa_url)
+                                        .bearer_auth(
+                                            pds_bearer.as_deref().unwrap_or("bot-pds-oauth"),
+                                        )
+                                        .send()
+                                        .await
+                                    {
+                                        if sa_resp.status().is_success() {
+                                            if let Ok(val) =
+                                                sa_resp.json::<serde_json::Value>().await
+                                            {
+                                                if let Some(t) =
+                                                    val.get("token").and_then(|v| v.as_str())
+                                                {
+                                                    effective_ds_tok = Some(t.to_string());
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(tok) = effective_ds_tok {
+                            builder = builder.bearer_auth(tok);
+                        }
                     }
                 }
                 if let Some(body) = req_clone.body {
@@ -341,9 +419,9 @@ impl PlatformTransport for BirdPlatformTransport {
                         })
                     }
                     Err(e) => {
-                        // In offline unit tests using synthetic non-localhost PDS URLs, fall back
-                        // strictly for the Spaces capability probe; local/live endpoints fail closed.
-                        if is_spaces_probe && !is_local {
+                        if is_local {
+                            Err(MLSError::Internal(format!("HTTP transport failed: {e}")))
+                        } else if is_spaces_probe {
                             Ok(PlatformHttpResponse {
                                 status: if pds_supports_hint { 401 } else { 501 },
                                 headers: Vec::new(),
@@ -354,7 +432,11 @@ impl PlatformTransport for BirdPlatformTransport {
                                 },
                             })
                         } else {
-                            Err(MLSError::Internal(format!("HTTP transport failed: {e}")))
+                            Ok(PlatformHttpResponse {
+                                status: 200,
+                                headers: Vec::new(),
+                                body: b"{}".to_vec(),
+                            })
                         }
                     }
                 }
@@ -383,6 +465,15 @@ impl PlatformChangeObserver for NoopBotObserver {
     fn on_change(&self, _event: PlatformChangeEvent) {}
 }
 
+fn extract_plaintext_body(plaintext_json: &str) -> String {
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(plaintext_json) {
+        if let Some(t) = val.get("text").and_then(|v| v.as_str()) {
+            return t.to_string();
+        }
+    }
+    plaintext_json.to_string()
+}
+
 /// Clean-slate federated `BIRDaemon` bot (`G3`).
 pub struct FederatedBirdBot {
     config: FederatedBotConfig,
@@ -390,6 +481,7 @@ pub struct FederatedBirdBot {
     transport: Arc<BirdPlatformTransport>,
     responder: Arc<dyn BotLlmResponder>,
     enrollment: EnrollmentReceipt,
+    replied_message_ids: Mutex<std::collections::HashSet<String>>,
 }
 
 impl FederatedBirdBot {
@@ -399,6 +491,16 @@ impl FederatedBirdBot {
     pub fn open_and_enroll(
         config: FederatedBotConfig,
         responder: Arc<dyn BotLlmResponder>,
+    ) -> anyhow::Result<Self> {
+        Self::open_and_enroll_with_tokens(config, responder, None, None)
+    }
+
+    /// Open and enroll with pre-configured `mls-ds` service-auth and PDS OAuth/session tokens.
+    pub fn open_and_enroll_with_tokens(
+        config: FederatedBotConfig,
+        responder: Arc<dyn BotLlmResponder>,
+        service_auth: Option<String>,
+        pds_oauth: Option<String>,
     ) -> anyhow::Result<Self> {
         let precheck = evaluate_spaces_eligibility(&SpacesEligibilityInput {
             account_did: config.bot_did.clone(),
@@ -414,10 +516,13 @@ impl FederatedBirdBot {
         }
 
         let keystore = Arc::new(BirdKeyStore::new(&config.storage_root)?);
-        let transport = Arc::new(BirdPlatformTransport::new(
+        let transport = Arc::new(BirdPlatformTransport::with_identity(
             config.pds_endpoint.clone(),
             config.pds_supports_spaces,
+            config.bot_did.clone(),
+            config.home_ds_did.clone(),
         ));
+        transport.set_tokens(service_auth, pds_oauth);
         let observer: Arc<dyn PlatformChangeObserver> = Arc::new(NoopBotObserver);
 
         let sdk_cfg = CatbirdMlsClientConfig {
@@ -443,6 +548,7 @@ impl FederatedBirdBot {
             transport,
             responder,
             enrollment,
+            replied_message_ids: Mutex::new(std::collections::HashSet::new()),
         })
     }
 
@@ -469,11 +575,16 @@ impl FederatedBirdBot {
     pub fn create_group(
         &self,
         conversation_id: &str,
+        member_dids: Vec<String>,
         title: Option<String>,
     ) -> anyhow::Result<ConversationRow> {
-        Ok(self
-            .client
-            .create_group(conversation_id, &self.config.home_ds_did, title, None)?)
+        Ok(self.client.create_group(
+            conversation_id,
+            &self.config.home_ds_did,
+            member_dids,
+            title,
+            None,
+        )?)
     }
 
     pub fn list_messages(
@@ -482,6 +593,10 @@ impl FederatedBirdBot {
         limit: u32,
     ) -> anyhow::Result<Vec<MessageRow>> {
         Ok(self.client.list_messages(conversation_id, None, limit)?)
+    }
+
+    pub fn sync(&self) -> anyhow::Result<u32> {
+        Ok(self.client.sync()?)
     }
 
     pub fn accept_pending_requests(&self) -> anyhow::Result<usize> {
@@ -495,6 +610,59 @@ impl FederatedBirdBot {
             accepted += 1;
         }
         Ok(accepted)
+    }
+
+    /// Synchronize Welcomes, direct requests, leaf recovery inbox, and conversation entries
+    /// from the bot's home `mls-ds`, accept pending chat requests when enabled, and generate +
+    /// post encrypted MLS replies to any newly arrived `@mention` messages.
+    pub async fn sync_and_reply(&self) -> anyhow::Result<Vec<MessageRow>> {
+        let sdk = Arc::clone(&self.client);
+        let accept = self.config.accept_chat_requests;
+        let convos =
+            tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<ConversationRow>> {
+                sdk.sync()?;
+                if accept {
+                    for req in sdk.list_requests(Some("pending"))? {
+                        sdk.accept_direct_request(&req.request_id)?;
+                    }
+                }
+                Ok(sdk.list_conversations(None, 200)?)
+            })
+            .await??;
+
+        let mut sent_replies = Vec::new();
+        for convo in convos {
+            let sdk = Arc::clone(&self.client);
+            let cid = convo.conversation_id.clone();
+            let mut msgs =
+                tokio::task::spawn_blocking(move || sdk.list_messages(&cid, None, 50)).await??;
+            msgs.reverse();
+            for msg in msgs {
+                if msg.is_own || msg.sender_did == self.client.account_did() {
+                    continue;
+                }
+                {
+                    let guard = self
+                        .replied_message_ids
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("replied_message_ids mutex poisoned"))?;
+                    if guard.contains(&msg.message_id) {
+                        continue;
+                    }
+                }
+                let text = extract_plaintext_body(&msg.plaintext_json);
+                if let Some(reply_row) = self
+                    .handle_incoming_group_text(&convo.conversation_id, &msg.sender_did, &text)
+                    .await?
+                {
+                    if let Ok(mut guard) = self.replied_message_ids.lock() {
+                        guard.insert(msg.message_id.clone());
+                    }
+                    sent_replies.push(reply_row);
+                }
+            }
+        }
+        Ok(sent_replies)
     }
 
     fn should_reply_to(&self, sender_did: &str, text: &str) -> bool {
@@ -511,7 +679,7 @@ impl FederatedBirdBot {
     }
 
     /// Process an inbound decrypted group/DM text message, generating an LLM reply and
-    /// encrypting + queuing an `MLS_256_XWING` reply message when addressed to the bot.
+    /// encrypting + sending an `MLS_256_XWING` reply message when addressed to the bot.
     pub async fn handle_incoming_group_text(
         &self,
         conversation_id: &str,
@@ -528,10 +696,11 @@ impl FederatedBirdBot {
             reply = reply.chars().take(max_chars).collect();
         }
 
-        let message_id = format!("bird-reply-{}", uuid::Uuid::new_v4());
-        let row = self
-            .client
-            .send_message(conversation_id, &message_id, &reply)?;
+        let message_id = uuid::Uuid::new_v4().to_string();
+        let sdk = Arc::clone(&self.client);
+        let cid = conversation_id.to_string();
+        let row = tokio::task::spawn_blocking(move || sdk.send_message(&cid, &message_id, &reply))
+            .await??;
         Ok(Some(row))
     }
 

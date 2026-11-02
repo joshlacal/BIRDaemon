@@ -28,7 +28,7 @@ pub struct BirdConfig {
 }
 
 fn default_device_id() -> String {
-    "birdaemon-default-device".to_string()
+    uuid::Uuid::new_v4().to_string()
 }
 
 fn default_home_ds_did() -> String {

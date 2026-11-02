@@ -109,11 +109,29 @@ async fn main() -> anyhow::Result<()> {
         cfg.system_prompt.clone(),
     )?);
 
+    let dev_uuid_file = storage_root.join("device_id.uuid");
+    let canonical_device_id = uuid::Uuid::parse_str(cfg.device_id.trim())
+        .ok()
+        .filter(|u| u.get_version_num() == 4)
+        .map(|u| u.to_string())
+        .or_else(|| {
+            std::fs::read_to_string(&dev_uuid_file)
+                .ok()
+                .and_then(|raw| uuid::Uuid::parse_str(raw.trim()).ok())
+                .filter(|u| u.get_version_num() == 4)
+                .map(|u| u.to_string())
+        })
+        .unwrap_or_else(|| {
+            let fresh = uuid::Uuid::new_v4().to_string();
+            let _ = std::fs::write(&dev_uuid_file, fresh.as_bytes());
+            fresh
+        });
+
     let bot_cfg = FederatedBotConfig {
         storage_root,
         bot_did: resolved_did,
         bot_handle: cfg.handle.clone(),
-        device_id: cfg.device_id.clone(),
+        device_id: canonical_device_id,
         home_ds_did: cfg.home_ds_did.clone(),
         home_ds_endpoint: cfg.home_ds_endpoint.clone(),
         pds_endpoint: cfg.pds_endpoint.clone(),
@@ -127,8 +145,12 @@ async fn main() -> anyhow::Result<()> {
         max_reply_characters: cfg.max_reply_characters,
     };
 
-    let bot = FederatedBirdBot::open_and_enroll(bot_cfg, responder)?;
-    bot.set_auth_tokens(ds_service_token, Some(pds_token));
+    let bot = FederatedBirdBot::open_and_enroll_with_tokens(
+        bot_cfg,
+        responder,
+        ds_service_token,
+        Some(pds_token),
+    )?;
     tracing::info!(
         did = %bot.account_did(),
         mailbox_space = %bot.enrollment_receipt().mailbox_space_uri,
@@ -143,8 +165,8 @@ async fn main() -> anyhow::Result<()> {
                 break;
             }
             _ = tick.tick() => {
-                if let Err(e) = bot.accept_pending_requests() {
-                    tracing::warn!("accept_pending_requests failed: {e}");
+                if let Err(e) = bot.sync_and_reply().await {
+                    tracing::warn!("sync_and_reply failed: {e}");
                 }
                 if let Err(e) = bot.flush_labyrinth_queue() {
                     tracing::debug!("flush_labyrinth_queue deferred: {e}");
