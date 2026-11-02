@@ -1,12 +1,16 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use base64::Engine as _;
 use bird_daemon::bot::{
     BirdKeyStore, BirdPlatformTransport, BotLlmResponder, FederatedBirdBot, FederatedBotConfig,
 };
 use catbird_mls::client::{
     CatbirdMlsClient, CatbirdMlsClientConfig, PlatformTransport, REQUIRED_LABYRINTH_OAUTH_SCOPES,
 };
+use labyrinth_protocol::receipt::{sign_sequencer_receipt, SequencerReceiptPayload};
+use p256::ecdsa::SigningKey as P256SigningKey;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -26,8 +30,8 @@ impl BotLlmResponder for EchoResponder {
     }
 }
 
-#[derive(Default)]
 struct LocalLiveDsState {
+    receipt_sk: P256SigningKey,
     pds_records: BTreeMap<(String, String, String), Value>,
     convo_kps: BTreeMap<(String, String), Vec<Value>>,
     dr_keys: BTreeMap<String, Vec<(String, Value, Value)>>,
@@ -36,6 +40,44 @@ struct LocalLiveDsState {
     pending_welcomes: BTreeMap<(String, String), Vec<Value>>,
     leaf_recovery_inbox: BTreeMap<String, Vec<Value>>,
     acked_welcomes: Vec<String>,
+    acked_watermarks: BTreeMap<(String, String), i64>,
+}
+
+impl LocalLiveDsState {
+    fn new() -> Self {
+        Self {
+            receipt_sk: P256SigningKey::random(&mut rand::rngs::OsRng),
+            pds_records: BTreeMap::new(),
+            convo_kps: BTreeMap::new(),
+            dr_keys: BTreeMap::new(),
+            conversations: BTreeMap::new(),
+            entries: BTreeMap::new(),
+            pending_welcomes: BTreeMap::new(),
+            leaf_recovery_inbox: BTreeMap::new(),
+            acked_welcomes: Vec::new(),
+            acked_watermarks: BTreeMap::new(),
+        }
+    }
+
+    fn receipt_jwk_did_doc(&self, ds_did: &str) -> Value {
+        let pt = self.receipt_sk.verifying_key().to_encoded_point(false);
+        let x = URL_SAFE_NO_PAD.encode(pt.x().unwrap());
+        let y = URL_SAFE_NO_PAD.encode(pt.y().unwrap());
+        json!({
+            "id": ds_did,
+            "verificationMethod": [{
+                "id": format!("{ds_did}#mls-receipt-1"),
+                "type": "JsonWebKey2020",
+                "controller": ds_did,
+                "publicKeyJwk": {
+                    "kty": "EC",
+                    "crv": "P-256",
+                    "x": x,
+                    "y": y
+                }
+            }]
+        })
+    }
 }
 
 fn pct_decode(s: &str) -> String {
@@ -81,6 +123,15 @@ fn handle_ds_http(
     let q = query_map(target);
     let body_json: Value = serde_json::from_slice(body).unwrap_or_else(|_| json!({}));
 
+    let mut g = state.lock().unwrap();
+
+    if target.ends_with("/.well-known/did.json")
+        || (target.contains("/xrpc/com.atproto.identity.resolveDid")
+            && q.get("did").map(String::as_str) == Some(ds_did))
+    {
+        return (200, g.receipt_jwk_did_doc(ds_did));
+    }
+
     if target.contains("/xrpc/com.atproto.identity.resolveDid") {
         let did = q.get("did").cloned().unwrap_or_default();
         return (
@@ -97,8 +148,6 @@ fn handle_ds_http(
             }),
         );
     }
-
-    let mut g = state.lock().unwrap();
 
     if target.contains("/xrpc/com.atproto.space.getSpace")
         || target.contains("/xrpc/com.atproto.space.putSpace")
@@ -305,14 +354,53 @@ fn handle_ds_http(
         let b = &sr["body"];
         let cid = b["prior"]["conversationId"].as_str().unwrap().to_string();
         let msg_id = b["messageId"].as_str().unwrap().to_string();
-        let seq = (g.entries.get(&cid).map(|v| v.len()).unwrap_or(0) as i64) + 1;
+        let actor_did = b["actorDid"].as_str().unwrap().to_string();
+        let actor_dev = b["actorDeviceId"].as_str().unwrap().to_string();
+        let gen = b["prior"]["generation"].as_u64().unwrap_or(0);
+        let epoch = b["prior"]["epoch"].as_u64().unwrap_or(0);
+        let group_id = catbird_mls::client::chat_wire::json_bytes(&b["prior"]["groupId"]).unwrap();
+        let commit_arr: [u8; 32] =
+            catbird_mls::client::chat_wire::json_bytes(&b["aad"]["archiveCommitment"])
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let seq = (g.entries.get(&cid).map(|v| v.len()).unwrap_or(0) as u64) + 1;
+        let payload = SequencerReceiptPayload {
+            sequencer_did: ds_did.to_string(),
+            conversation_id: cid.clone(),
+            group_id,
+            epoch,
+            sender_device_did_url: format!("{actor_did}#{actor_dev}"),
+            entry_id: msg_id.clone(),
+            archive_commitment: commit_arr,
+            seq,
+            issued_at_ms: 1_762_000_000_000,
+        };
+        let kid_full = format!("{ds_did}#mls-receipt-1");
+        let signed = sign_sequencer_receipt(&g.receipt_sk, &kid_full, &payload).unwrap();
+        let rcpt_json = json!({
+            "kid": signed.key_id,
+            "sequencerDid": signed.payload.sequencer_did,
+            "conversationId": signed.payload.conversation_id,
+            "generation": gen,
+            "groupId": { "$bytes": STANDARD.encode(&signed.payload.group_id) },
+            "epoch": signed.payload.epoch,
+            "seq": signed.payload.seq,
+            "entryId": signed.payload.entry_id,
+            "senderDid": actor_did,
+            "senderDeviceId": actor_dev,
+            "archiveCommitment": { "$bytes": STANDARD.encode(signed.payload.archive_commitment) },
+            "issuedAtMs": signed.payload.issued_at_ms,
+            "signature": { "$bytes": STANDARD.encode(signed.signature) },
+        });
         g.entries.entry(cid).or_default().push(json!({
             "$type": "blue.catbird.chat.defs#applicationMessageEntry",
             "seq": seq,
             "messageId": msg_id,
             "signedRequest": sr,
+            "sequencerReceipt": rcpt_json.clone(),
         }));
-        return (200, json!({ "seq": seq }));
+        return (200, json!({ "seq": seq, "sequencerReceipt": rcpt_json }));
     }
     if target.contains("/xrpc/blue.catbird.chat.getConversations") {
         let list: Vec<Value> = g.conversations.values().cloned().collect();
@@ -360,7 +448,20 @@ fn handle_ds_http(
             .collect();
         return (200, json!({ "entries": list }));
     }
-    (200, json!({}))
+    if target.contains("/xrpc/blue.catbird.chat.acknowledgeEntries") {
+        let cid = body_json["conversationId"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let dev = body_json["actorDeviceId"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let wm = body_json["upToSeq"].as_i64().unwrap_or(0);
+        g.acked_watermarks.insert((cid, dev), wm);
+        return (200, json!({ "watermarkSeq": wm }));
+    }
+    (404, json!({ "error": "NotFound", "target": target }))
 }
 
 async fn spawn_local_live_ds_server(
@@ -371,7 +472,7 @@ async fn spawn_local_live_ds_server(
         .expect("bind local ds");
     let addr = listener.local_addr().expect("local_addr");
     let base_url = format!("http://{addr}");
-    let state = Arc::new(Mutex::new(LocalLiveDsState::default()));
+    let state = Arc::new(Mutex::new(LocalLiveDsState::new()));
     let state_bg = Arc::clone(&state);
     let base_bg = base_url.clone();
 
