@@ -251,30 +251,48 @@ fn percent_encode_component(raw: &str) -> String {
     out
 }
 
+/// Whether `url` is `base` or lies under it: the same scheme, host and port after URL parsing,
+/// and a path equal to `base`'s or continuing it after a `/`. A raw string prefix would also
+/// accept `https://pds.example.evil`, `https://pds.example:4433` or `https://host/pds-other`.
+fn endpoint_contains(base: &url::Url, url: &url::Url) -> bool {
+    base.scheme() == url.scheme()
+        && base.host() == url.host()
+        && base.port_or_known_default() == url.port_or_known_default()
+        && url
+            .path()
+            .strip_prefix(base.path().trim_end_matches('/'))
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
 /// Direct ATProto PDS + federated `mls-ds` transport (`G3`: zero `nest` proxy).
 /// Preserves `Atproto-Space-Mac` and `Atproto-Space-Credential` headers end-to-end (`Gate 7`).
+/// Attaches the PDS bearer only to the PDS endpoint and the service-auth bearer only to the home
+/// `mls-ds` endpoint ([`endpoint_contains`]); any other target gets no bearer.
 pub struct BirdPlatformTransport {
     http: reqwest::Client,
-    pds_supports_spaces_hint: bool,
     service_auth_token: RwLock<Option<String>>,
     pds_oauth_token: RwLock<Option<String>>,
     pds_endpoint: String,
+    pds_base: Option<url::Url>,
+    home_ds_base: Option<url::Url>,
     bot_did: Option<String>,
     home_ds_did: Option<String>,
 }
 
 impl BirdPlatformTransport {
-    pub fn new(pds_endpoint: String, pds_supports_spaces_hint: bool) -> Self {
+    /// A transport that knows only its PDS endpoint: it never attaches the service-auth bearer.
+    pub fn new(pds_endpoint: String) -> Self {
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(15))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             http,
-            pds_supports_spaces_hint,
             service_auth_token: RwLock::new(None),
             pds_oauth_token: RwLock::new(None),
+            pds_base: url::Url::parse(&pds_endpoint).ok(),
             pds_endpoint,
+            home_ds_base: None,
             bot_did: None,
             home_ds_did: None,
         }
@@ -282,11 +300,12 @@ impl BirdPlatformTransport {
 
     pub fn with_identity(
         pds_endpoint: String,
-        pds_supports_spaces_hint: bool,
+        home_ds_endpoint: String,
         bot_did: String,
         home_ds_did: String,
     ) -> Self {
-        let mut s = Self::new(pds_endpoint, pds_supports_spaces_hint);
+        let mut s = Self::new(pds_endpoint);
+        s.home_ds_base = url::Url::parse(&home_ds_endpoint).ok();
         s.bot_did = Some(bot_did);
         s.home_ds_did = Some(home_ds_did);
         s
@@ -310,12 +329,17 @@ impl PlatformTransport for BirdPlatformTransport {
 
         let http = self.http.clone();
         let pds_base = self.pds_endpoint.trim_end_matches('/').to_string();
-        let is_pds_target = !pds_base.is_empty() && request.url.starts_with(&pds_base);
+        let target = url::Url::parse(&request.url).ok();
+        let within = |base: &Option<url::Url>| match (base, &target) {
+            (Some(base), Some(target)) => endpoint_contains(base, target),
+            _ => false,
+        };
+        let is_pds_target = within(&self.pds_base);
+        let is_home_ds_target = !is_pds_target && within(&self.home_ds_base);
         let pds_bearer = self.pds_oauth_token.read().ok().and_then(|g| g.clone());
         let ds_bearer = self.service_auth_token.read().ok().and_then(|g| g.clone());
         let bot_did = self.bot_did.clone();
         let home_ds_did = self.home_ds_did.clone();
-        let pds_supports_hint = self.pds_supports_spaces_hint;
         let req_clone = request;
 
         std::thread::spawn(move || {
@@ -346,7 +370,7 @@ impl PlatformTransport for BirdPlatformTransport {
                         if let Some(tok) = effective_pds_tok {
                             builder = builder.bearer_auth(tok);
                         }
-                    } else {
+                    } else if is_home_ds_target {
                         let mut effective_ds_tok = ds_bearer.clone();
                         let has_jwt = effective_ds_tok
                             .as_deref()
@@ -363,23 +387,24 @@ impl PlatformTransport for BirdPlatformTransport {
                                         percent_encode_component(nsid),
                                         percent_encode_component(iss),
                                     );
-                                    if let Ok(sa_resp) = http
+                                    let sa_resp = http
                                         .get(&sa_url)
                                         .bearer_auth(
                                             pds_bearer.as_deref().unwrap_or("bot-pds-oauth"),
                                         )
                                         .send()
                                         .await
-                                    {
-                                        if sa_resp.status().is_success() {
-                                            if let Ok(val) =
-                                                sa_resp.json::<serde_json::Value>().await
+                                        .map_err(|e| {
+                                            MLSError::Internal(format!(
+                                                "mint getServiceAuth `{nsid}` failed: {e}"
+                                            ))
+                                        })?;
+                                    if sa_resp.status().is_success() {
+                                        if let Ok(val) = sa_resp.json::<serde_json::Value>().await {
+                                            if let Some(t) =
+                                                val.get("token").and_then(|v| v.as_str())
                                             {
-                                                if let Some(t) =
-                                                    val.get("token").and_then(|v| v.as_str())
-                                                {
-                                                    effective_ds_tok = Some(t.to_string());
-                                                }
+                                                effective_ds_tok = Some(t.to_string());
                                             }
                                         }
                                     }
@@ -394,52 +419,35 @@ impl PlatformTransport for BirdPlatformTransport {
                 if let Some(body) = req_clone.body {
                     builder = builder.body(body);
                 }
-                match builder.send().await {
-                    Ok(resp) => {
-                        let status = resp.status().as_u16();
-                        let headers = resp
-                            .headers()
-                            .iter()
-                            .filter_map(|(k, v)| {
-                                v.to_str().ok().map(|val| PlatformHttpHeader {
-                                    name: k.as_str().to_string(),
-                                    value: val.to_string(),
-                                })
-                            })
-                            .collect();
-                        let body = resp
-                            .bytes()
-                            .await
-                            .map_err(|e| MLSError::Internal(format!("read HTTP body: {e}")))?
-                            .to_vec();
-                        Ok(PlatformHttpResponse {
-                            status,
-                            headers,
-                            body,
+                // A network failure or timeout is not a response: the request may or may not
+                // have reached the server, so surface an error and let the core keep its
+                // journaled request for its own retry. Real HTTP statuses (including 5xx)
+                // pass through unchanged for the core's transient/terminal classification.
+                let resp = builder
+                    .send()
+                    .await
+                    .map_err(|e| MLSError::Internal(format!("HTTP transport failed: {e}")))?;
+                let status = resp.status().as_u16();
+                let headers = resp
+                    .headers()
+                    .iter()
+                    .filter_map(|(k, v)| {
+                        v.to_str().ok().map(|val| PlatformHttpHeader {
+                            name: k.as_str().to_string(),
+                            value: val.to_string(),
                         })
-                    }
-                    Err(e) => {
-                        if is_local {
-                            Err(MLSError::Internal(format!("HTTP transport failed: {e}")))
-                        } else if is_spaces_probe {
-                            Ok(PlatformHttpResponse {
-                                status: if pds_supports_hint { 401 } else { 501 },
-                                headers: Vec::new(),
-                                body: if pds_supports_hint {
-                                    b"{\"error\":\"AuthMissing\"}".to_vec()
-                                } else {
-                                    b"{\"error\":\"XRPCNotSupported\"}".to_vec()
-                                },
-                            })
-                        } else {
-                            Ok(PlatformHttpResponse {
-                                status: 200,
-                                headers: Vec::new(),
-                                body: b"{}".to_vec(),
-                            })
-                        }
-                    }
-                }
+                    })
+                    .collect();
+                let body = resp
+                    .bytes()
+                    .await
+                    .map_err(|e| MLSError::Internal(format!("read HTTP body: {e}")))?
+                    .to_vec();
+                Ok(PlatformHttpResponse {
+                    status,
+                    headers,
+                    body,
+                })
             })
         })
         .join()
@@ -518,7 +526,7 @@ impl FederatedBirdBot {
         let keystore = Arc::new(BirdKeyStore::new(&config.storage_root)?);
         let transport = Arc::new(BirdPlatformTransport::with_identity(
             config.pds_endpoint.clone(),
-            config.pds_supports_spaces,
+            config.home_ds_endpoint.clone(),
             config.bot_did.clone(),
             config.home_ds_did.clone(),
         ));
@@ -706,5 +714,53 @@ impl FederatedBirdBot {
 
     pub fn flush_labyrinth_queue(&self) -> anyhow::Result<u32> {
         Ok(self.client.flush_labyrinth_queue()?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::endpoint_contains;
+
+    fn url(raw: &str) -> url::Url {
+        url::Url::parse(raw).unwrap()
+    }
+
+    #[test]
+    fn endpoint_contains_rejects_suffix_port_scheme_userinfo_and_path_confusion() {
+        let origin = url("https://pds.example");
+        for inside in [
+            "https://pds.example",
+            "https://pds.example/xrpc/com.atproto.repo.getRecord?repo=x",
+            "https://PDS.Example:443/xrpc/com.atproto.repo.getRecord",
+        ] {
+            assert!(endpoint_contains(&origin, &url(inside)), "{inside}");
+        }
+        for outside in [
+            "https://pds.example.evil.com/xrpc/com.atproto.repo.getRecord",
+            "https://pds.examplex/xrpc/com.atproto.repo.getRecord",
+            "https://pds.example:4443/xrpc/com.atproto.repo.getRecord",
+            "http://pds.example/xrpc/com.atproto.repo.getRecord",
+            "https://pds.example@evil.com/xrpc/com.atproto.repo.getRecord",
+            "https://evil.com/https://pds.example/xrpc/com.atproto.repo.getRecord",
+        ] {
+            assert!(!endpoint_contains(&origin, &url(outside)), "{outside}");
+        }
+
+        let based = url("https://host.example/pds/");
+        for inside in [
+            "https://host.example/pds",
+            "https://host.example/pds/xrpc/x",
+        ] {
+            assert!(endpoint_contains(&based, &url(inside)), "{inside}");
+        }
+        for outside in [
+            "https://host.example/pds-other/xrpc/x",
+            "https://host.example/pdsx",
+            "https://host.example/xrpc/x",
+            "https://host.example/pds/../other/xrpc/x",
+            "https://host.example/pds/%2e%2e/other/xrpc/x",
+        ] {
+            assert!(!endpoint_contains(&based, &url(outside)), "{outside}");
+        }
     }
 }

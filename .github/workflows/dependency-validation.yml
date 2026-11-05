@@ -24,14 +24,20 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Checkout pinned canonical catbird-mls sibling
+      - name: Checkout pinned catbird-mls, catbird-atproto and labyrinth siblings
         run: |
           source scripts/canonical-sibling-provenance.env
-          rm -rf ../catbird-mls
-          git init ../catbird-mls
-          git -C ../catbird-mls remote add origin "$CATBIRD_MLS_REPOSITORY"
-          git -C ../catbird-mls fetch --depth 1 origin "$CATBIRD_MLS_COMMIT"
-          git -C ../catbird-mls checkout --detach FETCH_HEAD
+          checkout() {
+            rm -rf "../$1"
+            git init "../$1"
+            git -C "../$1" remote add origin "$2"
+            git -C "../$1" fetch --depth 1 origin "$3"
+            git -C "../$1" checkout --detach FETCH_HEAD
+            test "$(git -C "../$1" rev-parse HEAD)" = "$3"
+          }
+          checkout catbird-mls "$CATBIRD_MLS_REPOSITORY" "$CATBIRD_MLS_COMMIT"
+          checkout catbird-atproto "$CATBIRD_ATPROTO_REPOSITORY" "$CATBIRD_ATPROTO_COMMIT"
+          checkout labyrinth "$LABYRINTH_REPOSITORY" "$LABYRINTH_COMMIT"
       - name: Record native Linux runner and install build prerequisites
         run: |
           test "$(uname -m)" = x86_64

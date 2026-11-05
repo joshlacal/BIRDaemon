@@ -7,7 +7,8 @@ use bird_daemon::bot::{
     BirdKeyStore, BirdPlatformTransport, BotLlmResponder, FederatedBirdBot, FederatedBotConfig,
 };
 use catbird_mls::client::{
-    CatbirdMlsClient, CatbirdMlsClientConfig, PlatformTransport, REQUIRED_LABYRINTH_OAUTH_SCOPES,
+    CatbirdMlsClient, CatbirdMlsClientConfig, PlatformHttpRequest, PlatformTransport,
+    REQUIRED_LABYRINTH_OAUTH_SCOPES,
 };
 use labyrinth_protocol::receipt::{sign_sequencer_receipt, SequencerReceiptPayload};
 use p256::ecdsa::SigningKey as P256SigningKey;
@@ -541,8 +542,14 @@ async fn spawn_local_live_ds_server(
     (base_url, state)
 }
 
+/// Live path (catbird-mls has no implicit offline create/send): a bare `did:plc`, a UUIDv4
+/// device and the local `mls-ds` + PDS stand-in, whose sends return signed I13 receipts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn birdaemon_federated_bot_runs_without_nest_dependency_g3() {
+    const DS_DID: &str = "did:web:mlschat.catbird.blue";
+    const BOT_DID: &str = "did:plc:birdaemoncleanbotaaaaaaa";
+
+    let (base_url, _ds_state) = spawn_local_live_ds_server(DS_DID).await;
     let tmp = tempfile::tempdir().expect("tempdir");
     let responder = Arc::new(EchoResponder {
         seen_prompts: Mutex::new(Vec::new()),
@@ -550,12 +557,12 @@ async fn birdaemon_federated_bot_runs_without_nest_dependency_g3() {
 
     let cfg = FederatedBotConfig {
         storage_root: tmp.path().to_path_buf(),
-        bot_did: "did:plc:birdaemoncleanbot01".to_string(),
+        bot_did: BOT_DID.to_string(),
         bot_handle: "bird.catbird.blue".to_string(),
-        device_id: "dev-birdaemon-01".to_string(),
-        home_ds_did: "did:web:mlschat.catbird.blue".to_string(),
-        home_ds_endpoint: "https://mlschat.catbird.blue".to_string(),
-        pds_endpoint: "https://pds.catbird.blue".to_string(),
+        device_id: uuid::Uuid::new_v4().to_string(),
+        home_ds_did: DS_DID.to_string(),
+        home_ds_endpoint: base_url.clone(),
+        pds_endpoint: base_url,
         pds_supports_spaces: true,
         granted_oauth_scopes: REQUIRED_LABYRINTH_OAUTH_SCOPES
             .iter()
@@ -571,7 +578,7 @@ async fn birdaemon_federated_bot_runs_without_nest_dependency_g3() {
 
     let bot = FederatedBirdBot::open_and_enroll(cfg, responder.clone())
         .expect("bot should initialize and enroll on federated mls-ds + Spaces without Nest");
-    assert_eq!(bot.account_did(), "did:plc:birdaemoncleanbot01");
+    assert_eq!(bot.account_did(), BOT_DID);
     assert!(bot.labyrinth_status().expect("status").backup_enabled);
 
     // Create an MLS_256_XWING group and process an @mention
@@ -653,7 +660,7 @@ async fn birdaemon_live_local_ds_welcome_mention_and_encrypted_reply_roundtrip()
     // 2. Enroll Alice peer SDK client against the same live 127.0.0.1 server
     let alice_dir = tmp.path().join("alice");
     let alice_ks = Arc::new(BirdKeyStore::new(&alice_dir).expect("alice keystore"));
-    let alice_transport = Arc::new(BirdPlatformTransport::new(base_url.clone(), true));
+    let alice_transport = Arc::new(BirdPlatformTransport::new(base_url.clone()));
     alice_transport.set_tokens(
         Some("alice-ds-token".to_string()),
         Some("alice-pds-token".to_string()),
@@ -746,4 +753,309 @@ async fn birdaemon_live_local_ds_welcome_mention_and_encrypted_reply_roundtrip()
             && m.plaintext_json
                 .contains("chirp reply to: hello @bird.catbird.blue live check!")
     }));
+}
+
+/// Reads one HTTP/1.1 request (headers plus `Content-Length` body) so the reply is not reset,
+/// and returns its request line and headers (empty if the client went away first).
+fn read_request(stream: &mut std::net::TcpStream) -> String {
+    use std::io::Read as _;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&buf[..end]).into_owned();
+            let len = head
+                .to_ascii_lowercase()
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            if buf.len() >= end + 4 + len {
+                return head;
+            }
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => return String::new(),
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+    }
+}
+
+/// The production (non-loopback-prefixed) transport path: a refused connection or a timeout is
+/// an error, never a fabricated `200 {}`; each call makes exactly one attempt, so an
+/// ambiguous POST is not resent; real statuses (5xx included) pass through byte-for-byte and a
+/// caller retry after recovery lands exactly once.
+#[test]
+fn birdaemon_transport_network_failures_are_errors_without_duplicate_effect() {
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    // `127.1` is 127.0.0.1 but does not match the transport's `http://127.0.0.1` local
+    // prefix, so the request takes the path a remote PDS / mls-ds request takes.
+    let post = |base: &str| PlatformHttpRequest {
+        method: "POST".to_string(),
+        url: format!("{base}/xrpc/blue.catbird.chat.sendMessage"),
+        headers: Vec::new(),
+        body: Some(br#"{"messageId":"m1"}"#.to_vec()),
+    };
+
+    // 1. Connection refused: nothing listens on the port.
+    let refused_port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let refused_base = format!("http://127.1:{refused_port}");
+    let transport = BirdPlatformTransport::new(refused_base.clone());
+    let err = transport
+        .execute_http(post(&refused_base))
+        .expect_err("a refused connection must not look like an HTTP response");
+    assert!(err.to_string().contains("HTTP transport failed"), "{err}");
+
+    // 2. Timeout after the server received the request: one attempt, bounded by the client
+    // timeout, and no resend of a POST whose effect is unknown.
+    let hung = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let hung_base = format!("http://127.1:{}", hung.local_addr().unwrap().port());
+    let hung_hits = Arc::new(AtomicUsize::new(0));
+    let hits = Arc::clone(&hung_hits);
+    std::thread::spawn(move || {
+        for mut stream in hung.incoming().flatten() {
+            let hits = Arc::clone(&hits);
+            std::thread::spawn(move || {
+                read_request(&mut stream);
+                hits.fetch_add(1, Ordering::SeqCst);
+                // Hold the connection open without answering until the client gives up.
+                read_request(&mut stream);
+            });
+        }
+    });
+    let started = Instant::now();
+    let err = BirdPlatformTransport::new(hung_base.clone())
+        .execute_http(post(&hung_base))
+        .expect_err("a timeout must not look like an HTTP response");
+    assert!(err.to_string().contains("HTTP transport failed"), "{err}");
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "unbounded wait"
+    );
+    assert_eq!(
+        hung_hits.load(Ordering::SeqCst),
+        1,
+        "timed-out POST was resent"
+    );
+
+    // 3. The service recovers on the refused port: a 5xx passes through unchanged, then the
+    // caller's retry succeeds; each call is exactly one request.
+    let recovered = std::net::TcpListener::bind(("127.0.0.1", refused_port)).unwrap();
+    let served = Arc::new(AtomicUsize::new(0));
+    let served_bg = Arc::clone(&served);
+    std::thread::spawn(move || {
+        let replies = [
+            (
+                "503 Service Unavailable",
+                r#"{"error":"CapacityUnavailable"}"#,
+            ),
+            ("200 OK", r#"{"accepted":"m1"}"#),
+        ];
+        for (mut stream, (status, body)) in recovered.incoming().flatten().zip(replies) {
+            read_request(&mut stream);
+            served_bg.fetch_add(1, Ordering::SeqCst);
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    let unavailable = transport
+        .execute_http(post(&refused_base))
+        .expect("503 response");
+    assert_eq!(unavailable.status, 503);
+    assert_eq!(unavailable.body, br#"{"error":"CapacityUnavailable"}"#);
+    let ok = transport
+        .execute_http(post(&refused_base))
+        .expect("retry after recovery");
+    assert_eq!(ok.status, 200);
+    assert_eq!(ok.body, br#"{"accepted":"m1"}"#);
+    assert_eq!(
+        served.load(Ordering::SeqCst),
+        2,
+        "each call must be exactly one request"
+    );
+}
+
+/// A DS call that needs a minted service-auth token fails when the PDS cannot be reached for
+/// `getServiceAuth`; it never goes to the DS without the token it needed.
+#[test]
+fn birdaemon_service_auth_mint_network_failure_is_an_error_and_sends_nothing() {
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let refused_pds = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let ds = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let ds_base = format!("http://127.1:{}", ds.local_addr().unwrap().port());
+    let ds_hits = Arc::new(AtomicUsize::new(0));
+    let hits = Arc::clone(&ds_hits);
+    std::thread::spawn(move || {
+        for mut stream in ds.incoming().flatten() {
+            read_request(&mut stream);
+            hits.fetch_add(1, Ordering::SeqCst);
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+            );
+        }
+    });
+
+    // Different ports, so the home-DS URL is never within the PDS endpoint.
+    let transport = BirdPlatformTransport::with_identity(
+        format!("http://127.0.0.1:{refused_pds}"),
+        ds_base.clone(),
+        "did:plc:birdaemoncleanbotaaaaaaa".to_string(),
+        "did:web:ds.example".to_string(),
+    );
+    let err = transport
+        .execute_http(PlatformHttpRequest {
+            method: "POST".to_string(),
+            url: format!("{ds_base}/xrpc/blue.catbird.chat.sendMessage"),
+            headers: Vec::new(),
+            body: Some(br#"{"messageId":"m1"}"#.to_vec()),
+        })
+        .expect_err("an unreachable PDS must not send the DS call without its token");
+    assert!(err.to_string().contains("mint getServiceAuth"), "{err}");
+    assert_eq!(
+        ds_hits.load(Ordering::SeqCst),
+        0,
+        "DS call sent without service auth"
+    );
+}
+
+/// Bearers go only to their own endpoint, compared as parsed scheme, host and port plus a path
+/// boundary: the PDS bearer to the PDS endpoint, the service-auth bearer to the home `mls-ds`
+/// endpoint, and nothing to a sibling path, the origin root or a port whose digits extend the
+/// endpoint's (a raw string prefix matched each of those).
+#[test]
+fn birdaemon_transport_sends_bearers_only_to_their_exact_endpoints() {
+    use std::io::Write as _;
+
+    // One local server records the request line and Authorization header of every request.
+    let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = server.local_addr().unwrap().port();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<(String, Option<String>)>::new()));
+    let log = Arc::clone(&seen);
+    std::thread::spawn(move || {
+        for mut stream in server.incoming().flatten() {
+            let head = read_request(&mut stream);
+            let mut lines = head.lines();
+            let path = lines
+                .next()
+                .unwrap_or_default()
+                .split(' ')
+                .nth(1)
+                .unwrap_or_default()
+                .to_string();
+            let auth = lines.find_map(|l| {
+                l.split_once(':')
+                    .filter(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+                    .map(|(_, value)| value.trim().to_string())
+            });
+            log.lock().unwrap().push((path, auth));
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+            );
+        }
+    });
+    // `127.1` parses to 127.0.0.1 without matching the transport's `http://127.0.0.1` loopback
+    // prefix, so no test placeholder token is involved.
+    let origin = format!("http://127.1:{port}");
+    let get = |transport: &BirdPlatformTransport, url: String| {
+        transport
+            .execute_http(PlatformHttpRequest {
+                method: "GET".to_string(),
+                url,
+                headers: Vec::new(),
+                body: None,
+            })
+            .expect("local server answers");
+    };
+
+    // The service-auth token is JWT-shaped, so no getServiceAuth mint is attempted.
+    let transport = BirdPlatformTransport::with_identity(
+        format!("{origin}/pds"),
+        format!("{origin}/ds/"),
+        "did:plc:birdaemoncleanbotaaaaaaa".to_string(),
+        "did:web:ds.example".to_string(),
+    );
+    transport.set_tokens(
+        Some("ds.service.jwt".to_string()),
+        Some("pds-oauth".to_string()),
+    );
+    get(
+        &transport,
+        format!("{origin}/pds/xrpc/com.atproto.repo.getRecord"),
+    );
+    get(
+        &transport,
+        format!("{origin}/ds/xrpc/blue.catbird.chat.getConversations"),
+    );
+    get(
+        &transport,
+        format!("{origin}/pds-other/xrpc/com.atproto.repo.getRecord"),
+    );
+    get(
+        &transport,
+        format!("{origin}/ds-other/xrpc/blue.catbird.chat.getConversations"),
+    );
+    get(
+        &transport,
+        format!("{origin}/xrpc/blue.catbird.chat.getConversations"),
+    );
+
+    // Endpoints on a port whose digits are a prefix of the server's port.
+    let short = format!("http://127.1:{}", port / 10);
+    let transport = BirdPlatformTransport::with_identity(
+        short.clone(),
+        short,
+        "did:plc:birdaemoncleanbotaaaaaaa".to_string(),
+        "did:web:ds.example".to_string(),
+    );
+    transport.set_tokens(
+        Some("ds.service.jwt".to_string()),
+        Some("pds-oauth".to_string()),
+    );
+    get(
+        &transport,
+        format!("{origin}/xrpc/blue.catbird.chat.getConversations"),
+    );
+
+    let bearer = |token: &str| Some(format!("Bearer {token}"));
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![
+            (
+                "/pds/xrpc/com.atproto.repo.getRecord".to_string(),
+                bearer("pds-oauth")
+            ),
+            (
+                "/ds/xrpc/blue.catbird.chat.getConversations".to_string(),
+                bearer("ds.service.jwt")
+            ),
+            (
+                "/pds-other/xrpc/com.atproto.repo.getRecord".to_string(),
+                None
+            ),
+            (
+                "/ds-other/xrpc/blue.catbird.chat.getConversations".to_string(),
+                None
+            ),
+            ("/xrpc/blue.catbird.chat.getConversations".to_string(), None),
+            ("/xrpc/blue.catbird.chat.getConversations".to_string(), None),
+        ]
+    );
 }
