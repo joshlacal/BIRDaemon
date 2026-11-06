@@ -1303,7 +1303,7 @@ fn birdaemon_transport_mints_exact_claims_and_contains_bearers() {
     let log = Arc::clone(&seen);
     let minted_for_server = minted.clone();
     let server_thread = std::thread::spawn(move || {
-        for mut stream in server.incoming().flatten().take(7) {
+        for mut stream in server.incoming().flatten().take(8) {
             let head = read_request(&mut stream);
             let mut lines = head.lines();
             let path = lines
@@ -1358,6 +1358,14 @@ fn birdaemon_transport_mints_exact_claims_and_contains_bearers() {
     );
     get(
         &transport,
+        format!("{origin}/pds/xrpc/com.atproto.space.getRecord"),
+        vec![catbird_mls::client::PlatformHttpHeader {
+            name: "Authorization".to_string(),
+            value: "Atproto-Space-Credential delegated-space-token".to_string(),
+        }],
+    );
+    get(
+        &transport,
         format!("{origin}/ds/xrpc/{LXM}"),
         vec![catbird_mls::client::PlatformHttpHeader {
             name: "Authorization".to_string(),
@@ -1388,7 +1396,7 @@ fn birdaemon_transport_mints_exact_claims_and_contains_bearers() {
     server_thread.join().unwrap();
 
     let records = seen.lock().unwrap();
-    assert_eq!(records.len(), 7);
+    assert_eq!(records.len(), 8);
     assert_eq!(
         records[0],
         (
@@ -1396,19 +1404,26 @@ fn birdaemon_transport_mints_exact_claims_and_contains_bearers() {
             Some("Bearer pds-oauth".to_string())
         )
     );
-    assert!(records[1]
+    assert_eq!(
+        records[1],
+        (
+            "/pds/xrpc/com.atproto.space.getRecord".to_string(),
+            Some("Atproto-Space-Credential delegated-space-token".to_string())
+        )
+    );
+    assert!(records[2]
         .0
         .starts_with("/pds/xrpc/com.atproto.server.getServiceAuth?"));
-    assert_eq!(records[1].1, Some("Bearer pds-oauth".to_string()));
-    let mint_query = query_map(&records[1].0);
+    assert_eq!(records[2].1, Some("Bearer pds-oauth".to_string()));
+    let mint_query = query_map(&records[2].0);
     assert_eq!(mint_query.len(), 2);
     assert_eq!(mint_query.get("aud").map(String::as_str), Some(AUDIENCE));
     assert_eq!(mint_query.get("lxm").map(String::as_str), Some(LXM));
     assert_eq!(
-        records[2],
+        records[3],
         (format!("/ds/xrpc/{LXM}"), Some(format!("Bearer {minted}")))
     );
-    for (path, authorization) in &records[3..] {
+    for (path, authorization) in &records[4..] {
         assert!(authorization.is_none(), "bearer escaped to {path}");
     }
 }

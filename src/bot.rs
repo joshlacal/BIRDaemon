@@ -760,6 +760,11 @@ impl PlatformTransport for BirdPlatformTransport {
             runtime.block_on(async move {
                 let http = hardened_client(&target, allow_test_loopback).await?;
                 let mut builder = http.request(method, target);
+                let supplied_authorization = request
+                    .headers
+                    .iter()
+                    .find(|header| header.name.eq_ignore_ascii_case("authorization"))
+                    .map(|header| header.value.clone());
                 for header in &request.headers {
                     if !header.name.eq_ignore_ascii_case("authorization")
                         && !header.name.eq_ignore_ascii_case("host")
@@ -788,7 +793,14 @@ impl PlatformTransport for BirdPlatformTransport {
                     .await?;
                     builder = builder.bearer_auth(token);
                 } else if is_pds_authenticated_target {
-                    if let Some(token) = pds_bearer.as_deref().filter(|token| !token.is_empty()) {
+                    if let Some(authorization) = supplied_authorization
+                        .as_deref()
+                        .filter(|value| !value.is_empty())
+                    {
+                        builder = builder.header("authorization", authorization);
+                    } else if let Some(token) =
+                        pds_bearer.as_deref().filter(|token| !token.is_empty())
+                    {
                         builder = builder.bearer_auth(token);
                     }
                 }
