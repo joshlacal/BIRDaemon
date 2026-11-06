@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2021"
 description = "BIRD - Bluesky DM chatbot daemon using MLS encryption"
 
+[features]
+default = []
+# Exposes explicit `*_for_test` loopback constructors; never enable in production artifacts.
+test-support = []
+
 [dependencies]
 # Unified clean-slate MLS + Labyrinth SDK (`G2`, `G3`, `I15`, `I16`)
 catbird_mls = { path = "../catbird-mls" }

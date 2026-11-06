@@ -5,10 +5,12 @@
 //! with zero `nest` dependency, URL, or session coupling.
 
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine as _;
 use catbird_mls::client::{
     evaluate_spaces_eligibility, CatbirdMlsClient, CatbirdMlsClientConfig, EnrollmentReceipt,
@@ -19,6 +21,8 @@ use catbird_mls::client::{
 use catbird_mls::storage::{ConversationRow, MessageRow};
 use catbird_mls::MLSError;
 use rand::RngCore;
+
+const SERVICE_AUTH_MAX_LIFETIME_SECONDS: i64 = 60;
 
 /// Pluggable LLM responder trait for generating bot replies to `@mention` / DM messages.
 #[async_trait::async_trait]
@@ -239,18 +243,6 @@ impl PlatformKeyStore for BirdKeyStore {
     }
 }
 
-fn percent_encode_component(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len() + 8);
-    for &b in raw.as_bytes() {
-        if matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~') {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
-}
-
 /// Whether `url` is `base` or lies under it: the same scheme, host and port after URL parsing,
 /// and a path equal to `base`'s or continuing it after a `/`. A raw string prefix would also
 /// accept `https://pds.example.evil`, `https://pds.example:4433` or `https://host/pds-other`.
@@ -264,184 +256,565 @@ fn endpoint_contains(base: &url::Url, url: &url::Url) -> bool {
             .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
+fn parse_base_url(raw: &str, label: &str, allow_test_loopback: bool) -> Result<url::Url, MLSError> {
+    let parsed = url::Url::parse(raw)
+        .map_err(|e| MLSError::invalid_input(format!("invalid {label} URL: {e}")))?;
+    if parsed.cannot_be_a_base()
+        || parsed.host().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(MLSError::invalid_input(format!(
+            "{label} must be an origin/base URL without credentials, query, or fragment"
+        )));
+    }
+    let allow_test_loopback = test_loopback_allowed(allow_test_loopback);
+    if parsed.scheme() != "https" && !(allow_test_loopback && parsed.scheme() == "http") {
+        return Err(MLSError::invalid_input(format!("{label} must use HTTPS")));
+    }
+    Ok(parsed)
+}
+
+fn service_audience(home_ds_did: &str) -> Result<String, MLSError> {
+    let (bare, fragment) = match home_ds_did.split_once('#') {
+        Some((bare, fragment)) => (bare, Some(fragment)),
+        None => (home_ds_did, None),
+    };
+    let Some((method, identifier)) = bare
+        .strip_prefix("did:")
+        .and_then(|value| value.split_once(':'))
+    else {
+        return Err(MLSError::invalid_input("home DS DID must be a DID"));
+    };
+    if method.is_empty()
+        || !method
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        || identifier.is_empty()
+        || identifier
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || matches!(byte, b'/' | b'?' | b'#'))
+    {
+        return Err(MLSError::invalid_input("home DS DID must be a DID"));
+    }
+    if fragment.is_some_and(|fragment| fragment != "atproto_mls") {
+        return Err(MLSError::invalid_input(
+            "home DS DID fragment must be #atproto_mls",
+        ));
+    }
+    Ok(format!("{bare}#atproto_mls"))
+}
+
+fn xrpc_nsid(base: &url::Url, target: &url::Url) -> Option<String> {
+    if !endpoint_contains(base, target) {
+        return None;
+    }
+    let relative = target
+        .path()
+        .strip_prefix(base.path().trim_end_matches('/'))?;
+    let nsid = relative.strip_prefix("/xrpc/")?;
+    if nsid.is_empty()
+        || nsid.starts_with('.')
+        || nsid.ends_with('.')
+        || nsid.contains("..")
+        || !nsid.contains('.')
+        || !nsid
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+    {
+        return None;
+    }
+    Some(nsid.to_string())
+}
+
+fn has_xrpc_path(base: &url::Url, target: &url::Url) -> bool {
+    endpoint_contains(base, target)
+        && target
+            .path()
+            .strip_prefix(base.path().trim_end_matches('/'))
+            .is_some_and(|relative| relative.starts_with("/xrpc/"))
+}
+
+fn forbidden_outbound_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let [a, b, c, _] = ip.octets();
+            ip.is_loopback()
+                || ip.is_private()
+                || ip.is_link_local()
+                || ip.is_multicast()
+                || ip.is_unspecified()
+                || a == 0
+                || (a == 100 && (64..=127).contains(&b))
+                || (a == 192 && b == 0 && c == 0)
+                || (a == 192 && b == 0 && c == 2)
+                || (a == 192 && b == 88 && c == 99)
+                || (a == 198 && (b == 18 || b == 19))
+                || (a == 198 && b == 51 && c == 100)
+                || (a == 203 && b == 0 && c == 113)
+                || a >= 240
+        }
+        IpAddr::V6(ip) => {
+            let segments = ip.segments();
+            ip.is_loopback()
+                || ip.is_unique_local()
+                || ip.is_unicast_link_local()
+                || ip.is_multicast()
+                || ip.is_unspecified()
+                || (segments[0] & 0xffc0) == 0xfec0
+                || (segments[0] & 0xe000) != 0x2000
+                || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+                || segments[0] == 0x2002
+                || (segments[0] == 0x3fff && segments[1] < 0x1000)
+                || ip
+                    .to_ipv4_mapped()
+                    .is_some_and(|mapped| forbidden_outbound_ip(IpAddr::V4(mapped)))
+        }
+    }
+}
+
+fn test_loopback_allowed(requested: bool) -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        requested
+    }
+    #[cfg(not(any(test, feature = "test-support")))]
+    {
+        let _ = requested;
+        false
+    }
+}
+
+fn client_pinned_to(
+    target: &url::Url,
+    addresses: &[SocketAddr],
+    allow_test_loopback: bool,
+) -> Result<reqwest::Client, MLSError> {
+    let allow_test_loopback = test_loopback_allowed(allow_test_loopback);
+    if addresses.is_empty() {
+        return Err(MLSError::invalid_input(
+            "outbound host resolved no addresses",
+        ));
+    }
+    let all_loopback = addresses.iter().all(|address| address.ip().is_loopback());
+    if target.scheme() != "https"
+        && !(allow_test_loopback && target.scheme() == "http" && all_loopback)
+    {
+        return Err(MLSError::invalid_input(
+            "outbound HTTP transport requires HTTPS",
+        ));
+    }
+    for address in addresses {
+        if forbidden_outbound_ip(address.ip())
+            && !(allow_test_loopback && address.ip().is_loopback())
+        {
+            return Err(MLSError::invalid_input(format!(
+                "outbound address class refused: {}",
+                address.ip()
+            )));
+        }
+    }
+    let host = match target.host() {
+        Some(url::Host::Domain(domain)) => std::borrow::Cow::Borrowed(domain),
+        Some(url::Host::Ipv4(ip)) => std::borrow::Cow::Owned(ip.to_string()),
+        Some(url::Host::Ipv6(ip)) => std::borrow::Cow::Owned(ip.to_string()),
+        None => return Err(MLSError::invalid_input("outbound URL has no host")),
+    };
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .resolve_to_addrs(host.as_ref(), addresses)
+        .build()
+        .map_err(|e| MLSError::Internal(format!("build pinned HTTP client: {e}")))
+}
+
+async fn hardened_client(
+    target: &url::Url,
+    allow_test_loopback: bool,
+) -> Result<reqwest::Client, MLSError> {
+    if !target.username().is_empty() || target.password().is_some() {
+        return Err(MLSError::invalid_input(
+            "outbound URL credentials are forbidden",
+        ));
+    }
+    let allow_test_loopback = test_loopback_allowed(allow_test_loopback);
+    if target.scheme() != "https" && !(allow_test_loopback && target.scheme() == "http") {
+        return Err(MLSError::invalid_input(
+            "outbound HTTP transport requires HTTPS",
+        ));
+    }
+
+    let port = target
+        .port_or_known_default()
+        .ok_or_else(|| MLSError::invalid_input("outbound URL has no known port"))?;
+    let addresses: Vec<SocketAddr> = match target.host() {
+        Some(url::Host::Domain(domain)) => tokio::time::timeout(
+            Duration::from_secs(15),
+            tokio::net::lookup_host((domain, port)),
+        )
+        .await
+        .map_err(|_| MLSError::Internal("outbound DNS resolution timed out".to_string()))?
+        .map_err(|e| MLSError::Internal(format!("outbound DNS resolution failed: {e}")))?
+        .collect(),
+        Some(url::Host::Ipv4(ip)) => vec![SocketAddr::new(IpAddr::V4(ip), port)],
+        Some(url::Host::Ipv6(ip)) => vec![SocketAddr::new(IpAddr::V6(ip), port)],
+        None => return Err(MLSError::invalid_input("outbound URL has no host")),
+    };
+    client_pinned_to(target, &addresses, allow_test_loopback)
+}
+
+fn mint_error(nsid: &str, detail: impl std::fmt::Display) -> MLSError {
+    MLSError::Internal(format!(
+        "retryable service-auth mint `{nsid}` failed before DS send: {detail}"
+    ))
+}
+
+fn validate_service_auth_token(
+    token: &str,
+    expected_issuer: &str,
+    expected_audience: &str,
+    expected_lxm: &str,
+) -> Result<(), String> {
+    let mut segments = token.split('.');
+    let header_segment = segments.next().unwrap_or_default();
+    let claims_segment = segments.next().unwrap_or_default();
+    let signature_segment = segments.next().unwrap_or_default();
+    if header_segment.is_empty()
+        || claims_segment.is_empty()
+        || signature_segment.is_empty()
+        || segments.next().is_some()
+    {
+        return Err("token is not a three-segment JWT".to_string());
+    }
+    let header_bytes = URL_SAFE_NO_PAD
+        .decode(header_segment)
+        .map_err(|_| "JWT header is not base64url".to_string())?;
+    let header: serde_json::Value =
+        serde_json::from_slice(&header_bytes).map_err(|_| "JWT header is not JSON".to_string())?;
+    if header.get("alg").and_then(|value| value.as_str()) != Some("ES256") {
+        return Err("JWT algorithm must be ES256".to_string());
+    }
+    let signature = URL_SAFE_NO_PAD
+        .decode(signature_segment)
+        .map_err(|_| "JWT signature is not base64url".to_string())?;
+    if signature.len() != 64 {
+        return Err("JWT ES256 signature must be 64 bytes".to_string());
+    }
+    let claims_bytes = URL_SAFE_NO_PAD
+        .decode(claims_segment)
+        .map_err(|_| "JWT claims are not base64url".to_string())?;
+    let claims: serde_json::Value =
+        serde_json::from_slice(&claims_bytes).map_err(|_| "JWT claims are not JSON".to_string())?;
+    if claims.get("iss").and_then(|value| value.as_str()) != Some(expected_issuer) {
+        return Err("JWT issuer does not match the authenticated bot DID".to_string());
+    }
+    if claims.get("aud").and_then(|value| value.as_str()) != Some(expected_audience) {
+        return Err("JWT audience does not match the home DS service".to_string());
+    }
+    if claims.get("lxm").and_then(|value| value.as_str()) != Some(expected_lxm) {
+        return Err("JWT lxm does not match the exact XRPC method".to_string());
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "system clock precedes the Unix epoch".to_string())?
+        .as_secs() as i64;
+    let expiry = claims
+        .get("exp")
+        .and_then(|value| value.as_i64())
+        .ok_or_else(|| "JWT exp is missing or not an integer".to_string())?;
+    if expiry <= now {
+        return Err("JWT is expired".to_string());
+    }
+    if expiry > now + SERVICE_AUTH_MAX_LIFETIME_SECONDS {
+        return Err("JWT lifetime exceeds 60 seconds".to_string());
+    }
+    if let Some(not_before) = claims.get("nbf") {
+        let not_before = not_before
+            .as_i64()
+            .ok_or_else(|| "JWT nbf is not an integer".to_string())?;
+        if not_before > now {
+            return Err("JWT is not yet valid".to_string());
+        }
+    }
+    Ok(())
+}
+
+async fn mint_service_auth_token(
+    pds_base: &url::Url,
+    pds_bearer: Option<&str>,
+    issuer: &str,
+    audience: &str,
+    nsid: &str,
+    allow_test_loopback: bool,
+) -> Result<String, MLSError> {
+    let pds_bearer = pds_bearer
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| mint_error(nsid, "missing PDS OAuth/session token"))?;
+    let mut mint_url = pds_base.clone();
+    let path = format!(
+        "{}/xrpc/com.atproto.server.getServiceAuth",
+        pds_base.path().trim_end_matches('/')
+    );
+    mint_url.set_path(&path);
+    mint_url.set_query(None);
+    mint_url
+        .query_pairs_mut()
+        .append_pair("aud", audience)
+        .append_pair("lxm", nsid);
+
+    let client = hardened_client(&mint_url, allow_test_loopback)
+        .await
+        .map_err(|error| mint_error(nsid, error))?;
+    let response = client
+        .get(mint_url)
+        .bearer_auth(pds_bearer)
+        .send()
+        .await
+        .map_err(|error| mint_error(nsid, error))?;
+    let status = response.status();
+    let body = response
+        .bytes()
+        .await
+        .map_err(|error| mint_error(nsid, format!("response body read failed: {error}")))?;
+    if !status.is_success() {
+        return Err(mint_error(nsid, format!("PDS returned HTTP {status}")));
+    }
+    let value: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|error| mint_error(nsid, format!("response JSON invalid: {error}")))?;
+    let token = value
+        .get("token")
+        .and_then(|value| value.as_str())
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| mint_error(nsid, "response token missing or empty"))?;
+    if token == pds_bearer {
+        return Err(mint_error(
+            nsid,
+            "PDS returned the account token instead of a service-auth token",
+        ));
+    }
+    validate_service_auth_token(token, issuer, audience, nsid)
+        .map_err(|error| mint_error(nsid, error))?;
+    Ok(token.to_string())
+}
+
 /// Direct ATProto PDS + federated `mls-ds` transport (`G3`: zero `nest` proxy).
 /// Preserves `Atproto-Space-Mac` and `Atproto-Space-Credential` headers end-to-end (`Gate 7`).
-/// Attaches the PDS bearer only to the PDS endpoint and the service-auth bearer only to the home
-/// `mls-ds` endpoint ([`endpoint_contains`]); any other target gets no bearer.
+/// PDS and freshly minted method-bound service bearers remain confined to their configured parsed
+/// origin and base-path boundary ([`endpoint_contains`]); any other target gets no bearer.
 pub struct BirdPlatformTransport {
-    http: reqwest::Client,
-    service_auth_token: RwLock<Option<String>>,
     pds_oauth_token: RwLock<Option<String>>,
-    pds_endpoint: String,
-    pds_base: Option<url::Url>,
+    pds_base: url::Url,
     home_ds_base: Option<url::Url>,
     bot_did: Option<String>,
-    home_ds_did: Option<String>,
+    home_ds_audience: Option<String>,
+    allow_test_loopback: bool,
 }
 
 impl BirdPlatformTransport {
-    /// A transport that knows only its PDS endpoint: it never attaches the service-auth bearer.
-    pub fn new(pds_endpoint: String) -> Self {
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
-        Self {
-            http,
-            service_auth_token: RwLock::new(None),
+    fn new_with_policy(pds_endpoint: String, allow_test_loopback: bool) -> Result<Self, MLSError> {
+        Ok(Self {
             pds_oauth_token: RwLock::new(None),
-            pds_base: url::Url::parse(&pds_endpoint).ok(),
-            pds_endpoint,
+            pds_base: parse_base_url(&pds_endpoint, "PDS endpoint", allow_test_loopback)?,
             home_ds_base: None,
             bot_did: None,
-            home_ds_did: None,
-        }
+            home_ds_audience: None,
+            allow_test_loopback: test_loopback_allowed(allow_test_loopback),
+        })
     }
 
+    fn with_identity_policy(
+        pds_endpoint: String,
+        home_ds_endpoint: String,
+        bot_did: String,
+        home_ds_did: String,
+        allow_test_loopback: bool,
+    ) -> Result<Self, MLSError> {
+        if !bot_did.starts_with("did:") {
+            return Err(MLSError::invalid_input("bot identity must be a DID"));
+        }
+        let mut transport = Self::new_with_policy(pds_endpoint, allow_test_loopback)?;
+        transport.home_ds_base = Some(parse_base_url(
+            &home_ds_endpoint,
+            "home DS endpoint",
+            allow_test_loopback,
+        )?);
+        transport.bot_did = Some(bot_did);
+        transport.home_ds_audience = Some(service_audience(&home_ds_did)?);
+        Ok(transport)
+    }
+
+    /// Production transport: HTTPS and public addresses only.
+    pub fn new(pds_endpoint: String) -> Result<Self, MLSError> {
+        Self::new_with_policy(pds_endpoint, false)
+    }
+
+    /// Production transport with home-DS service-auth identity.
     pub fn with_identity(
         pds_endpoint: String,
         home_ds_endpoint: String,
         bot_did: String,
         home_ds_did: String,
-    ) -> Self {
-        let mut s = Self::new(pds_endpoint);
-        s.home_ds_base = url::Url::parse(&home_ds_endpoint).ok();
-        s.bot_did = Some(bot_did);
-        s.home_ds_did = Some(home_ds_did);
-        s
+    ) -> Result<Self, MLSError> {
+        Self::with_identity_policy(pds_endpoint, home_ds_endpoint, bot_did, home_ds_did, false)
     }
 
-    pub fn set_tokens(&self, service_auth: Option<String>, pds_oauth: Option<String>) {
-        if let Ok(mut guard) = self.service_auth_token.write() {
-            *guard = service_auth;
-        }
-        if let Ok(mut guard) = self.pds_oauth_token.write() {
-            *guard = pds_oauth;
-        }
+    /// Local fixture transport. This API does not exist without a unit-test build or the
+    /// non-default `test-support` feature.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn new_for_test(pds_endpoint: String) -> Result<Self, MLSError> {
+        Self::new_with_policy(pds_endpoint, true)
+    }
+
+    /// Local fixture transport with home-DS identity.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_identity_for_test(
+        pds_endpoint: String,
+        home_ds_endpoint: String,
+        bot_did: String,
+        home_ds_did: String,
+    ) -> Result<Self, MLSError> {
+        Self::with_identity_policy(pds_endpoint, home_ds_endpoint, bot_did, home_ds_did, true)
+    }
+
+    pub fn set_pds_oauth_token(&self, pds_oauth: Option<String>) -> Result<(), MLSError> {
+        *self
+            .pds_oauth_token
+            .write()
+            .map_err(|_| MLSError::lock_poisoned("PDS OAuth token"))? = pds_oauth;
+        Ok(())
     }
 }
 
 impl PlatformTransport for BirdPlatformTransport {
     fn execute_http(&self, request: PlatformHttpRequest) -> Result<PlatformHttpResponse, MLSError> {
-        let is_local = request.url.starts_with("http://127.0.0.1")
-            || request.url.starts_with("http://localhost");
-        let is_spaces_probe = request.url.contains("/xrpc/com.atproto.space.getSpace");
-
-        let http = self.http.clone();
-        let pds_base = self.pds_endpoint.trim_end_matches('/').to_string();
-        let target = url::Url::parse(&request.url).ok();
-        let within = |base: &Option<url::Url>| match (base, &target) {
-            (Some(base), Some(target)) => endpoint_contains(base, target),
-            _ => false,
-        };
-        let is_pds_target = within(&self.pds_base);
-        let is_home_ds_target = !is_pds_target && within(&self.home_ds_base);
-        let pds_bearer = self.pds_oauth_token.read().ok().and_then(|g| g.clone());
-        let ds_bearer = self.service_auth_token.read().ok().and_then(|g| g.clone());
+        let target = url::Url::parse(&request.url)
+            .map_err(|error| MLSError::invalid_input(format!("invalid outbound URL: {error}")))?;
+        let method = reqwest::Method::from_bytes(request.method.as_bytes())
+            .map_err(|error| MLSError::invalid_input(format!("invalid HTTP method: {error}")))?;
+        let is_pds_target = endpoint_contains(&self.pds_base, &target);
+        let pds_nsid = xrpc_nsid(&self.pds_base, &target);
+        let home_match = self
+            .home_ds_base
+            .as_ref()
+            .is_some_and(|base| endpoint_contains(base, &target));
+        let home_nsid = self
+            .home_ds_base
+            .as_ref()
+            .and_then(|base| xrpc_nsid(base, &target));
+        if home_match
+            && home_nsid.is_none()
+            && self
+                .home_ds_base
+                .as_ref()
+                .is_some_and(|base| has_xrpc_path(base, &target))
+        {
+            return Err(mint_error(
+                "<invalid-nsid>",
+                "home DS request has no exact XRPC NSID",
+            ));
+        }
+        let pds_path_len = self.pds_base.path().trim_end_matches('/').len();
+        let home_path_len = self
+            .home_ds_base
+            .as_ref()
+            .map(|base| base.path().trim_end_matches('/').len())
+            .unwrap_or_default();
+        let is_home_ds_target = home_match
+            && home_nsid.as_deref().is_some_and(|nsid| {
+                !is_pds_target
+                    || home_path_len > pds_path_len
+                    || (home_path_len == pds_path_len && !nsid.starts_with("com.atproto."))
+            });
+        let is_pds_authenticated_target = is_pds_target
+            && pds_nsid
+                .as_deref()
+                .is_some_and(|nsid| nsid.starts_with("com.atproto."));
+        if is_pds_target
+            && !is_home_ds_target
+            && has_xrpc_path(&self.pds_base, &target)
+            && !is_pds_authenticated_target
+        {
+            return Err(mint_error(
+                pds_nsid.as_deref().unwrap_or("<invalid-nsid>"),
+                "request is outside the configured home DS endpoint",
+            ));
+        }
+        let pds_base = self.pds_base.clone();
+        let pds_bearer = self
+            .pds_oauth_token
+            .read()
+            .map_err(|_| MLSError::lock_poisoned("PDS OAuth token"))?
+            .clone();
         let bot_did = self.bot_did.clone();
-        let home_ds_did = self.home_ds_did.clone();
-        let req_clone = request;
+        let home_ds_audience = self.home_ds_audience.clone();
+        let allow_test_loopback = self.allow_test_loopback;
 
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
+            let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .map_err(|e| MLSError::Internal(format!("build transport runtime: {e}")))?;
-            rt.block_on(async move {
-                let method = reqwest::Method::from_bytes(req_clone.method.as_bytes())
-                    .map_err(|e| MLSError::invalid_input(format!("invalid HTTP method: {e}")))?;
-                let mut builder = http.request(method, &req_clone.url);
-                let mut has_auth = false;
-                for h in &req_clone.headers {
-                    if h.name.eq_ignore_ascii_case("authorization") {
-                        has_auth = true;
-                    }
-                    builder = builder.header(&h.name, &h.value);
-                }
-                if !has_auth {
-                    if is_pds_target {
-                        let effective_pds_tok = if is_spaces_probe {
-                            pds_bearer.clone()
-                        } else {
-                            pds_bearer
-                                .clone()
-                                .or_else(|| is_local.then(|| "bot-pds-oauth".to_string()))
-                        };
-                        if let Some(tok) = effective_pds_tok {
-                            builder = builder.bearer_auth(tok);
-                        }
-                    } else if is_home_ds_target {
-                        let mut effective_ds_tok = ds_bearer.clone();
-                        let has_jwt = effective_ds_tok
-                            .as_deref()
-                            .is_some_and(|t| t.matches('.').count() == 2);
-                        if !has_jwt && req_clone.url.contains("/xrpc/blue.catbird.") {
-                            if let (Some(iss), Some(ds_did)) = (&bot_did, &home_ds_did) {
-                                if let Some(after_xrpc) = req_clone.url.split("/xrpc/").nth(1) {
-                                    let nsid = after_xrpc.split('?').next().unwrap_or(after_xrpc);
-                                    let ds_base = ds_did.split('#').next().unwrap_or(ds_did);
-                                    let aud = format!("{ds_base}#atproto_mls");
-                                    let sa_url = format!(
-                                        "{pds_base}/xrpc/com.atproto.server.getServiceAuth?aud={}&lxm={}&iss={}",
-                                        percent_encode_component(&aud),
-                                        percent_encode_component(nsid),
-                                        percent_encode_component(iss),
-                                    );
-                                    let sa_resp = http
-                                        .get(&sa_url)
-                                        .bearer_auth(
-                                            pds_bearer.as_deref().unwrap_or("bot-pds-oauth"),
-                                        )
-                                        .send()
-                                        .await
-                                        .map_err(|e| {
-                                            MLSError::Internal(format!(
-                                                "mint getServiceAuth `{nsid}` failed: {e}"
-                                            ))
-                                        })?;
-                                    if sa_resp.status().is_success() {
-                                        if let Ok(val) = sa_resp.json::<serde_json::Value>().await {
-                                            if let Some(t) =
-                                                val.get("token").and_then(|v| v.as_str())
-                                            {
-                                                effective_ds_tok = Some(t.to_string());
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        if let Some(tok) = effective_ds_tok {
-                            builder = builder.bearer_auth(tok);
-                        }
+                .map_err(|error| MLSError::Internal(format!("build transport runtime: {error}")))?;
+            runtime.block_on(async move {
+                let http = hardened_client(&target, allow_test_loopback).await?;
+                let mut builder = http.request(method, target);
+                for header in &request.headers {
+                    if !header.name.eq_ignore_ascii_case("authorization")
+                        && !header.name.eq_ignore_ascii_case("host")
+                    {
+                        builder = builder.header(&header.name, &header.value);
                     }
                 }
-                if let Some(body) = req_clone.body {
+                if is_home_ds_target {
+                    let nsid = home_nsid
+                        .as_deref()
+                        .ok_or_else(|| MLSError::invalid_input("home DS XRPC NSID missing"))?;
+                    let issuer = bot_did
+                        .as_deref()
+                        .ok_or_else(|| mint_error(nsid, "bot DID missing"))?;
+                    let audience = home_ds_audience
+                        .as_deref()
+                        .ok_or_else(|| mint_error(nsid, "home DS audience missing"))?;
+                    let token = mint_service_auth_token(
+                        &pds_base,
+                        pds_bearer.as_deref(),
+                        issuer,
+                        audience,
+                        nsid,
+                        allow_test_loopback,
+                    )
+                    .await?;
+                    builder = builder.bearer_auth(token);
+                } else if is_pds_authenticated_target {
+                    if let Some(token) = pds_bearer.as_deref().filter(|token| !token.is_empty()) {
+                        builder = builder.bearer_auth(token);
+                    }
+                }
+                if let Some(body) = request.body {
                     builder = builder.body(body);
                 }
-                // A network failure or timeout is not a response: the request may or may not
-                // have reached the server, so surface an error and let the core keep its
-                // journaled request for its own retry. Real HTTP statuses (including 5xx)
-                // pass through unchanged for the core's transient/terminal classification.
-                let resp = builder
-                    .send()
-                    .await
-                    .map_err(|e| MLSError::Internal(format!("HTTP transport failed: {e}")))?;
-                let status = resp.status().as_u16();
-                let headers = resp
+                // Exactly one target request is attempted. A network error leaves the core's
+                // exact journal bytes untouched; real HTTP statuses pass through unchanged.
+                let response = builder.send().await.map_err(|error| {
+                    MLSError::Internal(format!("HTTP transport failed: {error}"))
+                })?;
+                let status = response.status().as_u16();
+                let headers = response
                     .headers()
                     .iter()
-                    .filter_map(|(k, v)| {
-                        v.to_str().ok().map(|val| PlatformHttpHeader {
-                            name: k.as_str().to_string(),
-                            value: val.to_string(),
+                    .filter_map(|(name, value)| {
+                        value.to_str().ok().map(|value| PlatformHttpHeader {
+                            name: name.as_str().to_string(),
+                            value: value.to_string(),
                         })
                     })
                     .collect();
-                let body = resp
+                let body = response
                     .bytes()
                     .await
-                    .map_err(|e| MLSError::Internal(format!("read HTTP body: {e}")))?
+                    .map_err(|error| MLSError::Internal(format!("read HTTP body: {error}")))?
                     .to_vec();
                 Ok(PlatformHttpResponse {
                     status,
@@ -464,6 +837,100 @@ impl PlatformTransport for BirdPlatformTransport {
 
     fn disconnect_realtime_stream(&self) -> Result<(), MLSError> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod transport_security_tests {
+    use super::{client_pinned_to, forbidden_outbound_ip, BirdPlatformTransport};
+    use std::io::{Read as _, Write as _};
+    use std::net::{IpAddr, SocketAddr, TcpListener};
+
+    #[test]
+    fn test_support_does_not_weaken_default_constructors() {
+        let loopback = "http://127.0.0.1:1".to_string();
+        assert!(BirdPlatformTransport::new(loopback.clone()).is_err());
+        assert!(BirdPlatformTransport::with_identity(
+            loopback.clone(),
+            loopback.clone(),
+            "did:plc:testbot".to_string(),
+            "did:web:test-ds.invalid".to_string(),
+        )
+        .is_err());
+
+        let production = BirdPlatformTransport::new("https://pds.example.com".to_string()).unwrap();
+        assert!(!production.allow_test_loopback);
+        let fixture = BirdPlatformTransport::new_for_test(loopback).unwrap();
+        assert!(fixture.allow_test_loopback);
+    }
+
+    #[test]
+    fn production_policy_refuses_non_https_and_non_public_address_classes() {
+        for raw in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "169.254.169.254",
+            "224.0.0.1",
+            "100.100.100.200",
+            "192.0.2.1",
+            "198.18.0.1",
+            "203.0.113.1",
+            "240.0.0.1",
+            "0.0.0.0",
+            "::1",
+            "fc00::1",
+            "fe80::1",
+            "ff02::1",
+            "::",
+            "::ffff:127.0.0.1",
+            "2001:db8::1",
+            "2002:7f00:1::1",
+            "3fff::1",
+        ] {
+            let ip: IpAddr = raw.parse().unwrap();
+            assert!(forbidden_outbound_ip(ip), "{raw} must be refused");
+            let url = url::Url::parse("https://target.invalid/xrpc/example.method").unwrap();
+            assert!(client_pinned_to(&url, &[SocketAddr::new(ip, 443)], false).is_err());
+        }
+        for raw in ["8.8.8.8", "93.184.216.34", "2606:4700:4700::1111"] {
+            let ip: IpAddr = raw.parse().unwrap();
+            assert!(!forbidden_outbound_ip(ip), "{raw} must remain reachable");
+        }
+
+        let cleartext = url::Url::parse("http://target.invalid/xrpc/example.method").unwrap();
+        let public = "93.184.216.34:80".parse().unwrap();
+        assert!(client_pinned_to(&cleartext, &[public], false).is_err());
+    }
+
+    #[tokio::test]
+    async fn validated_dns_address_is_pinned_and_mixed_rebind_answer_is_rejected() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .unwrap();
+        });
+        // `.invalid` cannot be resolved by the system. Success proves reqwest used only the
+        // already-validated address rather than performing a second, rebindable lookup.
+        let target =
+            url::Url::parse(&format!("http://rebind.invalid:{}/pinned", address.port())).unwrap();
+        let response = client_pinned_to(&target, &[address], true)
+            .unwrap()
+            .get(target)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        server.join().unwrap();
+
+        let target = url::Url::parse("https://rebind.invalid/xrpc/example.method").unwrap();
+        let public = "93.184.216.34:443".parse().unwrap();
+        let rebound_private = "10.0.0.1:443".parse().unwrap();
+        assert!(client_pinned_to(&target, &[public, rebound_private], false).is_err());
     }
 }
 
@@ -493,22 +960,33 @@ pub struct FederatedBirdBot {
 }
 
 impl FederatedBirdBot {
-    /// Open the per-account encrypted SQLCipher DB, verify `I15` Spaces + OAuth scope
-    /// eligibility, and enroll `MLS_256_XWING` KeyPackages + `D4` Labyrinth default-on backup
-    /// with zero `nest` dependency (`G3`).
-    pub fn open_and_enroll(
+    /// Open the per-account encrypted SQLCipher DB, verify Spaces eligibility, and enroll with the
+    /// PDS OAuth/session token used to mint a fresh, exact-lxm service token before each home-DS
+    /// request.
+    pub fn open_and_enroll_with_pds_token(
         config: FederatedBotConfig,
         responder: Arc<dyn BotLlmResponder>,
+        pds_oauth: Option<String>,
     ) -> anyhow::Result<Self> {
-        Self::open_and_enroll_with_tokens(config, responder, None, None)
+        Self::open_and_enroll_with_policy(config, responder, pds_oauth, false)
     }
 
-    /// Open and enroll with pre-configured `mls-ds` service-auth and PDS OAuth/session tokens.
-    pub fn open_and_enroll_with_tokens(
+    /// Local-fixture variant, absent unless unit tests or the non-default `test-support` feature
+    /// are compiled.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn open_and_enroll_with_pds_token_for_test(
         config: FederatedBotConfig,
         responder: Arc<dyn BotLlmResponder>,
-        service_auth: Option<String>,
         pds_oauth: Option<String>,
+    ) -> anyhow::Result<Self> {
+        Self::open_and_enroll_with_policy(config, responder, pds_oauth, true)
+    }
+
+    fn open_and_enroll_with_policy(
+        config: FederatedBotConfig,
+        responder: Arc<dyn BotLlmResponder>,
+        pds_oauth: Option<String>,
+        allow_test_loopback: bool,
     ) -> anyhow::Result<Self> {
         let precheck = evaluate_spaces_eligibility(&SpacesEligibilityInput {
             account_did: config.bot_did.clone(),
@@ -524,13 +1002,14 @@ impl FederatedBirdBot {
         }
 
         let keystore = Arc::new(BirdKeyStore::new(&config.storage_root)?);
-        let transport = Arc::new(BirdPlatformTransport::with_identity(
+        let transport = Arc::new(BirdPlatformTransport::with_identity_policy(
             config.pds_endpoint.clone(),
             config.home_ds_endpoint.clone(),
             config.bot_did.clone(),
             config.home_ds_did.clone(),
-        ));
-        transport.set_tokens(service_auth, pds_oauth);
+            allow_test_loopback,
+        )?);
+        transport.set_pds_oauth_token(pds_oauth)?;
         let observer: Arc<dyn PlatformChangeObserver> = Arc::new(NoopBotObserver);
 
         let sdk_cfg = CatbirdMlsClientConfig {
@@ -560,8 +1039,8 @@ impl FederatedBirdBot {
         })
     }
 
-    pub fn set_auth_tokens(&self, service_auth: Option<String>, pds_oauth: Option<String>) {
-        self.transport.set_tokens(service_auth, pds_oauth);
+    pub fn set_pds_oauth_token(&self, pds_oauth: Option<String>) -> Result<(), MLSError> {
+        self.transport.set_pds_oauth_token(pds_oauth)
     }
 
     pub fn account_did(&self) -> &str {

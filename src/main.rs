@@ -5,61 +5,61 @@ use bird_daemon::bot::{FederatedBirdBot, FederatedBotConfig, HttpLlmResponder};
 use bird_daemon::config::{data_dir, load_config, load_secrets};
 use catbird_mls::client::REQUIRED_LABYRINTH_OAUTH_SCOPES;
 
-/// Authenticate directly against an ATProto PDS via `com.atproto.server.createSession` and
-/// mint a `com.atproto.server.getServiceAuth` JWT for the bot's home `mls-ds` (`G3`: zero `nest`).
-async fn authenticate_with_pds_and_home_ds(
+/// Authenticate directly against an ATProto PDS via `com.atproto.server.createSession`.
+/// The resulting PDS session token is retained only for PDS calls and per-request service-auth
+/// minting; it is never sent to the home DS.
+async fn authenticate_with_pds(
     pds_endpoint: &str,
     identifier: &str,
     app_password: &str,
-    home_ds_did: &str,
-) -> anyhow::Result<(String, String, String)> {
+) -> anyhow::Result<(String, String)> {
+    let pds_base = url::Url::parse(pds_endpoint)?;
+    if pds_base.scheme() != "https"
+        || pds_base.host().is_none()
+        || !pds_base.username().is_empty()
+        || pds_base.password().is_some()
+        || pds_base.query().is_some()
+        || pds_base.fragment().is_some()
+    {
+        anyhow::bail!(
+            "PDS endpoint must be an HTTPS base URL without credentials, query, or fragment"
+        );
+    }
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
         .build()?;
-    let trimmed = pds_endpoint.trim_end_matches('/');
+    let endpoint = format!(
+        "{}/xrpc/com.atproto.server.createSession",
+        pds_endpoint.trim_end_matches('/')
+    );
 
-    let session_resp = http
-        .post(format!("{trimmed}/xrpc/com.atproto.server.createSession"))
+    let response = http
+        .post(endpoint)
         .json(&serde_json::json!({
             "identifier": identifier,
             "password": app_password,
         }))
         .send()
         .await?;
-    let status = session_resp.status();
-    let session_val: serde_json::Value = session_resp.json().await?;
+    let status = response.status();
+    let body = response.bytes().await?;
+    let value: serde_json::Value = serde_json::from_slice(&body)?;
     if !status.is_success() {
-        anyhow::bail!("PDS createSession failed ({status}): {session_val}");
+        anyhow::bail!("PDS createSession failed ({status}): {value}");
     }
-    let did = session_val
+    let did = value
         .get("did")
-        .and_then(|v| v.as_str())
+        .and_then(|value| value.as_str())
         .ok_or_else(|| anyhow::anyhow!("missing did in createSession response"))?
         .to_string();
-    let access_jwt = session_val
+    let access_jwt = value
         .get("accessJwt")
-        .and_then(|v| v.as_str())
+        .and_then(|value| value.as_str())
         .ok_or_else(|| anyhow::anyhow!("missing accessJwt in createSession response"))?
         .to_string();
-
-    let svc_resp = http
-        .get(format!("{trimmed}/xrpc/com.atproto.server.getServiceAuth"))
-        .bearer_auth(&access_jwt)
-        .query(&[("aud", home_ds_did)])
-        .send()
-        .await?;
-    let svc_status = svc_resp.status();
-    let svc_val: serde_json::Value = svc_resp.json().await?;
-    if !svc_status.is_success() {
-        anyhow::bail!("PDS getServiceAuth failed ({svc_status}): {svc_val}");
-    }
-    let service_token = svc_val
-        .get("token")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("missing token in getServiceAuth response"))?
-        .to_string();
-
-    Ok((did, access_jwt, service_token))
+    Ok((did, access_jwt))
 }
 
 #[tokio::main]
@@ -77,30 +77,21 @@ async fn main() -> anyhow::Result<()> {
     let storage_root = data_dir();
     std::fs::create_dir_all(&storage_root)?;
 
-    let (resolved_did, pds_token, ds_service_token) =
-        if let Some(ref app_pw) = secrets.app_password {
-            let (did, access_jwt, svc_tok) = authenticate_with_pds_and_home_ds(
-                &cfg.pds_endpoint,
-                &cfg.handle,
-                app_pw,
-                &cfg.home_ds_did,
-            )
-            .await?;
-            (
-                did,
-                secrets.pds_oauth_token.clone().unwrap_or(access_jwt),
-                Some(svc_tok),
-            )
-        } else {
-            let did = cfg.bot_did.clone().ok_or_else(|| {
-                anyhow::anyhow!("botDid required when using BIRD_PDS_OAUTH_TOKEN")
-            })?;
-            let tok = secrets
-                .pds_oauth_token
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("missing BIRD_PDS_OAUTH_TOKEN"))?;
-            (did, tok, None)
-        };
+    let (resolved_did, pds_token) = if let Some(app_pw) = &secrets.app_password {
+        let (did, access_jwt) =
+            authenticate_with_pds(&cfg.pds_endpoint, &cfg.handle, app_pw).await?;
+        (did, secrets.pds_oauth_token.clone().unwrap_or(access_jwt))
+    } else {
+        let did = cfg
+            .bot_did
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("botDid required when using BIRD_PDS_OAUTH_TOKEN"))?;
+        let token = secrets
+            .pds_oauth_token
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("missing BIRD_PDS_OAUTH_TOKEN"))?;
+        (did, token)
+    };
 
     let responder = Arc::new(HttpLlmResponder::new(
         cfg.llm_base_url.clone(),
@@ -145,12 +136,8 @@ async fn main() -> anyhow::Result<()> {
         max_reply_characters: cfg.max_reply_characters,
     };
 
-    let bot = FederatedBirdBot::open_and_enroll_with_tokens(
-        bot_cfg,
-        responder,
-        ds_service_token,
-        Some(pds_token),
-    )?;
+    let bot =
+        FederatedBirdBot::open_and_enroll_with_pds_token(bot_cfg, responder, Some(pds_token))?;
     tracing::info!(
         did = %bot.account_did(),
         mailbox_space = %bot.enrollment_receipt().mailbox_space_uri,
