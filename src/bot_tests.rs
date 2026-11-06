@@ -290,14 +290,25 @@ fn handle_ds_http(
         let b = &sr["body"];
         let cid = b["conversationId"].as_str().unwrap().to_string();
         let coords = b["next"].clone();
-        let parts = b["manifest"]["participants"].clone();
+        let mut participants = b["manifest"]["participants"].clone();
+        let creator_did = b["manifest"]["actorLeaf"]["userDid"].as_str();
+        if let Some(items) = participants.as_array_mut() {
+            for participant in items {
+                participant["leafCount"] =
+                    json!(usize::from(participant["userDid"].as_str() == creator_did));
+            }
+        }
         g.conversations.insert(
             cid.clone(),
             json!({
                 "conversationKind": "group",
                 "sequencerDid": ds_did,
                 "coordinates": coords.clone(),
-                "participants": parts,
+                "cipherSuite": "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
+                "participants": participants,
+                "leaves": [b["manifest"]["actorLeaf"]],
+                "metadataSnapshot": b["metadataSnapshot"],
+                "snapshotSeq": 1,
             }),
         );
         g.entries.entry(cid).or_default().push(json!({
@@ -320,11 +331,17 @@ fn handle_ds_http(
             .unwrap()
             .to_string();
         let rec_req_id = b["recoveryRequestId"].as_str().unwrap().to_string();
+        let requested_at = b["signedAt"].clone();
+        let expires_at = (chrono::DateTime::parse_from_rfc3339(requested_at.as_str().unwrap())
+            .unwrap()
+            + chrono::Duration::minutes(5))
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         let kp = g
             .convo_kps
             .get_mut(&(invitee_did.clone(), invitee_dev.clone()))
             .and_then(|v| v.pop())
             .expect("invitee must have conversation KP");
+        let kp_ref = kp["keyPackageRef"].clone();
         if let Some(st) = g.conversations.get_mut(&cid) {
             st["coordinates"] = next_coords.clone();
             if let Some(arr) = st["participants"].as_array_mut() {
@@ -343,16 +360,36 @@ fn handle_ds_http(
             "coordinates": next_coords.clone(),
             "signedRequest": sr,
         }));
+        g.conversations.get_mut(&cid).unwrap()["snapshotSeq"] = json!(next_seq);
         g.leaf_recovery_inbox
             .entry(inviter_did)
             .or_default()
             .push(json!({
+                "$type": "blue.catbird.chat.defs#leafRecoveryView",
                 "conversationId": cid,
                 "recoveryRequestId": rec_req_id,
-                "userDid": invitee_did,
-                "deviceId": invitee_dev,
-                "keyPackage": kp,
-                "coordinates": next_coords,
+                "requesterDid": invitee_did,
+                "requesterDeviceId": invitee_dev,
+                "recoveryKind": "add",
+                "boundCoordinate": next_coords,
+                "status": "open",
+                "requestedAt": requested_at,
+                "expiresAt": expires_at,
+                "reservation": {
+                    "conversationId": cid,
+                    "recoveryRequestId": rec_req_id,
+                    "boundCoordinate": next_coords,
+                    "requesterDid": invitee_did,
+                    "requesterDeviceId": invitee_dev,
+                    "requesterKeyId": b["keyId"],
+                    "requesterAuthGeneration": b["authGeneration"],
+                    "keyPackageRef": kp_ref,
+                    "cipherSuite": "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
+                    "purpose": "leafRecovery",
+                    "status": "active",
+                    "expiresAt": expires_at,
+                    "keyPackage": kp,
+                },
             }));
         return (200, json!({ "seq": next_seq }));
     }
@@ -363,6 +400,7 @@ fn handle_ds_http(
         let cid = b["next"]["conversationId"].as_str().unwrap().to_string();
         let next_coords = b["next"].clone();
         let next_seq = (g.entries.get(&cid).map(|v| v.len()).unwrap_or(0) as i64) + 1;
+        let fulfilled_recovery_id = b["recoveryRequestId"].as_str().map(str::to_owned);
         if btype.ends_with("leafRecoveryFulfillmentBody") {
             let wb = &b["manifest"]["welcomeBundle"];
             let welcome_id = wb["welcomeId"].as_str().unwrap().to_string();
@@ -392,6 +430,39 @@ fn handle_ds_http(
         }));
         if let Some(st) = g.conversations.get_mut(&cid) {
             st["coordinates"] = next_coords.clone();
+            st["snapshotSeq"] = json!(next_seq);
+            if let Some(snapshot) = b.get("metadataSnapshot") {
+                st["metadataSnapshot"] = snapshot.clone();
+            }
+            for change in b["manifest"]["leafChanges"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                if change["$type"] == "blue.catbird.chat.defs#addLeafByRecovery" {
+                    st["leaves"].as_array_mut().unwrap().push(json!({
+                        "userDid": change["userDid"],
+                        "deviceId": change["deviceId"],
+                        "leafOrigin": "recovery",
+                    }));
+                }
+            }
+            let leaves = st["leaves"].as_array().cloned().unwrap_or_default();
+            if let Some(participants) = st["participants"].as_array_mut() {
+                for participant in participants {
+                    participant["leafCount"] = json!(leaves
+                        .iter()
+                        .filter(|leaf| leaf["userDid"] == participant["userDid"])
+                        .count());
+                }
+            }
+        }
+        if let Some(fulfilled_recovery_id) = fulfilled_recovery_id {
+            for requests in g.leaf_recovery_inbox.values_mut() {
+                requests.retain(|request| {
+                    request["recoveryRequestId"].as_str() != Some(&fulfilled_recovery_id)
+                });
+            }
         }
         return (
             200,
@@ -402,7 +473,6 @@ fn handle_ds_http(
         let sr = body_json["signedRequest"].clone();
         let b = &sr["body"];
         let cid = b["prior"]["conversationId"].as_str().unwrap().to_string();
-        let msg_id = b["messageId"].as_str().unwrap().to_string();
         let actor_did = b["actorDid"].as_str().unwrap().to_string();
         let actor_dev = b["actorDeviceId"].as_str().unwrap().to_string();
         let gen = b["prior"]["generation"].as_u64().unwrap_or(0);
@@ -413,14 +483,16 @@ fn handle_ds_http(
                 .unwrap()
                 .try_into()
                 .unwrap();
+        let received_at = b["signedAt"].clone();
         let seq = (g.entries.get(&cid).map(|v| v.len()).unwrap_or(0) as u64) + 1;
+        let entry_id = uuid::Uuid::new_v4().to_string();
         let payload = SequencerReceiptPayload {
             sequencer_did: ds_did.to_string(),
             conversation_id: cid.clone(),
             group_id,
             epoch,
             sender_device_did_url: format!("{actor_did}#{actor_dev}"),
-            entry_id: msg_id.clone(),
+            entry_id: entry_id.clone(),
             archive_commitment: commit_arr,
             seq,
             issued_at_ms: 1_762_000_000_000,
@@ -442,14 +514,56 @@ fn handle_ds_http(
             "issuedAtMs": signed.payload.issued_at_ms,
             "signature": { "$bytes": STANDARD.encode(signed.signature) },
         });
-        g.entries.entry(cid).or_default().push(json!({
-            "$type": "blue.catbird.chat.defs#applicationMessageEntry",
+        let entry = json!({
+            "$type": "blue.catbird.chat.defs#applicationEntry",
+            "entryId": entry_id,
+            "conversationId": cid.clone(),
             "seq": seq,
-            "messageId": msg_id,
             "signedRequest": sr,
             "sequencerReceipt": rcpt_json.clone(),
-        }));
-        return (200, json!({ "seq": seq, "sequencerReceipt": rcpt_json }));
+            "receivedAt": received_at,
+        });
+        g.entries.entry(cid).or_default().push(entry.clone());
+        return (
+            200,
+            json!({ "entry": entry, "sequencerReceipt": rcpt_json }),
+        );
+    }
+    if target.contains("/xrpc/blue.catbird.chat.getConversationState") {
+        let cid = q.get("conversationId").cloned().unwrap_or_default();
+        let dev = q.get("actorDeviceId").cloned().unwrap_or_default();
+        let Some(state) = g.conversations.get(&cid).cloned() else {
+            return (400, json!({ "error": "ConversationNotFound" }));
+        };
+        let owner = g
+            .convo_kps
+            .keys()
+            .find(|(_, device)| device == &dev)
+            .map(|(did, _)| did.clone())
+            .unwrap_or_default();
+        let pending_leaf_recoveries = g
+            .leaf_recovery_inbox
+            .get(&owner)
+            .into_iter()
+            .flatten()
+            .filter(|request| {
+                request["conversationId"].as_str() == Some(&cid)
+                    && request["requesterDeviceId"].as_str() != Some(&dev)
+                    && request["status"] == "open"
+                    && request["boundCoordinate"] == state["coordinates"]
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        return (
+            200,
+            json!({
+                "state": state,
+                "pendingLeafRecoveryRequests": pending_leaf_recoveries,
+                "pendingResetRequests": [],
+                "pendingLeaveRequests": [],
+                "accountDeletions": [],
+            }),
+        );
     }
     if target.contains("/xrpc/blue.catbird.chat.getConversations") {
         let list: Vec<Value> = g.conversations.values().cloned().collect();
@@ -481,7 +595,11 @@ fn handle_ds_http(
             .find(|(_, d)| d == &dev)
             .map(|(did, _)| did.clone())
             .unwrap_or_default();
-        let reqs = g.leaf_recovery_inbox.remove(&owner).unwrap_or_default();
+        let reqs = g
+            .leaf_recovery_inbox
+            .get(&owner)
+            .cloned()
+            .unwrap_or_default();
         return (200, json!({ "requests": reqs }));
     }
     if target.contains("/xrpc/blue.catbird.chat.getEntries") {
@@ -791,7 +909,22 @@ async fn birdaemon_live_local_ds_welcome_mention_and_encrypted_reply_roundtrip()
         .sync_and_reply()
         .await
         .expect("bot tick 2 sync_and_reply");
-    assert_eq!(replies.len(), 1);
+    let bot_message_count = bot
+        .list_messages(&convo_uuid, 20)
+        .map(|messages| messages.len());
+    let (acked, pending_welcomes, server_entries) = {
+        let state = ds_state.lock().unwrap();
+        (
+            state.acked_welcomes.len(),
+            state.pending_welcomes.values().map(Vec::len).sum::<usize>(),
+            state.entries.get(&convo_uuid).map(Vec::len),
+        )
+    };
+    assert_eq!(
+        replies.len(),
+        1,
+        "acked={acked} pending_welcomes={pending_welcomes} server_entries={server_entries:?} bot_messages={bot_message_count:?}"
+    );
     assert!(uuid::Uuid::parse_str(&replies[0].message_id).is_ok());
     assert!(replies[0]
         .plaintext_json
