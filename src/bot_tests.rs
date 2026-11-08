@@ -259,8 +259,21 @@ fn handle_ds_http(
         let did = b["actorDid"].as_str().unwrap().to_string();
         let dev = b["deviceId"].as_str().unwrap().to_string();
         let kps = b["keyPackages"].as_array().cloned().unwrap_or_default();
+        // `blue.catbird.chat.defs#deviceView`, as mls-ds answers: the core binds enrollment to
+        // this exact device, key and generation before any PDS write.
+        let device = json!({
+            "deviceId": dev,
+            "keyId": b["keyId"],
+            "signaturePublicKey": b["signaturePublicKey"],
+            "authGeneration": 1,
+            "status": "active",
+            "createdAt": b["signedAt"],
+            "updatedAt": b["signedAt"],
+            "availablePackageCount": kps.len(),
+            "reservedPackageCount": 0,
+        });
         g.convo_kps.entry((did, dev)).or_default().extend(kps);
-        return (200, json!({ "device": { "authGeneration": 1 } }));
+        return (200, json!({ "device": device }));
     }
     if target.contains("/xrpc/blue.catbird.chat.replenishKeyPackages") {
         let b = &body_json["signedRequest"]["body"];
@@ -311,13 +324,24 @@ fn handle_ds_http(
                 "snapshotSeq": 1,
             }),
         );
-        g.entries.entry(cid).or_default().push(json!({
+        g.entries.entry(cid.clone()).or_default().push(json!({
             "$type": "blue.catbird.chat.defs#creationEntry",
             "seq": 1,
             "coordinates": coords.clone(),
             "signedRequest": sr,
         }));
-        return (200, json!({ "seq": 1, "state": { "coordinates": coords } }));
+        // `mls-ds` answers the sequenced creation entry carrying the exact signed request.
+        return (
+            200,
+            json!({ "result": {
+                "$type": "blue.catbird.chat.defs#conversationCreatedResult",
+                "coordinates": coords,
+                "entry": {
+                    "entryId": b["transitionId"], "conversationId": cid, "seq": 1,
+                    "signedRequest": sr, "receivedAt": b["signedAt"],
+                },
+            }}),
+        );
     }
     if target.contains("/xrpc/blue.catbird.chat.acceptConversation") {
         let sr = body_json["signedRequest"].clone();
@@ -361,37 +385,42 @@ fn handle_ds_http(
             "signedRequest": sr,
         }));
         g.conversations.get_mut(&cid).unwrap()["snapshotSeq"] = json!(next_seq);
+        let view = json!({
+            "$type": "blue.catbird.chat.defs#leafRecoveryView",
+            "conversationId": cid,
+            "recoveryRequestId": rec_req_id,
+            "requesterDid": invitee_did,
+            "requesterDeviceId": invitee_dev,
+            "recoveryKind": "add",
+            "boundCoordinate": next_coords,
+            "status": "open",
+            "requestedAt": requested_at,
+            "expiresAt": expires_at,
+            "reservation": {
+                "conversationId": cid,
+                "recoveryRequestId": rec_req_id,
+                "boundCoordinate": next_coords,
+                "requesterDid": invitee_did,
+                "requesterDeviceId": invitee_dev,
+                "requesterKeyId": b["keyId"],
+                "requesterAuthGeneration": b["authGeneration"],
+                "keyPackageRef": kp_ref,
+                "cipherSuite": "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
+                "purpose": "leafRecovery",
+                "status": "active",
+                "expiresAt": expires_at,
+                "keyPackage": kp,
+            },
+        });
         g.leaf_recovery_inbox
             .entry(inviter_did)
             .or_default()
-            .push(json!({
-                "$type": "blue.catbird.chat.defs#leafRecoveryView",
-                "conversationId": cid,
-                "recoveryRequestId": rec_req_id,
-                "requesterDid": invitee_did,
-                "requesterDeviceId": invitee_dev,
-                "recoveryKind": "add",
-                "boundCoordinate": next_coords,
-                "status": "open",
-                "requestedAt": requested_at,
-                "expiresAt": expires_at,
-                "reservation": {
-                    "conversationId": cid,
-                    "recoveryRequestId": rec_req_id,
-                    "boundCoordinate": next_coords,
-                    "requesterDid": invitee_did,
-                    "requesterDeviceId": invitee_dev,
-                    "requesterKeyId": b["keyId"],
-                    "requesterAuthGeneration": b["authGeneration"],
-                    "keyPackageRef": kp_ref,
-                    "cipherSuite": "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
-                    "purpose": "leafRecovery",
-                    "status": "active",
-                    "expiresAt": expires_at,
-                    "keyPackage": kp,
-                },
-            }));
-        return (200, json!({ "seq": next_seq }));
+            .push(view.clone());
+        // `mls-ds` `acceptance_response`: the acceptance's coordinate and recovery view.
+        return (
+            200,
+            json!({ "seq": next_seq, "coordinates": next_coords, "recovery": view }),
+        );
     }
     if target.contains("/xrpc/blue.catbird.chat.submitTransition") {
         let sr = body_json["signedRequest"].clone();
@@ -464,9 +493,25 @@ fn handle_ds_http(
                 });
             }
         }
+        let entry_kind = match btype.trim_start_matches("blue.catbird.chat.defs#") {
+            "commitTransitionBody" => "commitEntry",
+            "leafRecoveryFulfillmentBody" => "leafRecoveryFulfillmentEntry",
+            "policyTransitionBody" => "policyEntry",
+            "metadataTransitionBody" => "metadataEntry",
+            other => panic!("fixture has no entry kind for {other}"),
+        };
+        // `mls-ds` answers the sequenced entry carrying the exact signed request.
         return (
             200,
-            json!({ "seq": next_seq, "state": { "coordinates": next_coords } }),
+            json!({
+                "coordinates": next_coords,
+                "entry": {
+                    "$type": format!("blue.catbird.chat.defs#{entry_kind}"),
+                    "entryId": b["transitionId"], "conversationId": cid, "seq": next_seq,
+                    "signedRequest": sr, "receivedAt": b["signedAt"],
+                },
+                "welcomes": [],
+            }),
         );
     }
     if target.contains("/xrpc/blue.catbird.chat.sendMessage") {
