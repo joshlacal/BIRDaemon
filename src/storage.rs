@@ -3171,10 +3171,13 @@ mod tests {
             .await
             .expect("refresh canonical roster");
         assert_eq!(
-            serde_json::to_value(reopened
-                .get_conversation(owner, canonical_id)
-                .await
-                .unwrap()).unwrap(),
+            serde_json::to_value(
+                reopened
+                    .get_conversation(owner, canonical_id)
+                    .await
+                    .unwrap()
+            )
+            .unwrap(),
             serde_json::to_value(Some(refreshed_canonical)).unwrap()
         );
         assert!(reopened

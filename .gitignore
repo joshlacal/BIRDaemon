@@ -1,2 +1,14 @@
 /target
 .DS_Store
+
+# Local runtime configuration, credentials, and MLS state
+.env
+.env.*
+config.json
+credentials.json
+keychain.json
+keystore/
+mls-state/
+*.db
+*.db-*
+*.key

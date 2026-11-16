@@ -81,11 +81,8 @@ pub struct BirdApiClient {
     signer: Arc<Mutex<Option<Arc<dyn CleanChatRequestSigner>>>>,
     inventory: Arc<Mutex<Option<InventoryFence>>>,
     pending_welcomes: Arc<Mutex<HashMap<String, CachedPendingWelcome>>>,
-    cached_coordinates: Arc<
-        Mutex<
-            HashMap<String, catbird_atproto::blue_catbird::chat::ConversationCoordinates>,
-        >,
-    >,
+    cached_coordinates:
+        Arc<Mutex<HashMap<String, catbird_atproto::blue_catbird::chat::ConversationCoordinates>>>,
     /// Stored for re-authentication when refresh token also expires.
     handle: String,
     app_password: String,
@@ -185,14 +182,7 @@ impl BirdApiClient {
                     e
                 );
                 self.session
-                    .login(
-                        &self.handle,
-                        &self.app_password,
-                        None,
-                        None,
-                        None,
-                        None,
-                    )
+                    .login(&self.handle, &self.app_password, None, None, None, None)
                     .await
                     .map_err(|e| {
                         OrchestratorError::Api(format!("Re-authentication failed: {e}"))
@@ -342,9 +332,7 @@ impl BirdApiClient {
             });
         let reason = match (response.status, error_code.as_deref()) {
             (401, Some("AccountSessionExpired")) => Some(InvalidationReason::LoggedOut),
-            (401, Some("DeviceBindingMismatch")) => {
-                Some(InvalidationReason::DeviceBindingChanged)
-            }
+            (401, Some("DeviceBindingMismatch")) => Some(InvalidationReason::DeviceBindingChanged),
             (401, Some("DeviceNotRegistered")) | (401, Some("DeviceRevoked")) => {
                 Some(InvalidationReason::Revoked)
             }
@@ -651,8 +639,11 @@ impl BirdApiClient {
         let path = canonical_get_conversations_path(call.snapshot.device_id(), limit, cursor);
         let response = self.canonical_get_response(call, &path).await?;
         let body = Self::require_successful_response("getConversations", response)?;
-        let output = catbird_mls::orchestrator::canonical_transport::decode_conversations_inventory(&body)
-            .map_err(|error| OrchestratorError::Api(format!("Canonical getConversations decode: {error}")))?;
+        let output =
+            catbird_mls::orchestrator::canonical_transport::decode_conversations_inventory(&body)
+                .map_err(|error| {
+                OrchestratorError::Api(format!("Canonical getConversations decode: {error}"))
+            })?;
 
         let response_inventory = InventoryFence {
             authority: call.snapshot.clone(),
@@ -869,8 +860,7 @@ fn validate_prepared_request_scope(
         | CanonicalOperation::GetPendingWelcomes => "GET",
         CanonicalOperation::SubscribeEvents | CanonicalOperation::UploadBlob => {
             return Err(OrchestratorError::InvalidInput(
-                "streaming and octet-stream operations cannot use the prepared JSON gateway"
-                    .into(),
+                "streaming and octet-stream operations cannot use the prepared JSON gateway".into(),
             ));
         }
         _ => "POST",
@@ -1147,12 +1137,17 @@ fn canonical_entry_envelope(
     use catbird_atproto::blue_catbird::chat::ConversationEntry;
     let kind = match &entry {
         ConversationEntry::ApplicationEntry(_) => CanonicalEntryKind::Application,
-        ConversationEntry::CommitEntry(_) | ConversationEntry::LeafRecoveryFulfillmentEntry(_)
-            | ConversationEntry::LeaveCommitFulfillmentEntry(_) => CanonicalEntryKind::Commit,
+        ConversationEntry::CommitEntry(_)
+        | ConversationEntry::LeafRecoveryFulfillmentEntry(_)
+        | ConversationEntry::LeaveCommitFulfillmentEntry(_) => CanonicalEntryKind::Commit,
         _ => return Ok(None),
     };
-    let row = serde_json::to_value(entry).map_err(|error| OrchestratorError::Api(error.to_string()))?;
-    Ok(IncomingEnvelope::from_canonical_entry(&row, requested_convo_id)?.map(|envelope| (kind, envelope)))
+    let row =
+        serde_json::to_value(entry).map_err(|error| OrchestratorError::Api(error.to_string()))?;
+    Ok(
+        IncomingEnvelope::from_canonical_entry(&row, requested_convo_id)?
+            .map(|envelope| (kind, envelope)),
+    )
 }
 
 fn parse_dt(s: &str) -> Option<DateTime<Utc>> {
@@ -1948,16 +1943,15 @@ mod tests {
             1,
         )
         .unwrap();
-        let request =
-            |operation: CanonicalOperation,
-             method: &str,
-             path: &str,
-             body: Option<serde_json::Value>| PreparedRequest {
-                operation,
-                method: method.into(),
-                path: path.into(),
-                body: body.map(|body| serde_json::to_vec(&body).unwrap()),
-            };
+        let request = |operation: CanonicalOperation,
+                       method: &str,
+                       path: &str,
+                       body: Option<serde_json::Value>| PreparedRequest {
+            operation,
+            method: method.into(),
+            path: path.into(),
+            body: body.map(|body| serde_json::to_vec(&body).unwrap()),
+        };
 
         assert!(validate_prepared_request_scope(
             &request(
@@ -2175,7 +2169,9 @@ mod tests {
 #[cfg(test)]
 mod canonical_admission_projection_tests {
     use super::*;
-    use catbird_mls::orchestrator::canonical_transport::{decode_conversation_state, encode_conversation_state, decode_conversations_inventory};
+    use catbird_mls::orchestrator::canonical_transport::{
+        decode_conversation_state, decode_conversations_inventory, encode_conversation_state,
+    };
 
     fn inventory(wire: serde_json::Value) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
@@ -2185,10 +2181,12 @@ mod canonical_admission_projection_tests {
         })).unwrap()
     }
 
-
     #[test]
     fn canonical_pending_and_accepted_leafless_views_keep_exact_snapshot() {
-        let fixture: serde_json::Value = serde_json::from_str(include_str!("../tests/fixtures/canonical-conversation-state.json")).unwrap();
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/canonical-conversation-state.json"
+        ))
+        .unwrap();
         for (status, version) in [("pending", 41), ("active", 42)] {
             let mut wire = fixture.clone();
             wire["participants"][1]["status"] = serde_json::json!(status);
@@ -2205,13 +2203,23 @@ mod canonical_admission_projection_tests {
             let view = canonical_conversation_view(&state).unwrap();
             assert_eq!(view.canonical_state.as_ref(), Some(&state));
             assert_eq!(view.epoch, state.coordinates.epoch as u64);
-            assert_eq!(view.group_id, hex::encode(state.coordinates.group_id.as_ref()));
-            let persisted: ConversationView = serde_json::from_slice(&serde_json::to_vec(&view).unwrap()).unwrap();
+            assert_eq!(
+                view.group_id,
+                hex::encode(state.coordinates.group_id.as_ref())
+            );
+            let persisted: ConversationView =
+                serde_json::from_slice(&serde_json::to_vec(&view).unwrap()).unwrap();
             let retained = persisted.canonical_state.unwrap();
-            assert_eq!(decode_conversation_state(&encode_conversation_state(&retained).unwrap()).unwrap(), state);
+            assert_eq!(
+                decode_conversation_state(&encode_conversation_state(&retained).unwrap()).unwrap(),
+                state
+            );
             assert_eq!(retained.participants[1].status, status);
             assert_eq!(retained.participants[1].leaf_count, 0);
-            assert_eq!(retained.participants[1].invitation_provenance, state.participants[1].invitation_provenance);
+            assert_eq!(
+                retained.participants[1].invitation_provenance,
+                state.participants[1].invitation_provenance
+            );
             assert!(view.created_at.is_none());
             assert!(view.metadata.is_none());
         }
@@ -2219,11 +2227,18 @@ mod canonical_admission_projection_tests {
 
     #[test]
     fn legacy_view_is_unknown_and_malformed_canonical_state_is_rejected() {
-        let mut wire: serde_json::Value = serde_json::from_str(include_str!("../tests/fixtures/canonical-conversation-state.json")).unwrap();
+        let mut wire: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/canonical-conversation-state.json"
+        ))
+        .unwrap();
         let state = decode_conversation_state(wire.to_string().as_bytes()).unwrap();
         let view = canonical_conversation_view(&state).unwrap();
         let mut old_view = serde_json::to_value(view).unwrap();
-        assert!(old_view.as_object_mut().unwrap().remove("canonicalState").is_some());
+        assert!(old_view
+            .as_object_mut()
+            .unwrap()
+            .remove("canonicalState")
+            .is_some());
         let legacy: ConversationView = serde_json::from_value(old_view).unwrap();
         assert!(legacy.canonical_state.is_none());
         wire["participants"][1]["status"] = serde_json::json!("unknown");

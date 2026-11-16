@@ -230,13 +230,7 @@ async fn test_canonical_read_through_nest_with_bearer_and_device_header() {
     let base_url = format!("http://127.0.0.1:{port}/");
 
     let signer = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
-    let snapshot = test_snapshot(
-        TEST_OPAQUE_SESSION,
-        TEST_DID,
-        TEST_DEVICE_ID,
-        7,
-        &signer,
-    );
+    let snapshot = test_snapshot(TEST_OPAQUE_SESSION, TEST_DID, TEST_DEVICE_ID, 7, &signer);
     let authority_state = Arc::new(AuthorityState::new());
     authority_state.install(snapshot);
 
@@ -298,13 +292,7 @@ async fn test_canonical_send_message_with_task5_signed_request_through_nest() {
     let base_url = format!("http://127.0.0.1:{port}/");
 
     let signer = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
-    let snapshot = test_snapshot(
-        TEST_OPAQUE_SESSION,
-        TEST_DID,
-        TEST_DEVICE_ID,
-        7,
-        &signer,
-    );
+    let snapshot = test_snapshot(TEST_OPAQUE_SESSION, TEST_DID, TEST_DEVICE_ID, 7, &signer);
     let authority_state = Arc::new(AuthorityState::new());
     authority_state.install(snapshot.clone());
 
@@ -425,13 +413,7 @@ async fn test_canonical_blob_download_through_nest() {
     let base_url = format!("http://127.0.0.1:{port}/");
 
     let signer = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
-    let snapshot = test_snapshot(
-        TEST_OPAQUE_SESSION,
-        TEST_DID,
-        TEST_DEVICE_ID,
-        7,
-        &signer,
-    );
+    let snapshot = test_snapshot(TEST_OPAQUE_SESSION, TEST_DID, TEST_DEVICE_ID, 7, &signer);
     let authority_state = Arc::new(AuthorityState::new());
     authority_state.install(snapshot);
 
@@ -486,13 +468,7 @@ async fn test_canonical_subscription_ticket_and_websocket_isolation() {
     let ws_endpoint = format!("ws://127.0.0.1:{ws_port}/subscribeEvents");
 
     let signer = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
-    let snapshot = test_snapshot(
-        TEST_OPAQUE_SESSION,
-        TEST_DID,
-        TEST_DEVICE_ID,
-        7,
-        &signer,
-    );
+    let snapshot = test_snapshot(TEST_OPAQUE_SESSION, TEST_DID, TEST_DEVICE_ID, 7, &signer);
     let authority_state = Arc::new(AuthorityState::new());
     authority_state.install(snapshot);
 
@@ -586,13 +562,7 @@ async fn test_bearer_never_sent_to_pds_or_ds_and_downstream_tokens_never_enter_b
     let nest_url = format!("http://127.0.0.1:{nest_port}/");
 
     let signer = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
-    let snapshot = test_snapshot(
-        TEST_OPAQUE_SESSION,
-        TEST_DID,
-        TEST_DEVICE_ID,
-        7,
-        &signer,
-    );
+    let snapshot = test_snapshot(TEST_OPAQUE_SESSION, TEST_DID, TEST_DEVICE_ID, 7, &signer);
     let authority_state = Arc::new(AuthorityState::new());
     authority_state.install(snapshot);
 
@@ -675,13 +645,7 @@ async fn ordinary_http_failures_are_preserved_without_invalidating_authority() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base_url = format!("http://{}/", listener.local_addr().unwrap());
         let signer = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
-        let snapshot = test_snapshot(
-            TEST_OPAQUE_SESSION,
-            TEST_DID,
-            TEST_DEVICE_ID,
-            7,
-            &signer,
-        );
+        let snapshot = test_snapshot(TEST_OPAQUE_SESSION, TEST_DID, TEST_DEVICE_ID, 7, &signer);
         let invalidated = Arc::new(AtomicBool::new(false));
         let invalidated_for_hook = invalidated.clone();
         let authority_state = Arc::new(AuthorityState::with_invalidation_hook(Arc::new(
@@ -744,13 +708,7 @@ async fn proven_account_session_expiry_invalidates_but_preserves_response() {
     let base_url = format!("http://127.0.0.1:{port}/");
 
     let signer = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
-    let snapshot = test_snapshot(
-        TEST_OPAQUE_SESSION,
-        TEST_DID,
-        TEST_DEVICE_ID,
-        7,
-        &signer,
-    );
+    let snapshot = test_snapshot(TEST_OPAQUE_SESSION, TEST_DID, TEST_DEVICE_ID, 7, &signer);
     let invalidated = Arc::new(AtomicBool::new(false));
     let inv_clone = invalidated.clone();
     let authority_state = Arc::new(AuthorityState::with_invalidation_hook(Arc::new(
@@ -815,13 +773,7 @@ async fn proven_account_session_expiry_invalidates_but_preserves_response() {
 #[tokio::test]
 async fn caller_scope_mismatch_fails_before_network_or_authority_mutation() {
     let signer = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
-    let snapshot = test_snapshot(
-        TEST_OPAQUE_SESSION,
-        TEST_DID,
-        TEST_DEVICE_ID,
-        7,
-        &signer,
-    );
+    let snapshot = test_snapshot(TEST_OPAQUE_SESSION, TEST_DID, TEST_DEVICE_ID, 7, &signer);
     let authority_state = Arc::new(AuthorityState::new());
     authority_state.install(snapshot);
     let nest = Arc::new(NestClient::new("http://127.0.0.1:9/").unwrap());
@@ -1487,13 +1439,7 @@ async fn test_simulated_bot_receive_decrypt_reply_flow() {
     let base_url = format!("http://127.0.0.1:{port}/");
 
     let signer = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
-    let snapshot = test_snapshot(
-        TEST_OPAQUE_SESSION,
-        TEST_DID,
-        TEST_DEVICE_ID,
-        7,
-        &signer,
-    );
+    let snapshot = test_snapshot(TEST_OPAQUE_SESSION, TEST_DID, TEST_DEVICE_ID, 7, &signer);
     let authority_state = Arc::new(AuthorityState::new());
     authority_state.install(snapshot);
 
