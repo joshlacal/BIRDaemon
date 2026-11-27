@@ -24,9 +24,6 @@ manifest_value() {
   printf '%s' "$value"
 }
 
-expected_commit=$(manifest_value CATBIRD_MLS_COMMIT)
-expected_child=$(manifest_value CATBIRD_MLS_CHILD)
-expected_tree=$(manifest_value CATBIRD_MLS_TREE)
 expected_lock=$(manifest_value BIR_DAEMON_LOCK_SHA256)
 
 actual_lock=$(shasum -a 256 "$repo_root/Cargo.lock" | awk '{print $1}')
@@ -44,29 +41,44 @@ if ! CMAKE_POLICY_VERSION_MINIMUM=3.5 cargo metadata \
   cat "$metadata_error" >&2
   exit 1
 fi
-resolved_mls_manifest=$(jq -er '[.packages[] | select(.name == "catbird_mls") | .manifest_path] | if length == 1 then .[0] else error("expected one catbird_mls package") end' "$metadata")
-expected_mls_manifest=$(cd "$sibling_root" && pwd)/Cargo.toml
-if [[ "$resolved_mls_manifest" != "$expected_mls_manifest" ]]; then
-  printf 'Cargo resolved catbird_mls outside checked sibling\nexpected: %s\nactual:   %s\n' \
-    "$expected_mls_manifest" "$resolved_mls_manifest" >&2
-  exit 1
-fi
+# Verify each repository against its immutable revision. Different jj workspaces
+# can have different empty working-copy commit IDs for the exact same source.
+verify_sibling() {
+  local package=$1 prefix=$2 directory=$3 path=$4
+  local resolved root commit tree gitdir current
+  resolved=$(jq -er --arg name "$package" '
+    [.packages[] | select(.name == $name and .source == null) | .manifest_path]
+    | if length == 1 then .[0] else error("expected one local package " + $name) end' "$metadata")
+  root=$(cd "$repo_root/../$directory" && pwd -P)
+  [[ "$(cd "$(dirname "$resolved")" && pwd -P)/$(basename "$resolved")" == "$root/$path" ]] || {
+    echo "Unexpected resolved manifest for $package" >&2
+    return 1
+  }
+  commit=$(manifest_value "${prefix}_COMMIT")
+  tree=$(manifest_value "${prefix}_TREE")
+  if [[ -d "$root/.jj" ]]; then
+    current=$(cd "$root" && jj log -r @ --no-graph -T commit_id)
+    gitdir=$(cd "$root" && jj git root)
+    [[ "$(cd "$root" && jj log -r "$commit & ::@" --no-graph -T commit_id)" == "$commit" ]]
+    [[ -z "$(cd "$root" && jj diff --summary -r @)" ]]
+  else
+    gitdir=$(git -C "$root" rev-parse --absolute-git-dir)
+    current=$(git -C "$root" rev-parse HEAD)
+    [[ "$current" == "$commit" ]]
+    [[ -z "$(git -C "$root" status --porcelain)" ]]
+  fi
+  [[ "$(git --git-dir="$gitdir" rev-parse "$current^{tree}")" == "$tree" ]]
+  printf 'Verified %s %s\n' "$package" "$commit"
+}
 
-status_output=$(cd "$sibling_root" && jj st)
-if ! grep -Fq 'The working copy has no changes.' <<<"$status_output"; then
-  printf 'catbird-mls sibling is dirty or conflicted: %s\n%s\n' "$sibling_root" "$status_output" >&2
-  exit 1
-fi
-
-actual_child=$(cd "$sibling_root" && jj log -r '@' --no-graph -T 'commit_id')
-actual_parent=$(cd "$sibling_root" && jj log -r '@-' --no-graph -T 'commit_id')
-actual_tree=$(cd "$sibling_root" && jj debug object commit "$actual_child" | awk '/TreeId\(/ { getline; gsub(/[",[:space:]]/, ""); print; exit }')
-
-if [[ "$actual_child" != "$expected_child" || "$actual_parent" != "$expected_commit" || "$actual_tree" != "$expected_tree" ]]; then
-  printf 'catbird-mls provenance mismatch\nexpected child: %s\nactual child:   %s\nexpected parent: %s\nactual parent:   %s\nexpected tree:   %s\nactual tree:     %s\n' \
-    "$expected_child" "$actual_child" "$expected_commit" "$actual_parent" "$expected_tree" "$actual_tree" >&2
-  exit 1
-fi
-
-printf 'exact Cargo-resolved catbird-mls and lock provenance verified: manifest=%s child=%s parent=%s tree=%s lock=%s\n' \
-  "$resolved_mls_manifest" "$actual_child" "$actual_parent" "$actual_tree" "$actual_lock"
+verify_sibling catbird_mls CATBIRD_MLS catbird-mls Cargo.toml
+verify_sibling petrel PETREL Petrel rust/petrel/Cargo.toml
+verify_sibling petrel-catbird PETREL_CATBIRD PetrelCatbird rust/petrel-catbird/Cargo.toml
+verify_sibling atproto-spaces CATBIRD_ATPROTO catbird-atproto atproto-spaces/Cargo.toml
+verify_sibling labyrinth LABYRINTH labyrinth Cargo.toml
+expected_features=$(manifest_value CATBIRD_MLS_FEATURES_JSON)
+jq -e --argjson expected "$expected_features" '
+  (.packages[] | select(.name == "catbird_mls") | .id) as $id
+  | (.resolve.nodes[] | select(.id == $id) | .features | sort) == ($expected | sort)
+' "$metadata" >/dev/null
+printf 'Verified lock %s and MLS features %s\n' "$actual_lock" "$expected_features"

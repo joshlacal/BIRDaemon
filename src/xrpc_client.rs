@@ -1,7 +1,7 @@
 //! MLSAPIClient implementation using PDS atproto-proxy.
 //!
 //! Routes MLS calls through the PDS with the atproto-proxy header.
-//! Uses jacquard session for automatic token refresh on expiry.
+//! Uses Petrel app-password session for automatic token refresh on expiry.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -27,8 +27,7 @@ use crate::chat_authority::{
 };
 use crate::credentials::FileCredentialStore;
 
-/// Jacquard session type alias.
-type Session = jacquard::client::MemoryCredentialSession;
+use crate::pds_session::PdsSession;
 
 /// Trait for preparing signed clean-chat requests without leaking credentials.
 #[async_trait]
@@ -64,27 +63,24 @@ where
 }
 
 /// XRPC client that routes MLS calls through the PDS via atproto-proxy.
-/// Token lifecycle is managed by the jacquard session: on expired token errors,
+/// Token lifecycle is managed by the Petrel app-password session: on expired token errors,
 /// the client refreshes via `com.atproto.server.refreshSession` and retries.
 /// If the refresh token is also expired, it falls back to full re-authentication
 /// with the app password.
 pub struct BirdApiClient {
-    http: reqwest::Client,
     pds_endpoint: String,
-    session: Arc<Session>,
+    session: PdsSession,
     did: String,
     /// Clean-chat requests use only this opaque Nest session and immutable
-    /// actor/device/generation/signer snapshot. Jacquard is never used for this
+    /// actor/device/generation/signer snapshot. PDS authentication is never used for this
     /// namespace.
     nest: Option<Arc<NestClient>>,
     authority: Option<Arc<AuthorityState>>,
     signer: Arc<Mutex<Option<Arc<dyn CleanChatRequestSigner>>>>,
     inventory: Arc<Mutex<Option<InventoryFence>>>,
     pending_welcomes: Arc<Mutex<HashMap<String, CachedPendingWelcome>>>,
-    cached_coordinates:
-        Arc<Mutex<HashMap<String, catbird_atproto::blue_catbird::chat::ConversationCoordinates>>>,
+    cached_coordinates: Arc<Mutex<HashMap<String, crate::chat::defs::ConversationCoordinates>>>,
     /// Stored for re-authentication when refresh token also expires.
-    handle: String,
     app_password: String,
 }
 
@@ -93,7 +89,7 @@ struct CachedPendingWelcome {
     authority: AuthoritySnapshot,
     welcome_id: String,
     transition_seq: i64,
-    coordinates: catbird_atproto::blue_catbird::chat::ConversationCoordinates<String>,
+    coordinates: crate::chat::defs::ConversationCoordinates,
     opaque_welcome: Vec<u8>,
     acknowledgement_idempotency_key: String,
 }
@@ -115,13 +111,11 @@ struct CallAuthority {
 impl BirdApiClient {
     pub fn new(
         pds_endpoint: String,
-        session: Arc<Session>,
+        session: PdsSession,
         did: String,
-        handle: String,
         app_password: String,
     ) -> Self {
         Self {
-            http: reqwest::Client::new(),
             pds_endpoint,
             session,
             did,
@@ -131,7 +125,6 @@ impl BirdApiClient {
             inventory: Arc::new(Mutex::new(None)),
             pending_welcomes: Arc::new(Mutex::new(HashMap::new())),
             cached_coordinates: Arc::new(Mutex::new(HashMap::new())),
-            handle,
             app_password,
         }
     }
@@ -150,61 +143,6 @@ impl BirdApiClient {
     pub fn set_signer(&self, signer: Arc<dyn CleanChatRequestSigner>) {
         let mut s = self.signer.lock().unwrap();
         *s = Some(signer);
-    }
-
-    fn xrpc_url(&self, nsid: &str) -> String {
-        format!("{}/xrpc/{}", self.pds_endpoint, nsid)
-    }
-
-    /// Get current access JWT from the jacquard session.
-    async fn get_jwt(&self) -> Result<String> {
-        match self.session.access_token().await {
-            Some(token) => Ok(Self::extract_jwt(token)),
-            None => {
-                // Session state lost — try to recover
-                tracing::warn!("No access token in session, attempting refresh");
-                self.refresh_jwt().await
-            }
-        }
-    }
-
-    /// Refresh the access token. Tries jacquard's refreshSession first,
-    /// falls back to full re-login with app password if that also fails.
-    async fn refresh_jwt(&self) -> Result<String> {
-        match self.session.refresh().await {
-            Ok(token) => {
-                tracing::info!("Session token refreshed successfully");
-                Ok(Self::extract_jwt(token))
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Token refresh failed ({}), re-authenticating with app password",
-                    e
-                );
-                self.session
-                    .login(&self.handle, &self.app_password, None, None, None, None)
-                    .await
-                    .map_err(|e| {
-                        OrchestratorError::Api(format!("Re-authentication failed: {e}"))
-                    })?;
-                tracing::info!("Re-authenticated successfully");
-                self.session
-                    .access_token()
-                    .await
-                    .map(Self::extract_jwt)
-                    .ok_or_else(|| {
-                        OrchestratorError::Api("No token after re-authentication".into())
-                    })
-            }
-        }
-    }
-
-    fn extract_jwt(token: jacquard_common::AuthorizationToken) -> String {
-        match token {
-            jacquard_common::AuthorizationToken::Bearer(s) => s.to_string(),
-            jacquard_common::AuthorizationToken::Dpop(s) => s.to_string(),
-            jacquard_common::AuthorizationToken::Delegation(s) => s.to_string(),
-        }
     }
 
     /// Get a v2 subscription ticket through Nest. The returned endpoint is
@@ -392,7 +330,7 @@ impl BirdApiClient {
     async fn get_own_devices_all(
         &self,
         call: &CallAuthority,
-    ) -> Result<Vec<catbird_atproto::blue_catbird::chat::DeviceView<String>>> {
+    ) -> Result<Vec<crate::chat::defs::DeviceView>> {
         const MAX_DEVICE_PAGES: usize = 32;
         let mut devices = Vec::new();
         let mut cursor: Option<String> = None;
@@ -409,11 +347,10 @@ impl BirdApiClient {
                     .map_err(|e| {
                         OrchestratorError::Api(format!("Canonical getOwnDevices decode: {e}"))
                     })?;
-            let output: catbird_atproto::blue_catbird::chat::get_own_devices::GetOwnDevicesOutput<
-                String,
-            > = serde_json::from_slice(&decoded).map_err(|e| {
-                OrchestratorError::Api(format!("Canonical getOwnDevices JSON: {e}"))
-            })?;
+            let output: crate::chat::get_own_devices::Output = serde_json::from_slice(&decoded)
+                .map_err(|e| {
+                    OrchestratorError::Api(format!("Canonical getOwnDevices JSON: {e}"))
+                })?;
             let page_snapshot_expires_at = output.snapshot_expires_at.to_string();
             if snapshot_expires_at
                 .as_ref()
@@ -488,11 +425,10 @@ impl BirdApiClient {
                     .map_err(|e| {
                         OrchestratorError::Api(format!("Canonical getPendingWelcomes decode: {e}"))
                     })?;
-            let output: catbird_atproto::blue_catbird::chat::get_pending_welcomes::GetPendingWelcomesOutput<
-                String,
-            > = serde_json::from_slice(&decoded).map_err(|e| {
-                OrchestratorError::Api(format!("Canonical getPendingWelcomes JSON: {e}"))
-            })?;
+            let output: crate::chat::get_pending_welcomes::Output =
+                serde_json::from_slice(&decoded).map_err(|e| {
+                    OrchestratorError::Api(format!("Canonical getPendingWelcomes JSON: {e}"))
+                })?;
             if output.inventory_session_id.as_str() != inventory_session_id
                 || output.snapshot_event_cursor.as_str() != snapshot_event_cursor
             {
@@ -510,7 +446,12 @@ impl BirdApiClient {
                 ));
             }
             snapshot_expires_at.get_or_insert(page_snapshot_expires_at);
-            for welcome in output.items {
+            for item in output.items {
+                // Direct-request Welcomes require the consent-specific admission path.
+                let crate::chat::get_pending_welcomes::OutputItems::WelcomeView(welcome) = item
+                else {
+                    continue;
+                };
                 if welcome.recipient_did.as_str() != call.snapshot.actor_did()
                     || welcome.recipient_device_id.as_str() != call.snapshot.device_id()
                     || welcome.status.as_str() != "pending"
@@ -527,7 +468,7 @@ impl BirdApiClient {
                     || welcome.coordinates.epoch < 0
                     || welcome.coordinates.generation < 0
                     || welcome.coordinates.state_version < 0
-                    || welcome.coordinates.group_id.is_empty()
+                    || welcome.coordinates.group_id.0.is_empty()
                 {
                     return Err(OrchestratorError::Serialization(
                         "pending Welcome contains invalid lifecycle coordinates".into(),
@@ -536,14 +477,14 @@ impl BirdApiClient {
                 if welcome.conversation_id.as_str() != conversation_id {
                     continue;
                 }
-                let opaque_welcome = welcome.opaque_welcome.to_vec();
+                let opaque_welcome = welcome.opaque_welcome.0.to_vec();
                 if opaque_welcome.is_empty() {
                     return Err(OrchestratorError::Serialization(
                         "pending Welcome artifact is empty".into(),
                     ));
                 }
                 let digest = sha2::Sha256::digest(&opaque_welcome);
-                if digest.as_slice() != welcome.sha256.as_ref() {
+                if digest.as_slice() != welcome.sha256.0.as_slice() {
                     return Err(OrchestratorError::Serialization(
                         "pending Welcome artifact hash does not match its bytes".into(),
                     ));
@@ -687,7 +628,7 @@ impl BirdApiClient {
                 self.pending_welcomes.lock().unwrap().clear();
             }
             for item in &output.items {
-                if let catbird_atproto::blue_catbird::chat::ConversationInventoryItem::ConversationInventoryState(
+                if let crate::chat::defs::ConversationInventoryItem::ConversationInventoryState(
                     item,
                 ) = item
                 {
@@ -702,9 +643,9 @@ impl BirdApiClient {
             .items
             .into_iter()
             .filter_map(|item| match item {
-                catbird_atproto::blue_catbird::chat::ConversationInventoryItem::ConversationInventoryState(
-                    item,
-                ) => Some(canonical_conversation_view(&item.state)),
+                crate::chat::defs::ConversationInventoryItem::ConversationInventoryState(item) => {
+                    Some(canonical_conversation_view(&item.state))
+                }
                 _ => None,
             })
             .collect::<Result<Vec<_>>>()?;
@@ -757,10 +698,8 @@ impl BirdApiClient {
                 .map_err(|e| {
                 OrchestratorError::Api(format!("Canonical getEntries decode: {e}"))
             })?;
-            let output: catbird_atproto::blue_catbird::chat::get_entries::GetEntriesOutput<String> =
-                serde_json::from_slice(&decoded).map_err(|e| {
-                    OrchestratorError::Api(format!("Canonical getEntries JSON: {e}"))
-                })?;
+            let output: crate::chat::get_entries::Output = serde_json::from_slice(&decoded)
+                .map_err(|e| OrchestratorError::Api(format!("Canonical getEntries JSON: {e}")))?;
             let next_after_seq = output.next_after_seq;
             if next_after_seq < after_seq
                 || (output.has_more && next_after_seq == after_seq)
@@ -817,9 +756,7 @@ impl BirdApiClient {
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
-fn validate_device_inventory_item(
-    device: &catbird_atproto::blue_catbird::chat::DeviceView<String>,
-) -> Result<()> {
+fn validate_device_inventory_item(device: &crate::chat::defs::DeviceView) -> Result<()> {
     let parsed = uuid::Uuid::parse_str(device.device_id.as_str()).map_err(|_| {
         OrchestratorError::Api("device inventory contains an invalid device UUID".into())
     })?;
@@ -830,9 +767,9 @@ fn validate_device_inventory_item(
         || parsed.get_variant() != uuid::Variant::RFC4122
         || parsed.to_string() != device.device_id.as_str()
         || device.auth_generation < 1
-        || device.status.is_empty()
-        || device.signature_public_key.len() != 32
-        || derive_key_id(device.signature_public_key.as_ref()) != device.key_id.as_str()
+        || device.status.as_str().is_empty()
+        || device.signature_public_key.0.len() != 32
+        || derive_key_id(device.signature_public_key.0.as_slice()) != device.key_id.as_str()
         || device.available_package_count < 0
         || device.reserved_package_count < 0
         || package_total.is_none_or(|total| total > 1_000)
@@ -850,15 +787,15 @@ fn validate_prepared_request_scope(
 ) -> Result<()> {
     let expected_method = match request.operation {
         CanonicalOperation::GetConversations
-        | CanonicalOperation::GetBlob
-        | CanonicalOperation::GetBlobUsage
+        | CanonicalOperation::GetDeviceKey
+        | CanonicalOperation::GetDirectRequestOutcome
         | CanonicalOperation::GetConversationState
         | CanonicalOperation::GetDevices
         | CanonicalOperation::GetEntries
         | CanonicalOperation::GetLeafRecoveryInbox
         | CanonicalOperation::GetOwnDevices
         | CanonicalOperation::GetPendingWelcomes => "GET",
-        CanonicalOperation::SubscribeEvents | CanonicalOperation::UploadBlob => {
+        CanonicalOperation::SubscribeEvents => {
             return Err(OrchestratorError::InvalidInput(
                 "streaming and octet-stream operations cannot use the prepared JSON gateway".into(),
             ));
@@ -1061,7 +998,7 @@ fn canonical_get_pending_welcomes_path(
 }
 
 fn canonical_conversation_view(
-    state: &catbird_atproto::blue_catbird::chat::ConversationState,
+    state: &crate::chat::defs::ConversationState,
 ) -> Result<ConversationView> {
     let coordinates = &state.coordinates;
     let conversation_id = coordinates.conversation_id.to_string();
@@ -1069,7 +1006,7 @@ fn canonical_conversation_view(
     let epoch = u64::try_from(coordinates.epoch).map_err(|_| {
         OrchestratorError::Api("getConversations returned a negative conversation epoch".into())
     })?;
-    if coordinates.group_id.is_empty()
+    if coordinates.group_id.0.is_empty()
         || coordinates.generation < 0
         || coordinates.state_version < 0
     {
@@ -1082,7 +1019,7 @@ fn canonical_conversation_view(
         .iter()
         .map(|participant| MemberView {
             did: participant.user_did.to_string(),
-            role: if participant.role.eq_ignore_ascii_case("admin") {
+            role: if participant.role.as_str().eq_ignore_ascii_case("admin") {
                 MemberRole::Admin
             } else {
                 MemberRole::Member
@@ -1091,7 +1028,7 @@ fn canonical_conversation_view(
         .collect();
     Ok(ConversationView {
         canonical_state: Some(state.clone()),
-        group_id: hex::encode(coordinates.group_id.as_ref()),
+        group_id: hex::encode(coordinates.group_id.0.as_slice()),
         conversation_id,
         epoch,
         members,
@@ -1108,10 +1045,8 @@ enum CanonicalEntryKind {
     Commit,
 }
 
-fn canonical_entry_sequence(
-    entry: &catbird_atproto::blue_catbird::chat::ConversationEntry<String>,
-) -> i64 {
-    use catbird_atproto::blue_catbird::chat::ConversationEntry;
+fn canonical_entry_sequence(entry: &crate::chat::defs::ConversationEntry) -> i64 {
+    use crate::chat::defs::ConversationEntry;
     match entry {
         ConversationEntry::ApplicationEntry(entry) => entry.seq,
         ConversationEntry::CommitEntry(entry) => entry.seq,
@@ -1127,14 +1062,17 @@ fn canonical_entry_sequence(
         ConversationEntry::ZeroLeafLeaveEntry(entry) => entry.seq,
         ConversationEntry::LeaveCancellationEntry(entry) => entry.seq,
         ConversationEntry::LeaveCommitFulfillmentEntry(entry) => entry.seq,
+        ConversationEntry::DirectRequestEntry(entry) => entry.seq,
+        ConversationEntry::DirectRequestAcceptanceEntry(entry) => entry.seq,
+        ConversationEntry::AccountDeletedEntry(entry) => entry.seq,
     }
 }
 
 fn canonical_entry_envelope(
-    entry: catbird_atproto::blue_catbird::chat::ConversationEntry<String>,
+    entry: crate::chat::defs::ConversationEntry,
     requested_convo_id: &str,
 ) -> Result<Option<(CanonicalEntryKind, IncomingEnvelope)>> {
-    use catbird_atproto::blue_catbird::chat::ConversationEntry;
+    use crate::chat::defs::ConversationEntry;
     let kind = match &entry {
         ConversationEntry::ApplicationEntry(_) => CanonicalEntryKind::Application,
         ConversationEntry::CommitEntry(_)
@@ -1142,8 +1080,8 @@ fn canonical_entry_envelope(
         | ConversationEntry::LeaveCommitFulfillmentEntry(_) => CanonicalEntryKind::Commit,
         _ => return Ok(None),
     };
-    let row =
-        serde_json::to_value(entry).map_err(|error| OrchestratorError::Api(error.to_string()))?;
+    let row = catbird_mls::atproto::json::to_value(&entry)
+        .map_err(|error| OrchestratorError::Api(error.to_string()))?;
     Ok(
         IncomingEnvelope::from_canonical_entry(&row, requested_convo_id)?
             .map(|envelope| (kind, envelope)),
@@ -1273,7 +1211,7 @@ impl MLSAPIClient for BirdApiClient {
         if device.auth_generation != call.snapshot.auth_generation()
             || device.status.as_str() != "active"
             || device.key_id.as_str() != call.snapshot.signer_handle()
-            || device.signature_public_key.as_ref() != call.snapshot.signer_public_key()
+            || device.signature_public_key.0.as_slice() != call.snapshot.signer_public_key()
         {
             return Err(OrchestratorError::Credential(
                 "authoritative device inventory does not match the admitted signer generation"
@@ -1324,9 +1262,9 @@ impl MLSAPIClient for BirdApiClient {
                     device_id: device.device_id.to_string(),
                     mls_did: format!("{}#{}", self.did, device.device_id),
                     device_uuid: device.device_id.to_string(),
-                    created_at: parse_dt(&device.created_at.to_string()),
+                    created_at: parse_dt(device.created_at.as_ref()),
                     key_id: Some(device.key_id.to_string()),
-                    signature_public_key: Some(device.signature_public_key.to_vec()),
+                    signature_public_key: Some(device.signature_public_key.0.to_vec()),
                     auth_generation: Some(device.auth_generation),
                     status: Some(device.status.to_string()),
                     available_package_count: Some(
@@ -1434,7 +1372,7 @@ impl BirdApiClient {
                     auth_generation: Some(call.snapshot.auth_generation()),
                 },
                 CanonicalOperation::AcknowledgeWelcome,
-                serde_json::to_vec(&body).map_err(|error| {
+                catbird_mls::atproto::json::to_vec(&body).map_err(|error| {
                     OrchestratorError::Serialization(format!(
                         "serialize Welcome acknowledgement: {error}"
                     ))
@@ -1489,6 +1427,7 @@ impl BirdApiClient {
         convo_id: &str,
         ciphertext: &[u8],
         epoch: u64,
+        send_counter: i64,
         msg_id: &str,
     ) -> Result<SendMessageResponse> {
         validate_stable_conversation_id(convo_id)?;
@@ -1530,11 +1469,13 @@ impl BirdApiClient {
             snapshot.auth_generation(),
             convo_id,
             msg_id,
-            &coords.group_id,
+            &coords.group_id.0,
+            coords.generation,
+            send_counter,
             epoch,
             coords.state_version,
-            &coords.confirmation_tag,
-            &coords.group_context_hash,
+            &coords.confirmation_tag.0,
+            &coords.group_context_hash.0,
             ciphertext,
         )?;
 
@@ -1572,14 +1513,17 @@ impl BirdApiClient {
         let decoded =
             decode_clean_chat_response(CanonicalOperation::SendMessage.into(), response_bytes)
                 .map_err(|e| OrchestratorError::Api(format!("decode sendMessage response: {e}")))?;
-        let output: catbird_atproto::blue_catbird::chat::send_message::SendMessageOutput<String> =
-            serde_json::from_slice(&decoded)
-                .map_err(|e| OrchestratorError::Api(format!("parse sendMessage output: {e}")))?;
+        let output: crate::chat::send_message::Output = serde_json::from_slice(&decoded)
+            .map_err(|e| OrchestratorError::Api(format!("parse sendMessage output: {e}")))?;
 
         let seq = u64::try_from(output.entry.seq).map_err(|_| {
             OrchestratorError::Api("sendMessage returned a negative sequence number".into())
         })?;
-        let epoch = u64::try_from(output.entry.signed_request.body.prior.epoch).map_err(|_| {
+        let signed = output.entry.signed_request.ok_or_else(|| {
+            OrchestratorError::Api("sendMessage returned an entry without the signed send".into())
+        })?;
+        let crate::chat::defs::SignedApplicationSendBody::ApplicationSendBody(body) = signed.body;
+        let epoch = u64::try_from(body.prior.epoch).map_err(|_| {
             OrchestratorError::Api("sendMessage returned a negative MLS epoch".into())
         })?;
         Ok(SendMessageResponse {
@@ -1663,14 +1607,19 @@ impl BirdApiClient {
     /// List records in the user's repo for a given collection.
     async fn list_repo_records(&self, collection: &str) -> Result<Vec<serde_json::Value>> {
         let output = self
-            .raw_get_no_proxy(
+            .session
+            .exchange(
+                &self.pds_endpoint,
+                &self.did,
+                &self.app_password,
+                reqwest::Method::GET,
                 "com.atproto.repo.listRecords",
                 &[
                     ("repo", &self.did),
                     ("collection", collection),
                     ("limit", "50"),
                 ],
-                &self.get_jwt().await?,
+                None,
             )
             .await?;
 
@@ -1693,72 +1642,20 @@ impl BirdApiClient {
             "validate": false,
             "record": record,
         });
-        self.raw_post_no_proxy(
-            "com.atproto.repo.createRecord",
-            &body,
-            &self.get_jwt().await?,
-        )
-        .await
-    }
-
-    /// GET without atproto-proxy header (direct PDS call).
-    async fn raw_get_no_proxy(
-        &self,
-        nsid: &str,
-        params: &[(&str, &str)],
-        jwt: &str,
-    ) -> Result<serde_json::Value> {
-        let resp = self
-            .http
-            .get(self.xrpc_url(nsid))
-            .header("Authorization", format!("Bearer {}", jwt))
-            .query(params)
-            .send()
+        self.session
+            .exchange(
+                &self.pds_endpoint,
+                &self.did,
+                &self.app_password,
+                reqwest::Method::POST,
+                "com.atproto.repo.createRecord",
+                &[],
+                Some(petrel::xrpc::XrpcBody::json(
+                    serde_json::to_vec(&body)
+                        .map_err(|e| OrchestratorError::Serialization(e.to_string()))?,
+                )),
+            )
             .await
-            .map_err(|e| OrchestratorError::Api(format!("HTTP error: {e}")))?;
-
-        let status = resp.status().as_u16();
-        if status >= 400 {
-            let body_text = resp.text().await.unwrap_or_default();
-            return Err(OrchestratorError::ServerError {
-                status,
-                body: body_text,
-            });
-        }
-
-        resp.json()
-            .await
-            .map_err(|e| OrchestratorError::Api(format!("JSON decode: {e}")))
-    }
-
-    /// POST without atproto-proxy header (direct PDS call).
-    async fn raw_post_no_proxy(
-        &self,
-        nsid: &str,
-        body: &serde_json::Value,
-        jwt: &str,
-    ) -> Result<serde_json::Value> {
-        let resp = self
-            .http
-            .post(self.xrpc_url(nsid))
-            .header("Authorization", format!("Bearer {}", jwt))
-            .json(body)
-            .send()
-            .await
-            .map_err(|e| OrchestratorError::Api(format!("HTTP error: {e}")))?;
-
-        let status = resp.status().as_u16();
-        if status >= 400 {
-            let body_text = resp.text().await.unwrap_or_default();
-            return Err(OrchestratorError::ServerError {
-                status,
-                body: body_text,
-            });
-        }
-
-        resp.json()
-            .await
-            .map_err(|e| OrchestratorError::Api(format!("JSON decode: {e}")))
     }
 
     pub async fn send_typing_indicator(&self, _convo_id: &str, _is_typing: bool) -> Result<()> {
@@ -1789,6 +1686,8 @@ fn build_application_send_body(
     convo_id: &str,
     message_id: &str,
     group_id: &[u8],
+    generation: i64,
+    send_counter: i64,
     epoch: u64,
     state_version: i64,
     confirmation_tag: &[u8],
@@ -1809,6 +1708,8 @@ fn build_application_send_body(
         || group_context_hash.len() != 32
         || ciphertext.is_empty()
         || auth_generation < 1
+        || send_counter < 0
+        || generation < 0
         || state_version < 0
     {
         return Err(OrchestratorError::InvalidInput(
@@ -1825,16 +1726,17 @@ fn build_application_send_body(
         "keyId": key_id,
         "messageId": msg_uuid.to_string(),
         "authGeneration": auth_generation,
+        "sendCounter": send_counter,
         "blobBindings": [],
         "aad": {
-            "conversationId": B64.encode(convo_uuid.as_bytes()),
-            "generation": 0,
-            "messageId": B64.encode(msg_uuid.as_bytes()),
+            "conversationId": {"$bytes": B64.encode(convo_uuid.as_bytes())},
+            "generation": generation,
+            "messageId": {"$bytes": B64.encode(msg_uuid.as_bytes())},
             "prior": {
                 "confirmationTag": {"$bytes": B64.encode(confirmation_tag)},
-                "conversationId": B64.encode(convo_uuid.as_bytes()),
+                "conversationId": {"$bytes": B64.encode(convo_uuid.as_bytes())},
                 "epoch": epoch,
-                "generation": 0,
+                "generation": generation,
                 "groupContextHash": {"$bytes": B64.encode(group_context_hash)},
                 "groupId": {"$bytes": B64.encode(group_id)},
                 "lifecycle": "active",
@@ -1852,7 +1754,7 @@ fn build_application_send_body(
             "confirmationTag": {"$bytes": B64.encode(confirmation_tag)},
             "conversationId": convo_uuid.to_string(),
             "epoch": epoch,
-            "generation": 0,
+            "generation": generation,
             "groupContextHash": {"$bytes": B64.encode(group_context_hash)},
             "groupId": {"$bytes": B64.encode(group_id)},
             "lifecycle": "active",
@@ -2066,6 +1968,8 @@ mod tests {
             conversation_id,
             message_id,
             &[2; 32],
+            2,
+            0,
             4,
             9,
             &[3; 32],
@@ -2078,7 +1982,7 @@ mod tests {
         assert_eq!(body["prior"]["conversationId"], conversation_id);
         assert_eq!(body["prior"]["groupId"]["$bytes"], B64.encode([2; 32]));
         assert_eq!(
-            body["aad"]["conversationId"],
+            body["aad"]["conversationId"]["$bytes"],
             B64.encode(uuid::Uuid::parse_str(conversation_id).unwrap().as_bytes())
         );
         assert_ne!(
@@ -2097,13 +2001,15 @@ mod tests {
             "seq": 1,
             "signedRequest": {
                 "body": {
+                    "$type":"blue.catbird.chat.defs#applicationSendBody",
+                    "sendCounter":1,
                     "aad": {
                         "conversationId": "AA==",
                         "generation": 7,
                         "messageId": "AA==",
                         "prior": {
                             "confirmationTag": {"$bytes": "AA=="},
-                            "conversationId": "11111111-1111-4111-8111-111111111111",
+                            "conversationId": {"$bytes": "AA=="},
                             "epoch": 42,
                             "generation": 7,
                             "groupContextHash": {"$bytes": "AA=="},
@@ -2138,13 +2044,11 @@ mod tests {
                     "signatureDomain": "CATBIRD-CHAT-MESSAGE",
                     "signedAt": "2026-08-16T00:00:00Z"
                 },
-                "signature": {"$bytes": "AA=="}
+                "signature": {"$bytes": B64.encode([9u8;64])}
             }
         });
-        let entry = serde_json::from_str::<
-            catbird_atproto::blue_catbird::chat::ConversationEntry<String>,
-        >(&wire.to_string())
-        .expect("generated application entry fixture");
+        let entry = serde_json::from_str::<crate::chat::defs::ConversationEntry>(&wire.to_string())
+            .expect("generated application entry fixture");
 
         let (_, envelope) = canonical_entry_envelope(entry, "11111111-1111-4111-8111-111111111111")
             .expect("application entry is valid")
@@ -2155,9 +2059,9 @@ mod tests {
 
         let mut mismatched_wire = wire;
         mismatched_wire["conversationId"] = json!("44444444-4444-4444-8444-444444444444");
-        let mismatched_entry = serde_json::from_str::<
-            catbird_atproto::blue_catbird::chat::ConversationEntry<String>,
-        >(&mismatched_wire.to_string())
+        let mismatched_entry = serde_json::from_str::<crate::chat::defs::ConversationEntry>(
+            &mismatched_wire.to_string(),
+        )
         .expect("generated mismatched entry fixture");
         let error =
             canonical_entry_envelope(mismatched_entry, "11111111-1111-4111-8111-111111111111")
@@ -2197,7 +2101,11 @@ mod canonical_admission_projection_tests {
             assert_eq!(page.next_page_cursor.as_deref(), Some("page-2"));
             assert_eq!(page.inventory_session_id, "inventory-session");
             assert_eq!(page.snapshot_event_cursor, "event-fence");
-            let catbird_atproto::blue_catbird::chat::ConversationInventoryItem::ConversationInventoryState(item) = page.items.remove(0) else { panic!("missing canonical state") };
+            let crate::chat::defs::ConversationInventoryItem::ConversationInventoryState(item) =
+                page.items.remove(0)
+            else {
+                panic!("missing canonical state")
+            };
             let state = item.state;
             assert_eq!(state, expected);
             let view = canonical_conversation_view(&state).unwrap();
@@ -2205,7 +2113,7 @@ mod canonical_admission_projection_tests {
             assert_eq!(view.epoch, state.coordinates.epoch as u64);
             assert_eq!(
                 view.group_id,
-                hex::encode(state.coordinates.group_id.as_ref())
+                hex::encode(state.coordinates.group_id.0.as_slice())
             );
             let persisted: ConversationView =
                 serde_json::from_slice(&serde_json::to_vec(&view).unwrap()).unwrap();
@@ -2214,7 +2122,7 @@ mod canonical_admission_projection_tests {
                 decode_conversation_state(&encode_conversation_state(&retained).unwrap()).unwrap(),
                 state
             );
-            assert_eq!(retained.participants[1].status, status);
+            assert_eq!(retained.participants[1].status.as_str(), status);
             assert_eq!(retained.participants[1].leaf_count, 0);
             assert_eq!(
                 retained.participants[1].invitation_provenance,

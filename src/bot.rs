@@ -380,6 +380,7 @@ async fn handle_message_bg(
 
     let timestamp = created_at.parse().unwrap_or_else(|_| Utc::now());
     let envelope = IncomingEnvelope {
+        canonical_entry_json: None,
         conversation_id: conversation_id.to_string(),
         sender_did: String::new(),
         ciphertext,
