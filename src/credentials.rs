@@ -72,8 +72,7 @@ impl FileCredentialStore {
         let obsolete_binding_keys = data
             .keys()
             .filter(|key| {
-                key.ends_with("/clean_chat_dpop_jkt")
-                    || key.ends_with("/clean_chat_device_id")
+                key.ends_with("/clean_chat_dpop_jkt") || key.ends_with("/clean_chat_device_id")
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -109,8 +108,9 @@ impl FileCredentialStore {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
-                .map_err(|e| OrchestratorError::Credential(format!("set credentials permissions: {e}")))?;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).map_err(
+                |e| OrchestratorError::Credential(format!("set credentials permissions: {e}")),
+            )?;
         }
         std::fs::rename(&tmp, &self.path)
             .map_err(|e| OrchestratorError::Credential(format!("rename credentials: {e}")))?;
@@ -204,25 +204,19 @@ impl FileCredentialStore {
                 "pending enrollment prepared body is empty".into(),
             ));
         }
-        let request: catbird_atproto::blue_catbird::chat::enroll_device::EnrollDevice<String> =
-            serde_json::from_slice(prepared_body).map_err(|error| {
-                OrchestratorError::Credential(format!(
-                    "pending enrollment prepared body is invalid: {error}"
-                ))
-            })?;
+        let binding = prepared_enrollment_binding(prepared_body)?;
         self.update_atomically(|data| {
             let pending = pending_enrollment_from_data(data, user_did)?.ok_or_else(|| {
                 OrchestratorError::Credential("pending enrollment binding is missing".into())
             })?;
             if pending.idempotency_key != idempotency_key
-                || request.signed_request.body.actor_did.as_str() != user_did
-                || request.signed_request.body.device_id.as_str() != pending.device_uuid
-                || request.signed_request.body.idempotency_key.as_str() != idempotency_key
-                || request.signed_request.body.expected_auth_generation != 0
+                || binding.actor_did.as_str() != user_did
+                || binding.device_id.as_str() != pending.device_uuid
+                || binding.idempotency_key.as_str() != idempotency_key
+                || binding.expected_auth_generation != 0
             {
                 return Err(OrchestratorError::Credential(
-                    "pending enrollment prepared request does not match its durable binding"
-                        .into(),
+                    "pending enrollment prepared request does not match its durable binding".into(),
                 ));
             }
             let encoded = B64.encode(prepared_body);
@@ -277,10 +271,7 @@ impl FileCredentialStore {
                     ));
                 }
             }
-            for (field, value) in [
-                ("device_uuid", device_uuid),
-                ("mls_did", mls_did),
-            ] {
+            for (field, value) in [("device_uuid", device_uuid), ("mls_did", mls_did)] {
                 data.insert(Self::key(user_did, field), value.to_owned());
             }
             data.insert(
@@ -294,11 +285,7 @@ impl FileCredentialStore {
 
     pub fn get_admitted_device_tuple(&self, user_did: &str) -> Result<Option<AdmittedDeviceTuple>> {
         let data = self.data.lock().unwrap();
-        let fields = [
-            "device_uuid",
-            "mls_did",
-            "clean_chat_auth_generation",
-        ];
+        let fields = ["device_uuid", "mls_did", "clean_chat_auth_generation"];
         let present = fields
             .iter()
             .filter(|field| data.contains_key(&Self::key(user_did, field)))
@@ -353,7 +340,7 @@ impl FileCredentialStore {
     }
 
     /// Persist the opaque Nest session only in the platform Keychain. It is
-    /// never written to ordinary credential JSON or interpreted as a Jacquard
+    /// never written to ordinary credential JSON or interpreted as a PDS
     /// bearer/downstream DPoP token.
     pub fn store_opaque_chat_session(&self, user_did: &str, session_handle: &str) -> Result<()> {
         if session_handle.is_empty() {
@@ -627,6 +614,31 @@ fn validate_device_uuid(device_uuid: &str) -> Result<()> {
     Ok(())
 }
 
+fn prepared_enrollment_binding(
+    body: &[u8],
+) -> Result<Box<crate::chat::defs::DeviceEnrollmentBody>> {
+    use petrel_core::{FromValue, Value};
+
+    let invalid =
+        |error| OrchestratorError::Credential(format!("invalid stored enrollment: {error}"));
+    let mut value: Value = petrel_core::from_json(body).map_err(invalid)?;
+    // Older enrollments encoded this single-member union without its tag.
+    // Supply it for local validation, leaving the originally signed bytes intact.
+    if let Value::Object(root) = &mut value {
+        if let Some(Value::Object(request)) = root.get_mut("signedRequest") {
+            if let Some(Value::Object(body)) = request.get_mut("body") {
+                body.entry("$type".to_owned()).or_insert_with(|| {
+                    Value::String(crate::chat::defs::DeviceEnrollmentBody::TYPE_IDENTIFIER.into())
+                });
+            }
+        }
+    }
+    let input = crate::chat::enroll_device::Input::from_value_strict(value).map_err(invalid)?;
+    let crate::chat::defs::SignedDeviceEnrollmentBody::DeviceEnrollmentBody(binding) =
+        input.signed_request.body;
+    Ok(binding)
+}
+
 fn pending_enrollment_from_data(
     data: &HashMap<String, String>,
     user_did: &str,
@@ -678,16 +690,11 @@ fn pending_enrollment_from_data(
         })
         .transpose()?;
     if let Some(prepared_body) = prepared_body.as_deref() {
-        let request: catbird_atproto::blue_catbird::chat::enroll_device::EnrollDevice<String> =
-            serde_json::from_slice(prepared_body).map_err(|error| {
-                OrchestratorError::Credential(format!(
-                    "pending enrollment prepared request is invalid: {error}"
-                ))
-            })?;
-        if request.signed_request.body.actor_did.as_str() != user_did
-            || request.signed_request.body.device_id.as_str() != device_uuid
-            || request.signed_request.body.idempotency_key.as_str() != idempotency_key
-            || request.signed_request.body.expected_auth_generation != 0
+        let binding = prepared_enrollment_binding(prepared_body)?;
+        if binding.actor_did.as_str() != user_did
+            || binding.device_id.as_str() != device_uuid
+            || binding.idempotency_key.as_str() != idempotency_key
+            || binding.expected_auth_generation != 0
         {
             return Err(OrchestratorError::Credential(
                 "pending enrollment prepared request escaped its durable binding".into(),
@@ -856,6 +863,54 @@ mod tests {
             .await
             .is_err());
 
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn untagged_pending_enrollment_restarts_and_retries_with_the_original_signed_bytes() {
+        let (directory, store) = temporary_store("legacy-enrollment");
+        let signer = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
+        let key_package = catbird_mls::KeyPackageResult {
+            key_package_data: vec![1; 32],
+            hash_ref: vec![2; 32],
+            signature_public_key: signer.public().to_vec(),
+        };
+        let body: serde_json::Value = serde_json::from_slice(
+            &crate::enrollment_body(
+                DID,
+                DEVICE,
+                &derive_key_id(signer.public()),
+                IDEMPOTENCY,
+                &key_package,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(body.get("$type").is_none());
+        let bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "signedRequest": {"body": body, "signature": {"$bytes": B64.encode([0; 64])}}
+        }))
+        .unwrap();
+        store
+            .begin_pending_enrollment(DID, DEVICE, &format!("{DID}#{DEVICE}"), IDEMPOTENCY)
+            .unwrap();
+        store
+            .finalize_pending_enrollment(DID, IDEMPOTENCY, &bytes)
+            .unwrap();
+        drop(store);
+        let reopened = FileCredentialStore::new(directory.join("credentials.json")).unwrap();
+        assert_eq!(
+            reopened
+                .get_pending_enrollment(DID)
+                .unwrap()
+                .unwrap()
+                .prepared_body
+                .as_deref(),
+            Some(bytes.as_slice())
+        );
+        reopened
+            .finalize_pending_enrollment(DID, IDEMPOTENCY, &bytes)
+            .unwrap();
         let _ = std::fs::remove_dir_all(directory);
     }
 

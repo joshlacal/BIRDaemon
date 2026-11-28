@@ -450,13 +450,15 @@ impl SqliteStorage {
     }
 
     fn valid_lifecycle(fence: &ProjectionLifecycleFence) -> bool {
-        fence.has_valid_pending_tuple()
-            && fence.generation.is_none_or(|value| value >= 0)
+        fence.generation.is_none_or(|value| value >= 0)
             && fence.state_version.is_none_or(|value| value >= 0)
             && fence.reset_generation.is_none_or(|value| value >= 0)
             && fence
-                .reset_pending_generation
-                .is_none_or(|value| value >= 0)
+                .reset_pending_target_group_id
+                .as_ref()
+                .is_none_or(|target| {
+                    fence.reset_generation.is_some() && Self::nonempty_group_hex(target)
+                })
     }
 
     fn lifecycle_matches(
@@ -475,12 +477,9 @@ impl SqliteStorage {
                 .reset_generation
                 .is_none_or(|value| actual.reset_generation == Some(value))
             && expected
-                .reset_pending_generation
-                .is_none_or(|value| actual.reset_pending_generation == Some(value))
-            && expected
                 .reset_pending_target_group_id
                 .as_ref()
-                .is_none_or(|value| actual.reset_pending_target_group_id.as_ref() == Some(value))
+                .is_none_or(|target| actual.reset_pending_target_group_id.as_ref() == Some(target))
     }
 
     fn stored_projection_fence(
@@ -515,7 +514,6 @@ impl SqliteStorage {
                         generation: row.get(5)?,
                         state_version: row.get(6)?,
                         reset_generation: reset_high_water,
-                        reset_pending_generation: reset_generation,
                         reset_pending_target_group_id: reset_target,
                     },
                 })
@@ -791,10 +789,8 @@ impl MLSStorageBackend for SqliteStorage {
         if !Self::strict_canonical_uuid(&canonical_id)
             || !Self::nonempty_group_hex(&canonical_group)
             || !Self::valid_lifecycle(&request.canonical_lifecycle)
-            || request
-                .canonical_lifecycle
-                .reset_pending_generation
-                .is_some()
+            // The reset-specific transaction owns publication of a pending target.
+            || request.canonical_lifecycle.reset_pending_target_group_id.is_some()
         {
             return Ok(ConversationProjectionCommitOutcome::FenceMismatch { affected_rows: 0 });
         }
@@ -2120,7 +2116,7 @@ impl MLSStorageBackend for SqliteStorage {
         let messages = if let Some(before) = before_sequence {
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, conversation_id, sender_did, text, timestamp, epoch,
+                    "SELECT id, source_conversation_id, sender_did, text, timestamp, epoch,
                             sequence_number, is_own, delivery_status_json, payload_json
                      FROM messages
                      WHERE owner_did = ?2
@@ -2138,11 +2134,12 @@ impl MLSStorageBackend for SqliteStorage {
                     Self::row_to_message,
                 )
                 .map_err(Self::map_err)?;
-            rows.filter_map(|r| r.ok()).collect::<Vec<_>>()
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Self::map_err)?
         } else {
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, conversation_id, sender_did, text, timestamp, epoch,
+                    "SELECT id, source_conversation_id, sender_did, text, timestamp, epoch,
                             sequence_number, is_own, delivery_status_json, payload_json
                      FROM messages
                      WHERE owner_did = ?2
@@ -2159,7 +2156,8 @@ impl MLSStorageBackend for SqliteStorage {
                     Self::row_to_message,
                 )
                 .map_err(Self::map_err)?;
-            rows.filter_map(|r| r.ok()).collect::<Vec<_>>()
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Self::map_err)?
         };
 
         // Reverse to get ascending order
@@ -2447,7 +2445,7 @@ impl MLSStorageBackend for SqliteStorage {
 impl SqliteStorage {
     fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
         let id: String = row.get("id")?;
-        let conversation_id: String = row.get("conversation_id")?;
+        let conversation_id: String = row.get("source_conversation_id")?;
         let sender_did: String = row.get("sender_did")?;
         let text: String = row.get("text")?;
         let timestamp_str: String = row.get("timestamp")?;
@@ -2493,7 +2491,7 @@ mod tests {
     #[tokio::test]
     async fn conversation_sequencer_did_round_trips() {
         let (path, storage) = new_temp_storage();
-        let user_did = "did:plc:alice";
+        let user_did = "did:plc:storage-test-owner";
         let conversation_id = "conv-sequencer";
         let group_id = "group-sequencer";
         let sequencer_did = "did:web:ds-b.example";
@@ -3044,17 +3042,12 @@ mod tests {
                 .unwrap();
             let canonical_lifecycle = ProjectionLifecycleFence {
                 reset_generation: Some(3),
-                ..ProjectionLifecycleFence::unknown()
+                ..ProjectionLifecycleFence::default()
             };
-            let authority = AliasRetirementAuthority::from_views_with_lifecycle(
-                owner,
-                &canonical,
-                canonical_lifecycle.clone(),
-                &alias,
-                ProjectionLifecycleFence::unknown(),
-            )
-            .expect("strict alias authority");
-            let encoded = authority.encode().expect("encode replay authority");
+            let mut authority = AliasRetirementAuthority::from_views(owner, &canonical, &alias)
+                .expect("strict alias authority");
+            authority.canonical_lifecycle = canonical_lifecycle.clone();
+            let encoded = serde_json::to_string(&authority).expect("encode replay authority");
             storage
                 .mark_pending_local_delete(raw_group_id, Some(&encoded))
                 .await
@@ -3087,14 +3080,14 @@ mod tests {
                 .expect("seed crypto group projection");
 
             let outcome = storage
-                .commit_conversation_projection(
-                    &ConversationProjectionCommitRequest::live_with_lifecycle(
+                .commit_conversation_projection(&ConversationProjectionCommitRequest {
+                    canonical_lifecycle,
+                    ..ConversationProjectionCommitRequest::live(
                         owner,
                         canonical.clone(),
-                        canonical_lifecycle,
                         vec![authority],
-                    ),
-                )
+                    )
+                })
                 .await
                 .expect("commit canonical projection");
             assert!(matches!(
@@ -3141,14 +3134,13 @@ mod tests {
         );
         let pending = reopened.list_pending_local_deletes().await.unwrap();
         assert_eq!(pending.len(), 1);
-        let replay_authority = AliasRetirementAuthority::decode(
+        let replay_authority: AliasRetirementAuthority = serde_json::from_str(
             pending[0]
                 .group_id_hex
                 .as_deref()
                 .expect("encoded alias replay authority"),
         )
-        .expect("decode intent")
-        .expect("intent is alias retirement authority");
+        .expect("decode intent");
         assert!(matches!(
             reopened
                 .commit_conversation_projection(&ConversationProjectionCommitRequest::replay(
@@ -3240,18 +3232,18 @@ mod tests {
 
         let negative_lifecycle = ProjectionLifecycleFence {
             reset_generation: Some(-1),
-            ..ProjectionLifecycleFence::unknown()
+            ..ProjectionLifecycleFence::default()
         };
         assert!(matches!(
             storage
-                .commit_conversation_projection(
-                    &ConversationProjectionCommitRequest::live_with_lifecycle(
+                .commit_conversation_projection(&ConversationProjectionCommitRequest {
+                    canonical_lifecycle: negative_lifecycle,
+                    ..ConversationProjectionCommitRequest::live(
                         owner,
                         projection_view(wanted_id, raw_group_id, 0, &[owner]),
-                        negative_lifecycle,
-                        vec![],
-                    ),
-                )
+                        vec![]
+                    )
+                },)
                 .await
                 .unwrap(),
             ConversationProjectionCommitOutcome::FenceMismatch { affected_rows: 0 }
@@ -3261,7 +3253,7 @@ mod tests {
             .ensure_conversation_exists(owner, conflicting_id, raw_group_id)
             .await
             .expect("seed conflicting canonical mapping");
-        let canonical = projection_view(wanted_id, raw_group_id, 0, &[owner]);
+        let canonical = projection_view(wanted_id, raw_group_id, 4, &[owner]);
         let alias = storage
             .get_conversation(owner, raw_group_id)
             .await

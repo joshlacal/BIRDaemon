@@ -830,15 +830,14 @@ impl NestClient {
         let mut snapshot_expires_at: Option<String> = None;
         let captured_at = chrono::Utc::now();
         for _ in 0..MAX_DEVICE_PAGES {
-            let request =
-                catbird_atproto::blue_catbird::chat::get_own_devices::GetOwnDevices::<String> {
-                    actor_device_id: device_id.to_owned(),
-                    limit: Some(100),
-                    page_cursor: cursor.clone(),
-                };
+            let request = crate::chat::get_own_devices::Parameters {
+                actor_device_id: device_id.to_owned(),
+                limit: 100,
+                page_cursor: cursor.clone(),
+            };
             let mut query = vec![
                 ("actorDeviceId", request.actor_device_id),
-                ("limit", request.limit.expect("fixed limit").to_string()),
+                ("limit", request.limit.to_string()),
             ];
             if let Some(cursor) = request.page_cursor {
                 query.push(("pageCursor", cursor));
@@ -857,10 +856,9 @@ impl NestClient {
             if !(200..300).contains(&response.status) {
                 return Err(AuthorityError::Remote);
             }
-            let output: catbird_atproto::blue_catbird::chat::get_own_devices::GetOwnDevicesOutput<
-                String,
-            > = serde_json::from_slice(&response.body)
-                .map_err(|_| AuthorityError::InvalidDeviceResponse)?;
+            let output: crate::chat::get_own_devices::Output =
+                serde_json::from_slice(&response.body)
+                    .map_err(|_| AuthorityError::InvalidDeviceResponse)?;
             let expiry = output.snapshot_expires_at.to_string();
             let parsed_expiry = chrono::DateTime::parse_from_rfc3339(&expiry)
                 .map_err(|_| AuthorityError::InvalidDeviceResponse)?
@@ -989,16 +987,14 @@ async fn lossless_http_response(
     })
 }
 
-fn parse_device_view(
-    device: catbird_atproto::blue_catbird::chat::DeviceView<String>,
-) -> Result<DeviceView, AuthorityError> {
+fn parse_device_view(device: crate::chat::defs::DeviceView) -> Result<DeviceView, AuthorityError> {
     validate_device_id(device.device_id.as_str())?;
-    let signature_public_key = device.signature_public_key.to_vec();
+    let signature_public_key = device.signature_public_key.0.to_vec();
     let package_total = device
         .available_package_count
         .checked_add(device.reserved_package_count);
     if device.auth_generation < 1
-        || device.status.is_empty()
+        || device.status.as_str().is_empty()
         || signature_public_key.len() != 32
         || derive_key_id(&signature_public_key) != device.key_id.as_str()
         || device.available_package_count < 0
@@ -1010,7 +1006,7 @@ fn parse_device_view(
     Ok(DeviceView {
         device_id: device.device_id,
         auth_generation: device.auth_generation,
-        status: device.status,
+        status: device.status.to_string(),
         key_id: device.key_id,
         signature_public_key,
     })

@@ -138,70 +138,36 @@ fn empty_conversations_json() -> String {
         "hasMore": false,
         "inventorySessionId": "inv-session-123",
         "snapshotEventCursor": "cursor-456",
-        "snapshotExpiresAt": "2026-08-17T12:00:00.000Z",
-        "items": [],
-        "nextPageCursor": null
+        "snapshotExpiresAt": "2099-08-17T12:00:00.000Z",
+        "items": []
     })
     .to_string()
 }
 
 fn populated_conversations_json(convo_id: &str) -> String {
-    let convo_uuid = uuid::Uuid::parse_str(convo_id).unwrap();
-    json!({
-        "hasMore": false,
-        "inventorySessionId": "inv-1",
-        "snapshotEventCursor": "cur-1",
-        "snapshotExpiresAt": "2026-08-17T12:00:00.000Z",
-        "items": [{
-            "$type": "blue.catbird.chat.defs#conversationInventoryState",
-            "state": {
-                "cipherSuite": "MLS_128_DHKEMP256_AES128GCM_SHA256_P256",
-                "conversationKind": "direct",
-                "snapshotSeq": 1,
-                "leaves": [],
-                "participants": [],
-                "metadataSnapshot": {
-                    "metadataVersion": 1,
-                    "authorProof": {
-                        "authorDid": TEST_DID,
-                        "authorDeviceId": TEST_DEVICE_ID,
-                        "authorKeyId": "key-1",
-                        "authGenerationAtOrigin": 7,
-                        "deviceStatusAtOrigin": "active",
-                        "originSeq": 1,
-                        "originTransitionId": "22222222-2222-4222-9222-222222222222",
-                        "roleAtOrigin": "admin",
-                        "signaturePublicKey": {"$bytes": B64.encode([1u8; 32])}
-                    },
-                    "ciphertext": {"$bytes": B64.encode([1u8; 3])},
-                    "ciphertextSha256": vec![1u8; 32],
-                    "ciphertextSize": 3,
-                    "coordinate": {
-                        "conversationId": convo_uuid.as_bytes().to_vec(),
-                        "groupId": {"$bytes": B64.encode([2u8; 32])},
-                        "epoch": 1,
-                        "generation": 7,
-                        "groupContextHash": {"$bytes": B64.encode([3u8; 32])},
-                        "confirmationTag": {"$bytes": B64.encode([4u8; 32])}
-                    },
-                    "nonce": {"$bytes": B64.encode([1u8; 12])},
-                    "originTransitionId": "22222222-2222-4222-9222-222222222222"
-                },
-                "coordinates": {
-                    "conversationId": convo_id,
-                    "groupId": {"$bytes": B64.encode([2u8; 32])},
-                    "epoch": 1,
-                    "generation": 7,
-                    "stateVersion": 1,
-                    "lifecycle": "active",
-                    "confirmationTag": {"$bytes": B64.encode([4u8; 32])},
-                    "groupContextHash": {"$bytes": B64.encode([3u8; 32])}
-                }
-            }
-        }],
-        "nextPageCursor": null
-    })
-    .to_string()
+    let mut state: serde_json::Value = serde_json::from_str(include_str!(
+        "../tests/fixtures/canonical-conversation-state.json"
+    ))
+    .unwrap();
+    let group = json!({"$bytes": B64.encode([2; 32])});
+    let coordinate = &mut state["coordinates"];
+    coordinate["conversationId"] = json!(convo_id);
+    coordinate["groupId"] = group.clone();
+    coordinate["epoch"] = json!(1);
+    coordinate["generation"] = json!(7);
+    let prior = &mut state["metadataSnapshot"]["coordinate"];
+    prior["conversationId"] =
+        json!({"$bytes": B64.encode(uuid::Uuid::parse_str(convo_id).unwrap().as_bytes())});
+    prior["groupId"] = group;
+    prior["epoch"] = json!(1);
+    prior["generation"] = json!(7);
+    state["leaves"][0]["deviceId"] = json!(TEST_DEVICE_ID);
+    state["leaves"][0]["userDid"] = json!(TEST_DID);
+    state["participants"][0]["userDid"] = json!(TEST_DID);
+    let mut output: serde_json::Value = serde_json::from_str(&empty_conversations_json()).unwrap();
+    output["items"] =
+        json!([{"$type":"blue.catbird.chat.defs#conversationInventoryState", "state":state}]);
+    output.to_string()
 }
 
 fn projection_conversations_json(convo_id: &str) -> String {
@@ -237,13 +203,12 @@ async fn test_canonical_read_through_nest_with_bearer_and_device_header() {
     let nest = Arc::new(NestClient::new(&base_url).unwrap());
     let tmp = TempDir::new("test-read");
     let creds = Arc::new(FileCredentialStore::new(tmp.path().join("creds.json")).unwrap());
-    let atp_session = Arc::new(jacquard::client::MemoryCredentialSession::unauthenticated());
+    let atp_session = crate::pds_session::PdsSession::new().unwrap();
 
     let client = BirdApiClient::new(
         "https://pds.example.invalid".into(),
         atp_session,
         TEST_DID.into(),
-        "alice.bsky.social".into(),
         "secret".into(),
     )
     .with_chat_authority(nest, authority_state, creds);
@@ -313,13 +278,12 @@ async fn test_canonical_send_message_with_task5_signed_request_through_nest() {
         )
         .unwrap();
 
-    let atp_session = Arc::new(jacquard::client::MemoryCredentialSession::unauthenticated());
+    let atp_session = crate::pds_session::PdsSession::new().unwrap();
 
     let client = BirdApiClient::new(
         "https://pds.example.invalid".into(),
         atp_session,
         TEST_DID.into(),
-        "alice.bsky.social".into(),
         "secret".into(),
     )
     .with_chat_authority(nest, authority_state, creds.clone());
@@ -364,20 +328,15 @@ async fn test_canonical_send_message_with_task5_signed_request_through_nest() {
             assert_eq!(signed_req["body"]["authGeneration"], 7);
             assert!(signed_req["signature"].is_object() || signed_req["signature"].is_string());
 
-            // Nest returns the generated DTO form for typed response
-            // decoding. The request wire uses {$bytes} for artifact hashes,
-            // while generated `Bytes` output is an array.
-            let mut response_body = signed_req["body"].clone();
-            response_body["applicationMessage"]["sha256"] = json!(vec![0u8; 32]);
             let send_out = json!({
                 "entry": {
                     "$type": "blue.catbird.chat.defs#applicationEntry",
-                    "entryId": "entry-uuid-999",
+                    "entryId": "74747474-7474-4474-9474-747474747474",
                     "conversationId": TEST_CONVO_ID,
                     "seq": 42,
-                    "receivedAt": "2026-08-17T12:00:00Z",
+                    "receivedAt": "2026-08-17T12:00:00.000Z",
                     "signedRequest": {
-                        "body": response_body,
+                        "body": signed_req["body"].clone(),
                         "signature": signed_req["signature"].clone()
                     }
                 }
@@ -396,12 +355,12 @@ async fn test_canonical_send_message_with_task5_signed_request_through_nest() {
     let msg_id = "51515151-5151-4151-9151-515151515151";
     let ciphertext = vec![1, 2, 3, 4, 5, 6, 7, 8];
     let send_resp = client
-        .send_message_with_id(TEST_CONVO_ID, &ciphertext, 1, msg_id)
+        .send_message_with_id(TEST_CONVO_ID, &ciphertext, 1, 0, msg_id)
         .await
         .unwrap();
 
     server_task.await.unwrap();
-    assert_eq!(send_resp.message_id, "entry-uuid-999");
+    assert_eq!(send_resp.message_id, "74747474-7474-4474-9474-747474747474");
     assert_eq!(send_resp.seq, 42);
     assert_eq!(send_resp.epoch, 1);
 }
@@ -420,13 +379,12 @@ async fn test_canonical_blob_download_through_nest() {
     let nest = Arc::new(NestClient::new(&base_url).unwrap());
     let tmp = TempDir::new("test-blob");
     let creds = Arc::new(FileCredentialStore::new(tmp.path().join("creds.json")).unwrap());
-    let atp_session = Arc::new(jacquard::client::MemoryCredentialSession::unauthenticated());
+    let atp_session = crate::pds_session::PdsSession::new().unwrap();
 
     let client = BirdApiClient::new(
         "https://pds.example.invalid".into(),
         atp_session,
         TEST_DID.into(),
-        "alice.bsky.social".into(),
         "secret".into(),
     )
     .with_chat_authority(nest, authority_state, creds);
@@ -475,13 +433,12 @@ async fn test_canonical_subscription_ticket_and_websocket_isolation() {
     let nest = Arc::new(NestClient::new(&nest_base).unwrap());
     let tmp = TempDir::new("test-ticket");
     let creds = Arc::new(FileCredentialStore::new(tmp.path().join("creds.json")).unwrap());
-    let atp_session = Arc::new(jacquard::client::MemoryCredentialSession::unauthenticated());
+    let atp_session = crate::pds_session::PdsSession::new().unwrap();
 
     let client = BirdApiClient::new(
         "https://pds.example.invalid".into(),
         atp_session,
         TEST_DID.into(),
-        "alice.bsky.social".into(),
         "secret".into(),
     )
     .with_chat_authority(nest, authority_state, creds);
@@ -569,13 +526,12 @@ async fn test_bearer_never_sent_to_pds_or_ds_and_downstream_tokens_never_enter_b
     let nest = Arc::new(NestClient::new(&nest_url).unwrap());
     let tmp = TempDir::new("test-bearer-isolation");
     let creds = Arc::new(FileCredentialStore::new(tmp.path().join("creds.json")).unwrap());
-    let atp_session = Arc::new(jacquard::client::MemoryCredentialSession::unauthenticated());
+    let atp_session = crate::pds_session::PdsSession::new().unwrap();
 
     let client = BirdApiClient::new(
         pds_url.clone(),
         atp_session,
         TEST_DID.into(),
-        "alice.bsky.social".into(),
         "secret".into(),
     )
     .with_chat_authority(nest, authority_state.clone(), creds);
@@ -660,9 +616,8 @@ async fn ordinary_http_failures_are_preserved_without_invalidating_authority() {
         let creds = Arc::new(FileCredentialStore::new(tmp.path().join("creds.json")).unwrap());
         let client = BirdApiClient::new(
             "https://pds.example.invalid".into(),
-            Arc::new(jacquard::client::MemoryCredentialSession::unauthenticated()),
+            crate::pds_session::PdsSession::new().unwrap(),
             TEST_DID.into(),
-            "alice.bsky.social".into(),
             "secret".into(),
         )
         .with_chat_authority(nest, authority_state.clone(), creds);
@@ -722,13 +677,12 @@ async fn proven_account_session_expiry_invalidates_but_preserves_response() {
     let nest = Arc::new(NestClient::new(&base_url).unwrap());
     let tmp = TempDir::new("test-401");
     let creds = Arc::new(FileCredentialStore::new(tmp.path().join("creds.json")).unwrap());
-    let atp_session = Arc::new(jacquard::client::MemoryCredentialSession::unauthenticated());
+    let atp_session = crate::pds_session::PdsSession::new().unwrap();
 
     let client = BirdApiClient::new(
         "https://pds.example.invalid".into(),
         atp_session,
         TEST_DID.into(),
-        "alice.bsky.social".into(),
         "secret".into(),
     )
     .with_chat_authority(nest, authority_state.clone(), creds);
@@ -781,9 +735,8 @@ async fn caller_scope_mismatch_fails_before_network_or_authority_mutation() {
     let creds = Arc::new(FileCredentialStore::new(tmp.path().join("creds.json")).unwrap());
     let client = BirdApiClient::new(
         "https://pds.example.invalid".into(),
-        Arc::new(jacquard::client::MemoryCredentialSession::unauthenticated()),
+        crate::pds_session::PdsSession::new().unwrap(),
         "did:plc:otherfixturebbbbbbbbbbb".into(),
-        "other.bsky.social".into(),
         "secret".into(),
     )
     .with_chat_authority(nest, authority_state.clone(), creds);
@@ -820,9 +773,8 @@ async fn get_entries_paginates_without_rewinding_and_stops_at_the_explicit_bound
     let tmp = TempDir::new("entry-pagination");
     let client = BirdApiClient::new(
         "https://pds.example.invalid".into(),
-        Arc::new(jacquard::client::MemoryCredentialSession::unauthenticated()),
+        crate::pds_session::PdsSession::new().unwrap(),
         TEST_DID.into(),
-        "alice.bsky.social".into(),
         "secret".into(),
     )
     .with_chat_authority(
@@ -886,9 +838,8 @@ async fn key_package_stats_paginate_and_count_only_the_admitted_device() {
     let tmp = TempDir::new("device-pagination");
     let client = BirdApiClient::new(
         "https://pds.example.invalid".into(),
-        Arc::new(jacquard::client::MemoryCredentialSession::unauthenticated()),
+        crate::pds_session::PdsSession::new().unwrap(),
         TEST_DID.into(),
-        "alice.bsky.social".into(),
         "secret".into(),
     )
     .with_chat_authority(
@@ -935,7 +886,7 @@ async fn key_package_stats_paginate_and_count_only_the_admitted_device() {
                 }}],
                 "hasMore": has_more,
                 "nextPageCursor": next_cursor,
-                "snapshotExpiresAt": "2026-08-23T12:15:00.000Z",
+                "snapshotExpiresAt": "2099-08-23T12:15:00.000Z",
             })
             .to_string();
             let response = format!(
@@ -969,9 +920,8 @@ async fn pending_welcome_is_device_fenced_and_never_acknowledged_before_durable_
     let tmp = TempDir::new("pending-welcome");
     let client = BirdApiClient::new(
         "https://pds.example.invalid".into(),
-        Arc::new(jacquard::client::MemoryCredentialSession::unauthenticated()),
+        crate::pds_session::PdsSession::new().unwrap(),
         TEST_DID.into(),
-        "alice.bsky.social".into(),
         "secret".into(),
     )
     .with_chat_authority(
@@ -1010,9 +960,9 @@ async fn pending_welcome_is_device_fenced_and_never_acknowledged_before_durable_
             "hasMore": false,
             "inventorySessionId": "inv-session-123",
             "snapshotEventCursor": "cursor-456",
-            "snapshotExpiresAt": "2026-08-23T12:15:00.000Z",
-            "nextPageCursor": null,
+            "snapshotExpiresAt": "2099-08-23T12:15:00.000Z",
             "items": [{
+                "$type": "blue.catbird.chat.defs#welcomeView",
                 "welcomeId": "33333333-3333-4333-9333-333333333333",
                 "conversationId": TEST_CONVO_ID,
                 "transitionSeq": 9,
@@ -1028,14 +978,14 @@ async fn pending_welcome_is_device_fenced_and_never_acknowledged_before_durable_
                 },
                 "status": "pending",
                 "opaqueWelcome": {"$bytes": B64.encode(&opaque_welcome)},
-                "sha256": welcome_sha256,
+                "sha256": {"$bytes": B64.encode(welcome_sha256)},
                 "recipientDid": TEST_DID,
                 "recipientDeviceId": TEST_DEVICE_ID,
                 "provenance": {
                     "recoveryRequestId": "44444444-4444-4444-9444-444444444444",
                     "keyPackageRef": {"$bytes": B64.encode([5_u8; 32])},
                 },
-                "expiresAt": "2026-09-23T12:15:00.000Z",
+                "expiresAt": "2099-09-23T12:15:00.000Z",
             }],
         })
         .to_string();
@@ -1056,9 +1006,12 @@ async fn pending_welcome_is_device_fenced_and_never_acknowledged_before_durable_
 
     client.get_conversations(25, None).await.unwrap();
     let error = client.get_welcome(TEST_CONVO_ID).await.unwrap_err();
-    assert!(error
-        .to_string()
-        .contains("no post-join acknowledgement hook"));
+    assert!(
+        error
+            .to_string()
+            .contains("no post-join acknowledgement hook"),
+        "{error}"
+    );
     server_task.await.unwrap();
 }
 
@@ -1108,12 +1061,18 @@ async fn test_process_restart_recovery_and_stale_rejection() {
         assert!(req2.contains("getOwnDevices"));
 
         let dev_body = json!({
+            "hasMore": false,
+            "snapshotExpiresAt": "2099-08-23T12:05:00.000Z",
             "items": [{
                 "device": {
                     "deviceId": TEST_DEVICE_ID,
                     "authGeneration": 7,
                     "status": "active",
                     "keyId": signer_handle,
+                    "availablePackageCount": 1,
+                    "reservedPackageCount": 0,
+                    "createdAt": "2026-08-23T12:00:00.000Z",
+                    "updatedAt": "2026-08-23T12:00:00.000Z",
                     "signaturePublicKey": {"$bytes": B64.encode(signer.public())}
                 }
             }]
@@ -1190,9 +1149,8 @@ async fn real_orchestrator_reuses_the_admitted_device_scoped_identity() {
     let api = Arc::new(
         BirdApiClient::new(
             "https://pds.example.invalid".into(),
-            Arc::new(jacquard::client::MemoryCredentialSession::unauthenticated()),
+            crate::pds_session::PdsSession::new().unwrap(),
             TEST_DID.into(),
-            "alice.bsky.social".into(),
             "secret".into(),
         )
         .with_chat_authority(
@@ -1232,7 +1190,7 @@ async fn real_orchestrator_reuses_the_admitted_device_scoped_identity() {
                     "reservedPackageCount": 2
                 }}],
                 "hasMore": false,
-                "snapshotExpiresAt": "2026-08-23T12:15:00.000Z"
+                "snapshotExpiresAt": "2099-08-23T12:15:00.000Z"
             })
             .to_string();
             let response = format!(
@@ -1303,9 +1261,8 @@ async fn real_orchestrator_sync_adopts_the_stable_uuid_and_retires_the_raw_alias
     let api = Arc::new(
         BirdApiClient::new(
             "https://pds.example.invalid".into(),
-            Arc::new(jacquard::client::MemoryCredentialSession::unauthenticated()),
+            crate::pds_session::PdsSession::new().unwrap(),
             TEST_DID.into(),
-            "alice.bsky.social".into(),
             "secret".into(),
         )
         .with_chat_authority(
@@ -1347,39 +1304,43 @@ async fn real_orchestrator_sync_adopts_the_stable_uuid_and_retires_the_raw_alias
 
     let server_raw_group_id = raw_group_id.clone();
     let server_task = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let mut request = [0_u8; 8192];
-        let read = stream.read(&mut request).await.unwrap();
-        let request = String::from_utf8_lossy(&request[..read]);
-        assert!(request.contains("blue.catbird.chat.getConversations"));
-        assert!(request.contains(&format!("actorDeviceId={TEST_DEVICE_ID}")));
-        let body = projection_conversations_json(TEST_CONVO_ID);
-        let response = format!(
-            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        stream.write_all(response.as_bytes()).await.unwrap();
-
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let mut request = [0_u8; 8192];
-        let read = stream.read(&mut request).await.unwrap();
-        let request = String::from_utf8_lossy(&request[..read]);
-        assert!(request.contains("blue.catbird.chat.getEntries"));
-        assert!(request.contains(&format!("conversationId={TEST_CONVO_ID}")));
-        assert!(!request.contains(&server_raw_group_id));
-        let body = json!({
-            "entries": [],
-            "hasMore": false,
-            "nextAfterSeq": 0,
-        })
-        .to_string();
-        let response = format!(
-            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        stream.write_all(response.as_bytes()).await.unwrap();
+        // The shared orchestrator also reads inventory for terminal-state reconciliation.
+        let mut saw_inventory = false;
+        for _ in 0..16 {
+            let (mut stream, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                    .await
+                    .expect("expected an inventory or entries read")
+                    .unwrap();
+            let mut buf = [0_u8; 8192];
+            let n = stream.read(&mut buf).await.unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]);
+            let line = request.lines().next().unwrap();
+            assert!(line.contains(&format!("actorDeviceId={TEST_DEVICE_ID}")));
+            let entries = line.starts_with("GET /xrpc/blue.catbird.chat.getEntries?");
+            let body = if entries {
+                assert!(saw_inventory);
+                assert!(line.contains(&format!("conversationId={TEST_CONVO_ID}")));
+                assert!(!line.contains(&server_raw_group_id));
+                json!({"entries": [], "hasMore": false, "nextAfterSeq": 0}).to_string()
+            } else {
+                assert!(
+                    line.starts_with("GET /xrpc/blue.catbird.chat.getConversations?"),
+                    "unexpected request {line}"
+                );
+                saw_inventory = true;
+                projection_conversations_json(TEST_CONVO_ID)
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(), body,
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            if entries {
+                return;
+            }
+        }
+        panic!("entry read missing after repeated inventory requests");
     });
 
     orchestrator.sync_with_server(true).await.unwrap();
@@ -1415,13 +1376,12 @@ async fn test_typing_remains_explicitly_disabled() {
     let authority_state = Arc::new(AuthorityState::new());
     let tmp = TempDir::new("test-typing");
     let creds = Arc::new(FileCredentialStore::new(tmp.path().join("creds.json")).unwrap());
-    let atp_session = Arc::new(jacquard::client::MemoryCredentialSession::unauthenticated());
+    let atp_session = crate::pds_session::PdsSession::new().unwrap();
 
     let client = BirdApiClient::new(
         "https://pds.example.invalid".into(),
         atp_session,
         TEST_DID.into(),
-        "alice.bsky.social".into(),
         "secret".into(),
     )
     .with_chat_authority(nest, authority_state, creds);
@@ -1446,13 +1406,12 @@ async fn test_simulated_bot_receive_decrypt_reply_flow() {
     let nest = Arc::new(NestClient::new(&base_url).unwrap());
     let tmp = TempDir::new("test-bot-reply");
     let creds = Arc::new(FileCredentialStore::new(tmp.path().join("creds.json")).unwrap());
-    let atp_session = Arc::new(jacquard::client::MemoryCredentialSession::unauthenticated());
+    let atp_session = crate::pds_session::PdsSession::new().unwrap();
 
     let client = BirdApiClient::new(
         "https://pds.example.invalid".into(),
         atp_session,
         TEST_DID.into(),
-        "alice.bsky.social".into(),
         "secret".into(),
     )
     .with_chat_authority(nest, authority_state, creds.clone());
@@ -1486,10 +1445,10 @@ async fn test_simulated_bot_receive_decrypt_reply_flow() {
             "nextAfterSeq": 10,
             "entries": [{
                 "$type": "blue.catbird.chat.defs#applicationEntry",
-                "entryId": "inbound-msg-001",
+                "entryId": "73737373-7373-4373-9373-737373737373",
                 "conversationId": TEST_CONVO_ID,
                 "seq": 10,
-                "receivedAt": "2026-08-17T12:00:00Z",
+                "receivedAt": "2026-08-17T12:00:00.000Z",
                 "signedRequest": {
                     "body": {
                         "$type": "blue.catbird.chat.defs#applicationSendBody",
@@ -1499,10 +1458,11 @@ async fn test_simulated_bot_receive_decrypt_reply_flow() {
                         "keyId": "bob-key-1",
                         "messageId": "88888888-8888-4888-8888-888888888888",
                         "authGeneration": 1,
+                        "sendCounter": 1,
                         "blobBindings": [],
                         "applicationMessage": {
                             "bytes": {"$bytes": B64.encode(b"ping")},
-                            "sha256": vec![9u8; 32],
+                            "sha256": {"$bytes": B64.encode(Sha256::digest(b"ping"))},
                             "framing": "mlsMessage",
                             "contentType": "privateMessageApplication"
                         },
@@ -1518,11 +1478,11 @@ async fn test_simulated_bot_receive_decrypt_reply_flow() {
                         },
                         "aad": {
                             "protocolVersion": "1",
-                            "conversationId": vec![1u8; 16],
+                            "conversationId": {"$bytes": B64.encode(uuid::Uuid::parse_str(TEST_CONVO_ID).unwrap().as_bytes())},
                             "generation": 1,
-                            "messageId": vec![8u8; 16],
+                            "messageId": {"$bytes": B64.encode(uuid::Uuid::parse_str("88888888-8888-4888-8888-888888888888").unwrap().as_bytes())},
                             "prior": {
-                                "conversationId": vec![1u8; 16],
+                                "conversationId": {"$bytes": B64.encode(uuid::Uuid::parse_str(TEST_CONVO_ID).unwrap().as_bytes())},
                                 "groupId": {"$bytes": B64.encode([2u8; 32])},
                                 "epoch": 1,
                                 "generation": 1,
@@ -1532,7 +1492,7 @@ async fn test_simulated_bot_receive_decrypt_reply_flow() {
                                 "groupContextHash": {"$bytes": B64.encode([3u8; 32])}
                             }
                         },
-                        "signedAt": "2026-08-17T12:00:00.000Z"
+                        "signedAt": "2099-08-17T12:00:00.000Z"
                     },
                     "signature": {"$bytes": B64.encode([9u8; 64])}
                 }
@@ -1562,17 +1522,15 @@ async fn test_simulated_bot_receive_decrypt_reply_flow() {
         assert_eq!(signed_req["body"]["actorDid"], TEST_DID);
         assert_eq!(signed_req["body"]["actorDeviceId"], TEST_DEVICE_ID);
 
-        let mut response_body = signed_req["body"].clone();
-        response_body["applicationMessage"]["sha256"] = json!(vec![0u8; 32]);
         let reply_out = json!({
             "entry": {
                 "$type": "blue.catbird.chat.defs#applicationEntry",
-                "entryId": "reply-entry-uuid-002",
+                "entryId": "75757575-7575-4575-9575-757575757575",
                 "conversationId": TEST_CONVO_ID,
                 "seq": 11,
-                "receivedAt": "2026-08-17T12:01:00Z",
+                "receivedAt": "2026-08-17T12:01:00.000Z",
                 "signedRequest": {
-                    "body": response_body,
+                    "body": signed_req["body"].clone(),
                     "signature": signed_req["signature"].clone()
                 }
             }
@@ -1599,19 +1557,22 @@ async fn test_simulated_bot_receive_decrypt_reply_flow() {
     assert_eq!(entries.len(), 1);
     assert_eq!(
         entries[0].server_message_id.as_deref(),
-        Some("inbound-msg-001")
+        Some("73737373-7373-4373-9373-737373737373")
     );
 
     // 3. Send reply
     let reply_msg_id = "62626262-6262-4262-9262-626262626262";
     let reply_ciphertext = b"pong: hello from bird bot!".to_vec();
     let reply_resp = client
-        .send_message_with_id(TEST_CONVO_ID, &reply_ciphertext, 1, reply_msg_id)
+        .send_message_with_id(TEST_CONVO_ID, &reply_ciphertext, 1, 0, reply_msg_id)
         .await
         .unwrap();
 
     server_task.await.unwrap();
-    assert_eq!(reply_resp.message_id, "reply-entry-uuid-002");
+    assert_eq!(
+        reply_resp.message_id,
+        "75757575-7575-4575-9575-757575757575"
+    );
     assert_eq!(reply_resp.seq, 11);
     assert_eq!(reply_resp.epoch, 1);
 }
